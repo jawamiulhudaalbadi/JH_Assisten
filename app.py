@@ -560,7 +560,7 @@ if api_key and folder_id:
 if api_key and folder_id and drive_authorized:
     try:
         with st.sidebar:
-        _render_rpd_limit_notice()
+            _render_rpd_limit_notice()
             _render_drive_sync_status(folder_id, api_key)
     except (GoogleAPIError, GoogleAuthError, HttpError, OSError, ValueError) as error:
         st.warning(f"Sinkronisasi Drive berjalan di latar belakang; indeks lokal tetap digunakan bila tersedia. {error}")

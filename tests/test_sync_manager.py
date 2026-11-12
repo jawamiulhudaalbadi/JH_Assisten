@@ -1,3 +1,7 @@
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -11,12 +15,57 @@ class _Index:
 
 
 class DriveSyncManagerTests(unittest.TestCase):
+    def test_daily_quota_status_is_persisted_and_loaded(self) -> None:
+        limited_at = datetime(2026, 3, 8, 8, 30, tzinfo=timezone.utc)
+        expected_status = {
+            "rpd_limited_at": "2026-03-08T08:30:00+00:00",
+            "rpd_reset_at": "2026-03-09T07:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "sync_status.json"
+            with patch("services.sync_manager.SYNC_STATUS_PATH", status_path):
+                writer = DriveSyncManager()
+                saved_status = writer.record_daily_quota_limit(limited_at)
+
+                self.assertEqual(saved_status, expected_status)
+                self.assertEqual(
+                    json.loads(status_path.read_text(encoding="utf-8")),
+                    expected_status,
+                )
+
+                reader = DriveSyncManager()
+                loaded_status = reader.get_rpd_status(
+                    datetime(2026, 3, 9, 6, 59, 59, tzinfo=timezone.utc)
+                )
+
+        self.assertEqual(loaded_status, expected_status)
+
+    def test_daily_quota_status_is_cleared_at_reset_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "sync_status.json"
+            with patch("services.sync_manager.SYNC_STATUS_PATH", status_path):
+                manager = DriveSyncManager()
+                manager.record_daily_quota_limit(
+                    datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+                )
+
+                status = manager.get_rpd_status(
+                    datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+                )
+
+                self.assertIsNone(status)
+                self.assertFalse(status_path.exists())
+
     def test_start_sync_does_not_submit_duplicate_background_work(self) -> None:
         manager = DriveSyncManager()
         future = Mock()
         future.done.return_value = False
 
-        with patch.object(manager._executor, "submit", return_value=future) as submit:
+        with (
+            patch.object(manager, "get_rpd_status", return_value=None),
+            patch.object(manager._executor, "submit", return_value=future) as submit,
+        ):
             self.assertTrue(manager.start_sync("folder-1", "api-key"))
             self.assertFalse(manager.start_sync("folder-1", "api-key"))
 
