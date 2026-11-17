@@ -65,6 +65,18 @@ PREFERRED_CHAT_MODEL_ORDER = {
 }
 _CHAT_MODEL_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
 _CHAT_MODEL_CACHE_LOCK = Lock()
+EMBEDDING_DIMENSIONS = 768
+
+
+def reduce_embedding_vector(vector: Sequence[float]) -> list[float]:
+    """Potong vektor Gemini ke EMBEDDING_DIMENSIONS lalu normalisasi L2."""
+    if len(vector) <= EMBEDDING_DIMENSIONS:
+        return list(vector)
+    reduced = np.asarray(vector[:EMBEDDING_DIMENSIONS], dtype=np.float32)
+    norm = float(np.linalg.norm(reduced))
+    if norm > 0:
+        reduced = reduced / norm
+    return reduced.tolist()
 
 
 class _EmbeddingRateLimiter:
@@ -175,7 +187,7 @@ class _QuotaAwareEmbeddings(Embeddings):
                     time.sleep(retry_delay)
                     retries += 1
                     continue
-                vectors.extend(batch_vectors)
+                vectors.extend(reduce_embedding_vector(vector) for vector in batch_vectors)
                 completed += len(batch)
                 if self._on_progress:
                     self._on_progress(completed, len(texts))
@@ -195,7 +207,7 @@ class _QuotaAwareEmbeddings(Embeddings):
                 (len(text.encode("utf-8")) + 3) // 4 + 8,
                 self._on_wait if on_wait is None else on_wait,
             )
-        return self._client.embed_query(text)
+        return reduce_embedding_vector(self._client.embed_query(text))
 
 
 def is_embedding_quota_error(error: Exception) -> bool:

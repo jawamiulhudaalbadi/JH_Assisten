@@ -26,3 +26,4 @@ token.json
 .env
 faiss_index/sync_failures.json
 faiss_index/sync_failures.tmp
+faiss_index_backup_3072/
