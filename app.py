@@ -679,7 +679,7 @@ st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
 
 if "app_title" not in st.session_state:
     st.session_state.app_title = str(
-        PRIVATE_CONFIG.get("app_title", "✨ Asisten AI Pribadi")
+        PRIVATE_CONFIG.get("app_title", "JH Asisten AI ")
     )
 theme = APP_THEMES[APP_THEME_ID]
 st.markdown(

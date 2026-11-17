@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 import pymupdf
 from docx import Document as DocxDocument
 from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -36,8 +37,8 @@ try:
     TOKEN_FILE.write_text(
         str(_st.secrets["gdrive_token_json"]), encoding="utf-8"
     )
-except Exception:
-  pass
+except Exception as _secrets_error:
+  print(f"[gdrive_service] Gagal membaca secrets: {_secrets_error}")
 
 DOCX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -122,6 +123,39 @@ def drive_download_url(file_info: dict[str, str]) -> str:
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
+SERVICE_ACCOUNT_FILE = PROJECT_ROOT / "service-account.json"
+
+
+def _load_service_account_credentials() -> service_account.Credentials | None:
+    """Load service account credentials from Streamlit secrets or a local file."""
+    raw_json = None
+    try:
+        import streamlit as st
+
+        if "gdrive_service_account_json" in st.secrets:
+            raw_json = str(st.secrets["gdrive_service_account_json"]).strip()
+    except Exception as error:
+        print(f"[gdrive_service] Gagal membaca secret service account: {error}")
+
+    if raw_json:
+        try:
+            info = json.loads(raw_json)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Secret gdrive_service_account_json bukan JSON yang valid: {error}"
+            ) from error
+        return service_account.Credentials.from_service_account_info(
+            info, scopes=[DRIVE_READONLY_SCOPE]
+        )
+
+    if SERVICE_ACCOUNT_FILE.is_file():
+        return service_account.Credentials.from_service_account_file(
+            str(SERVICE_ACCOUNT_FILE), scopes=[DRIVE_READONLY_SCOPE]
+        )
+
+    return None
+
+
 def _get_credentials() -> Credentials:
     """Load cached user credentials or require the app's OAuth consent flow."""
     credentials = load_cached_credentials()
@@ -133,7 +167,11 @@ def _get_credentials() -> Credentials:
 
 
 def load_cached_credentials() -> Credentials | None:
-    """Load and refresh the locally cached OAuth credentials, if available."""
+    """Load service account credentials, or fall back to cached OAuth credentials."""
+    service_account_credentials = _load_service_account_credentials()
+    if service_account_credentials is not None:
+        return service_account_credentials
+
     if not OAUTH_CLIENT_FILE.is_file():
         raise ValueError("File credentials.json tidak ditemukan di root proyek.")
 
