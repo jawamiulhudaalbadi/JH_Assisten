@@ -24,9 +24,25 @@ DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OAUTH_CLIENT_FILE = PROJECT_ROOT / "credentials.json"
 TOKEN_FILE = PROJECT_ROOT / "token.json"
+
+try:
+  import streamlit as _st
+
+  if not OAUTH_CLIENT_FILE.is_file() and "gdrive_credentials_json" in _st.secrets:
+    OAUTH_CLIENT_FILE.write_text(
+        str(_st.secrets["gdrive_credentials_json"]), encoding="utf-8"
+    )
+  if not TOKEN_FILE.is_file() and "gdrive_token_json" in _st.secrets:
+    TOKEN_FILE.write_text(
+        str(_st.secrets["gdrive_token_json"]), encoding="utf-8"
+    )
+except Exception:
+  pass
+
 DOCX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
+
 DOC_MIME_TYPE = "application/msword"
 TEXT_MIME_TYPE = "text/plain"
 GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
