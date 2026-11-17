@@ -33,6 +33,11 @@ lirik, hukum, cerita, quotes, dan catatan berbahasa Indonesia maupun Sunda.
    `GOOGLE_SERVICE_ACCOUNT_JSON` dengan konten JSON kredensial. Jangan commit
    API key atau file kredensial ke Git.
 
+   API key Gemini juga dapat diganti dari **Menu Pengaturan Instan** di aplikasi
+   setelah memasukkan sandi pengaturan. Key yang disimpan dari menu tersebut
+   menjadi prioritas sampai pengguna memilih kembali key dari konfigurasi server.
+   Menu yang sama menyediakan lima tema dan unggah/hapus logo aplikasi.
+
 ## Menjalankan aplikasi
 
 Dari direktori proyek jalankan:
@@ -46,18 +51,25 @@ tanpa memulai sinkronisasi otomatis. Setelah izin Google Drive tersedia, tekan
 **Sinkronkan Sekarang** untuk memeriksa perubahan; setiap sesi memproses maksimal
 10 file dan menyimpan progres agar dapat dilanjutkan secara manual. Jika batas
 kuota Gemini sementara tercapai, aplikasi menunggu lalu mencoba ulang batch
-embedding yang gagal (maksimal dua kali). File yang sudah tersimpan tidak
-diulang. Jika kuota tetap habis atau waktu tunggu melebihi lima menit,
+embedding yang gagal (maksimal dua kali). Setiap batch chunk yang berhasil
+langsung disimpan. Setelah kuota tersedia, tekan Lanjutkan muat; jika API key
+diganti setelah sinkronisasi terhenti karena kuota, aplikasi otomatis
+melanjutkan dari batch chunk terakhir yang belum tersimpan. Jika kuota tetap
+habis atau waktu tunggu melebihi lima menit,
 sinkronisasi dijeda dengan progres file sebelumnya tetap tersimpan.
 Sumber yang sudah tersedia dapat dibaca lengkap per bagian dari panel pratinjau.
 File `.doc` lama memerlukan program `antiword`; jika belum tersedia, sumber
 tersebut ditandai gagal dan dapat dicoba ulang setelah dependensi dipasang atau
-file disimpan sebagai `.docx`.
+file disimpan sebagai `.docx`. Kolom chat mendukung pertanyaan tertulis atau
+rekaman suara, serta lampiran hingga empat gambar. Rekaman suara ditranskripsikan
+Gemini sebelum dipakai mencari dokumen; gambar dianalisis bersama pertanyaan dan
+konteks dokumen yang relevan.
 
 ## Catatan
 
 - Akun service account memerlukan akses baca ke folder Drive.
-- Embedding dan jawaban dikirim ke layanan Google Gemini; jangan sinkronkan
-  dokumen yang tidak boleh diproses oleh layanan eksternal.
+- Embedding, jawaban, rekaman suara, dan gambar yang dikirim ke chat diproses
+  layanan Google Gemini; jangan kirim data yang tidak boleh diproses oleh layanan
+  eksternal.
 - Jawaban terkait hukum merupakan ringkasan dokumen, bukan nasihat hukum
   profesional.

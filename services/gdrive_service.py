@@ -12,6 +12,7 @@ from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
+import pymupdf
 from docx import Document as DocxDocument
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -45,7 +46,7 @@ FILE_TYPE_PRIORITY = {
     GOOGLE_DOC_MIME_TYPE: 3,
     PDF_MIME_TYPE: 4,
 }
-PDF_EXTRACTION_TIMEOUT_SECONDS = 45
+PDF_EXTRACTION_TIMEOUT_SECONDS = 180
 _PDF_EXTRACTION_SCRIPT = """
 import io
 import json
@@ -202,7 +203,7 @@ def _extract_pdf_pages(
     content: bytes,
     timeout_seconds: float = PDF_EXTRACTION_TIMEOUT_SECONDS,
 ) -> list[tuple[str, str]]:
-    """Extract text with original PDF page labels in a killable subprocess."""
+    """Extract PDF text with pypdf, falling back to PyMuPDF when extraction fails."""
     try:
         result = subprocess.run(
             [sys.executable, "-c", _PDF_EXTRACTION_SCRIPT],
@@ -215,12 +216,27 @@ def _extract_pdf_pages(
         raise PdfExtractionTimeout(
             f"PDF extraction exceeded {timeout_seconds:g} seconds"
         ) from error
+    except subprocess.CalledProcessError:
+        return _extract_pdf_pages_with_pymupdf(content)
+
     pages = json.loads(result.stdout.decode("utf-8"))
-    return [
+    extracted_pages = [
         (str(page["page_label"]), str(page["text"]))
         for page in pages
         if isinstance(page, dict) and page.get("text")
     ]
+    return extracted_pages or _extract_pdf_pages_with_pymupdf(content)
+
+
+def _extract_pdf_pages_with_pymupdf(content: bytes) -> list[tuple[str, str]]:
+    """Extract text page-by-page using PyMuPDF."""
+    pages: list[tuple[str, str]] = []
+    with pymupdf.open(stream=content, filetype="pdf") as document:
+        for page_number, page in enumerate(document, start=1):
+            page_text = page.get_text().strip()
+            if page_text:
+                pages.append((str(page_number), page_text))
+    return pages
 
 
 def _extract_pdf_text(

@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, time, timedelta, timezone
+import gc
+import hashlib
 import json
 from math import ceil
 from pathlib import Path
+import re
+import string
 from threading import Event, RLock
 from time import monotonic
 from collections.abc import Callable
@@ -35,9 +39,31 @@ from services.gdrive_service import (
 
 SOURCE_TEXT_DIRECTORY = DEFAULT_INDEX_DIRECTORY / "source_texts"
 SYNC_STATUS_PATH = DEFAULT_INDEX_DIRECTORY / "sync_status.json"
+SYNC_FAILURE_STATUS_PATH = DEFAULT_INDEX_DIRECTORY / "sync_failures.json"
 MAX_FILES_PER_SYNC_SESSION = 10
 _RPD_STATUS_LOCK = RLock()
+_SYNC_FAILURE_STATUS_LOCK = RLock()
+_INDEX_LOCK = RLock()
 _LOS_ANGELES_TIMEZONE = ZoneInfo("America/Los_Angeles")
+_CORRUPTED_CHARACTER_RE = re.compile(
+    rf"[^A-Za-z0-9\s\u00C0-\u024F\u1E00-\u1EFF\u0600-\u06FF"
+    rf"{re.escape(string.punctuation)}‘’“”…–—]"
+)
+_CORRUPTED_CHARACTER_RATIO_THRESHOLD = 0.3
+_CORRUPTED_TEXT_ERROR = "Teks rusak / tidak terbaca, konversi ke Google Docs"
+
+
+def is_text_corrupted(text: str) -> bool:
+    """Return whether extracted text is too short or contains too many unusual characters."""
+    normalized_text = text.strip()
+    if len(normalized_text) < 20:
+        return True
+
+    corrupted_character_count = len(_CORRUPTED_CHARACTER_RE.findall(normalized_text))
+    return (
+        corrupted_character_count / len(normalized_text)
+        > _CORRUPTED_CHARACTER_RATIO_THRESHOLD
+    )
 
 
 class _EmbeddingQuotaExceededError(RuntimeError):
@@ -54,7 +80,7 @@ class DriveSyncManager:
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drive-sync")
         self._lock = RLock()
-        self._index_lock = RLock()
+        self._index_lock = _INDEX_LOCK
         self._config: tuple[str, str] | None = None
         self._future: Future[None] | None = None
         self._job_id = 0
@@ -66,6 +92,11 @@ class DriveSyncManager:
         self._download_total = 0
         self._download_started_at = 0.0
         self._download_eta_seconds: float | None = None
+        self._embedding_batch_number = 0
+        self._embedding_started_at = 0.0
+        self._embedding_done_count = 0
+        self._embedding_total = 0
+        self._embedding_eta_seconds: float | None = None
         self._skipped_pdf_count = 0
         self._file_statuses: dict[str, dict[str, str]] = {}
         self._retry_file_ids: set[str] = set()
@@ -78,7 +109,7 @@ class DriveSyncManager:
     def start_sync(self, folder_id: str, api_key: str) -> bool:
         """Start one manually requested Drive sync."""
         with self._lock:
-            if self.get_rpd_status() is not None:
+            if self.get_rpd_status(api_key=api_key) is not None:
                 return False
             if self._future is not None and not self._future.done():
                 return False
@@ -100,6 +131,11 @@ class DriveSyncManager:
             self._downloaded_count = 0
             self._download_total = 0
             self._download_eta_seconds = None
+            self._embedding_batch_number = 0
+            self._embedding_started_at = 0.0
+            self._embedding_done_count = 0
+            self._embedding_total = 0
+            self._embedding_eta_seconds = None
             self._skipped_pdf_count = 0
             self._error = None
             self._future = self._executor.submit(
@@ -113,6 +149,7 @@ class DriveSyncManager:
     def record_daily_quota_limit(
         self,
         limited_at: datetime | None = None,
+        api_key: str | None = None,
     ) -> dict[str, str]:
         """Persist the current RPD limit and the next Los Angeles midnight reset."""
         limited_at = limited_at or datetime.now(timezone.utc)
@@ -133,6 +170,10 @@ class DriveSyncManager:
                 timespec="seconds"
             ),
         }
+        if api_key:
+            status["rpd_api_key_hash"] = hashlib.sha256(
+                api_key.encode("utf-8")
+            ).hexdigest()
         with _RPD_STATUS_LOCK:
             SYNC_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
             temporary_path = SYNC_STATUS_PATH.with_suffix(".tmp")
@@ -146,12 +187,14 @@ class DriveSyncManager:
     def get_rpd_status(
         self,
         now: datetime | None = None,
+        api_key: str | None = None,
     ) -> dict[str, str] | None:
         """Load a persisted RPD lockout, clearing it once its reset time passes."""
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("now must include a timezone.")
 
+        api_key_changed = False
         with _RPD_STATUS_LOCK:
             if not SYNC_STATUS_PATH.is_file():
                 return None
@@ -177,10 +220,33 @@ class DriveSyncManager:
             if now.astimezone(timezone.utc) >= reset_time.astimezone(timezone.utc):
                 SYNC_STATUS_PATH.unlink(missing_ok=True)
                 return None
-            return {
-                "rpd_limited_at": limited_at,
-                "rpd_reset_at": reset_at,
-            }
+            stored_api_key_hash = status.get("rpd_api_key_hash")
+            if (
+                api_key
+                and isinstance(stored_api_key_hash, str)
+                and stored_api_key_hash
+                != hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+            ):
+                SYNC_STATUS_PATH.unlink(missing_ok=True)
+                api_key_changed = True
+            else:
+                active_status = {
+                    "rpd_limited_at": limited_at,
+                    "rpd_reset_at": reset_at,
+                }
+
+        if api_key_changed:
+            with self._lock:
+                if self._phase == "quota_error":
+                    self._paused = False
+                    self._resume_event.set()
+                    self._error = None
+                    self._phase = "idle"
+                    self._status = (
+                        "Sinkronisasi belum dimulai. Tekan Sinkronkan Sekarang."
+                    )
+            return None
+        return active_status
 
     def snapshot(self) -> dict[str, object]:
         """Return the latest status in a form safe to read from a UI thread."""
@@ -192,6 +258,9 @@ class DriveSyncManager:
                 "downloaded_count": self._downloaded_count,
                 "download_total": self._download_total,
                 "download_eta_seconds": self._download_eta_seconds,
+                "embedding_done_count": self._embedding_done_count,
+                "embedding_total": self._embedding_total,
+                "embedding_eta_seconds": self._embedding_eta_seconds,
                 "skipped_pdf_count": self._skipped_pdf_count,
                 "files": [dict(file_status) for file_status in self._file_statuses.values()],
                 "paused": self._paused,
@@ -200,6 +269,20 @@ class DriveSyncManager:
                 "generation": self._generation,
                 "running": self._future is not None and not self._future.done(),
             }
+
+    def is_index_busy(self) -> bool:
+        """Return whether sync is embedding/saving or currently owns the index lock."""
+        with self._lock:
+            if (
+                self._phase in {"embedding", "saving"}
+                and self._future is not None
+                and not self._future.done()
+            ):
+                return True
+            if not self._index_lock.acquire(blocking=False):
+                return True
+            self._index_lock.release()
+            return False
 
     def pause(self) -> None:
         with self._lock:
@@ -225,7 +308,8 @@ class DriveSyncManager:
             file_status["state"] = "queued"
             file_status["error"] = ""
             self._status = f"Percobaan ulang dijadwalkan: {file_status['name']}."
-            return True
+        self._persist_failed_file_statuses()
+        return True
 
     def load_local_index(self, folder_id: str, api_key: str) -> FAISS | None:
         """Load a persisted index without racing the worker's disk write."""
@@ -240,6 +324,7 @@ class DriveSyncManager:
             )
             indexed_file_ids = set(get_index_file_manifest(index))
 
+        failed_file_statuses = self._load_failed_file_statuses(folder_id)
         with self._lock:
             if self._future is None or self._future.done():
                 self._config = (folder_id, api_key)
@@ -260,18 +345,28 @@ class DriveSyncManager:
                         or source.get("modified_time")
                         or ""
                     )
+                    failed_status = failed_file_statuses.get(file_id)
+                    is_failed = (
+                        failed_status is not None
+                        and failed_status["modified_time"] == modified_time
+                    )
                     self._file_statuses[file_id] = {
                         "id": file_id,
                         "name": str(source.get("name") or file_id),
                         "modified_time": modified_time,
                         "state": (
-                            "ready"
-                            if file_id in files and file_id in indexed_file_ids
-                            else "queued"
+                            "failed"
+                            if is_failed
+                            else (
+                                "ready"
+                                if file_id in files and file_id in indexed_file_ids
+                                else "queued"
+                            )
                         ),
-                        "error": "",
+                        "error": failed_status["error"] if is_failed else "",
                     }
                 self._file_count = len(file_ids)
+                self._persist_failed_file_statuses(folder_id)
                 if self._phase == "idle":
                     self._status = (
                         "Indeks lokal siap; sinkronisasi Google Drive belum dimulai."
@@ -308,7 +403,7 @@ class DriveSyncManager:
             result = self._sync(folder_id, api_key, job_id)
         except _DailyEmbeddingQuotaExceededError:
             try:
-                self.record_daily_quota_limit()
+                self.record_daily_quota_limit(api_key=api_key)
             except OSError as error:
                 with self._lock:
                     if job_id == self._job_id:
@@ -457,6 +552,7 @@ class DriveSyncManager:
         }
         with self._lock:
             retry_file_ids = set(self._retry_file_ids)
+        persisted_failures = self._load_failed_file_statuses(folder_id)
         pending_files = [
             file_info
             for file_info in inventory
@@ -473,6 +569,17 @@ class DriveSyncManager:
                 file_id = str(file_info["id"])
                 modified_time = str(file_info.get("modifiedTime", ""))
                 prior_status = self._file_statuses.get(file_id)
+                if prior_status is None:
+                    failed_status = persisted_failures.get(file_id)
+                    if (
+                        failed_status is not None
+                        and failed_status["modified_time"] == modified_time
+                    ):
+                        prior_status = {
+                            "state": "failed",
+                            "error": failed_status["error"],
+                            "modified_time": modified_time,
+                        }
                 is_indexed = (
                     previous_files.get(file_id) == modified_time
                     and file_id in indexed_file_ids
@@ -503,6 +610,7 @@ class DriveSyncManager:
             ]
             for file_id in set(previous_files) - set(current_files):
                 self._file_statuses.pop(file_id, None)
+            self._persist_failed_file_statuses(folder_id)
         removed_file_ids = set(previous_files) - set(current_files)
         if manifest is None or manifest.get("sources") != current_sources or needs_manifest_save:
             with self._index_lock:
@@ -608,40 +716,74 @@ class DriveSyncManager:
                     indexed_file_modification_times=indexed_file_modification_times,
                 )
                 processed_file_count += len(batch)
+                valid_documents: list[DriveDocument] = []
+                for document in documents:
+                    if is_text_corrupted(document.text):
+                        self._report_file_failed(
+                            job_id,
+                            document.file_id,
+                            document.name,
+                            _CORRUPTED_TEXT_ERROR,
+                        )
+                    else:
+                        valid_documents.append(document)
+                documents = valid_documents
                 successful_file_ids = {document.file_id for document in documents}
                 with self._lock:
                     for file_id in successful_file_ids:
                         if file_id in self._file_statuses:
                             self._file_statuses[file_id]["state"] = "embedding"
-                self._set_phase(job_id, "embedding")
-                self._set_status(
-                    job_id,
-                    f"Membuat embedding batch {batch_start // batch_size + 1} "
-                    f"dari {(len(changed_files) + batch_size - 1) // batch_size}...",
-                )
-                try:
-                    index = update_search_index(
-                        index,
-                        documents,
-                        successful_file_ids,
-                        api_key,
-                        on_wait=lambda seconds: self._report_embedding_wait(job_id, seconds),
+                if successful_file_ids:
+                    self._set_phase(job_id, "embedding")
+                    with self._lock:
+                        if job_id == self._job_id:
+                            self._embedding_batch_number = 0
+                            self._embedding_done_count = 0
+                            self._embedding_total = 0
+                            self._embedding_eta_seconds = None
+                    self._set_status(
+                        job_id,
+                        f"Membuat embedding batch {batch_start // batch_size + 1} "
+                        f"dari {(len(changed_files) + batch_size - 1) // batch_size}...",
                     )
-                except Exception as error:
-                    if is_embedding_quota_error(error):
+                    try:
+                        index = update_search_index(
+                            index,
+                            documents,
+                            successful_file_ids,
+                            api_key,
+                            on_wait=lambda seconds: self._report_embedding_wait(job_id, seconds),
+                            on_checkpoint=lambda checkpoint: self._save_index_checkpoint(
+                                checkpoint,
+                                folder_id,
+                                committed_files,
+                                current_sources,
+                            ),
+                            on_progress=lambda done, total: (
+                                self._report_embedding_progress(
+                                    job_id,
+                                    done,
+                                    total,
+                                    batch_start // batch_size + 1,
+                                    (len(changed_files) + batch_size - 1) // batch_size,
+                                )
+                            ),
+                        )
+                    except Exception as error:
+                        if is_embedding_quota_error(error):
+                            for file_id in successful_file_ids:
+                                self._set_file_status(
+                                    job_id,
+                                    file_id,
+                                    "queued",
+                                    "Ditunda karena batas kuota API Gemini.",
+                                )
+                            if is_embedding_daily_quota_error(error):
+                                raise _DailyEmbeddingQuotaExceededError from error
+                            raise _EmbeddingQuotaExceededError from error
                         for file_id in successful_file_ids:
-                            self._set_file_status(
-                                job_id,
-                                file_id,
-                                "queued",
-                                "Ditunda karena batas kuota API Gemini.",
-                            )
-                        if is_embedding_daily_quota_error(error):
-                            raise _DailyEmbeddingQuotaExceededError from error
-                        raise _EmbeddingQuotaExceededError from error
-                    for file_id in successful_file_ids:
-                        self._set_file_status(job_id, file_id, "failed", str(error))
-                    raise
+                            self._set_file_status(job_id, file_id, "failed", str(error))
+                        raise
                 updated_file_count += len(successful_file_ids)
                 committed_files.update(
                     {
@@ -706,6 +848,24 @@ class DriveSyncManager:
             "index_updated": changed or needs_manifest_save,
             "has_index": index is not None,
         }
+
+    def _save_index_checkpoint(
+        self,
+        index: FAISS,
+        folder_id: str,
+        committed_files: dict[str, str],
+        current_sources: dict[str, dict[str, str]],
+    ) -> None:
+        with self._index_lock:
+            index.save_local(str(DEFAULT_INDEX_DIRECTORY))
+            save_index_manifest(
+                folder_id,
+                committed_files,
+                True,
+                DEFAULT_INDEX_DIRECTORY,
+                current_sources,
+            )
+            gc.collect()
 
     @staticmethod
     def _save_source_text(document: DriveDocument) -> None:
@@ -813,6 +973,7 @@ class DriveSyncManager:
                 self._file_statuses[file_id]["state"] = "failed"
                 self._file_statuses[file_id]["error"] = reason
             self._status = f"PDF dilewati: {name} ({reason}); sinkronisasi dilanjutkan."
+        self._persist_failed_file_statuses()
 
     def _report_file_failed(
         self,
@@ -828,6 +989,7 @@ class DriveSyncManager:
                 self._file_statuses[file_id]["state"] = "failed"
                 self._file_statuses[file_id]["error"] = reason
             self._status = f"Sumber gagal: {name}; {reason}"
+        self._persist_failed_file_statuses()
 
     def _set_file_status(
         self,
@@ -840,6 +1002,98 @@ class DriveSyncManager:
             if job_id == self._job_id and file_id in self._file_statuses:
                 self._file_statuses[file_id]["state"] = state
                 self._file_statuses[file_id]["error"] = error
+        self._persist_failed_file_statuses()
+
+    def _load_failed_file_statuses(
+        self,
+        folder_id: str,
+    ) -> dict[str, dict[str, str]]:
+        with _SYNC_FAILURE_STATUS_LOCK:
+            if not SYNC_FAILURE_STATUS_PATH.is_file():
+                return {}
+            try:
+                status = json.loads(
+                    SYNC_FAILURE_STATUS_PATH.read_text(encoding="utf-8")
+                )
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    "The persisted failed-file status is invalid JSON."
+                ) from error
+            if not isinstance(status, dict):
+                raise ValueError("The persisted failed-file status must be an object.")
+            if status.get("folder_id") != folder_id:
+                return {}
+
+            files = status.get("files")
+            if not isinstance(files, dict):
+                raise ValueError("The persisted failed-file list is invalid.")
+            failed_statuses: dict[str, dict[str, str]] = {}
+            for file_id, file_status in files.items():
+                if not isinstance(file_id, str) or not isinstance(file_status, dict):
+                    raise ValueError("A persisted failed-file entry is invalid.")
+                name = file_status.get("name")
+                modified_time = file_status.get("modified_time")
+                error = file_status.get("error")
+                if not all(
+                    isinstance(value, str)
+                    for value in (name, modified_time, error)
+                ):
+                    raise ValueError("A persisted failed-file entry is incomplete.")
+                failed_statuses[file_id] = {
+                    "name": name,
+                    "modified_time": modified_time,
+                    "error": error,
+                }
+            return failed_statuses
+
+    def _persist_failed_file_statuses(self, folder_id: str | None = None) -> None:
+        with self._lock:
+            resolved_folder_id = folder_id or (
+                self._config[0] if self._config is not None else None
+            )
+            if resolved_folder_id is None:
+                return
+            failed_files = {
+                file_id: {
+                    "name": file_status["name"],
+                    "modified_time": file_status["modified_time"],
+                    "error": file_status.get("error", ""),
+                }
+                for file_id, file_status in self._file_statuses.items()
+                if file_status["state"] == "failed"
+            }
+
+        with _SYNC_FAILURE_STATUS_LOCK:
+            if not failed_files:
+                if SYNC_FAILURE_STATUS_PATH.is_file():
+                    try:
+                        persisted_status = json.loads(
+                            SYNC_FAILURE_STATUS_PATH.read_text(encoding="utf-8")
+                        )
+                    except json.JSONDecodeError as error:
+                        raise ValueError(
+                            "The persisted failed-file status is invalid JSON."
+                        ) from error
+                    if (
+                        isinstance(persisted_status, dict)
+                        and persisted_status.get("folder_id") == resolved_folder_id
+                    ):
+                        SYNC_FAILURE_STATUS_PATH.unlink()
+                return
+
+            SYNC_FAILURE_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = SYNC_FAILURE_STATUS_PATH.with_suffix(".tmp")
+            temporary_path.write_text(
+                json.dumps(
+                    {
+                        "folder_id": resolved_folder_id,
+                        "files": failed_files,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            temporary_path.replace(SYNC_FAILURE_STATUS_PATH)
 
     def _wait_until_resumed(self, job_id: int) -> None:
         while not self._resume_event.wait(timeout=0.5):
@@ -860,6 +1114,34 @@ class DriveSyncManager:
             job_id,
             f"Jeda aman embedding {wait_label} sebelum request berikutnya.",
         )
+
+    def _report_embedding_progress(
+        self,
+        job_id: int,
+        done: int,
+        total: int,
+        batch_number: int,
+        batch_total: int,
+    ) -> None:
+        now = monotonic()
+        with self._lock:
+            if job_id != self._job_id:
+                return
+            if batch_number != self._embedding_batch_number:
+                self._embedding_batch_number = batch_number
+                self._embedding_started_at = now
+            self._embedding_done_count = done
+            self._embedding_total = total
+            remaining = max(total - done, 0)
+            elapsed = now - self._embedding_started_at
+            self._embedding_eta_seconds = (
+                elapsed / done * remaining if done else None
+            )
+            status = (
+                f"Membuat embedding batch {batch_number}/{batch_total}: "
+                f"{done}/{total} potongan"
+            )
+            self._status = status + "."
 
     @staticmethod
     def _format_eta(seconds: float) -> str:

@@ -1,6 +1,8 @@
 .env
 credentials.json
 token.json
+.app_custom_logo.png
+.app_custom_logo.png.tmp
 private_config.json
 service-account*.json
 __pycache__/
@@ -22,3 +24,5 @@ private_config.json
 secrets.toml
 token.json
 .env
+faiss_index/sync_failures.json
+faiss_index/sync_failures.tmp

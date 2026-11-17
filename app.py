@@ -6,13 +6,23 @@ import ast
 import base64
 import html
 import json
+import os
 from datetime import datetime, timezone
+from importlib import import_module
+from inspect import signature
+from io import BytesIO
 from math import ceil
 import re
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = import_module("tomli")
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from PIL import Image
 from google.api_core.exceptions import GoogleAPIError
 from google.auth.exceptions import GoogleAuthError
 from googleapiclient.errors import HttpError
@@ -25,8 +35,8 @@ from requests.exceptions import RequestException
 from services.ai_service import (
     answer_question,
     find_source_link_matches,
-    is_full_context_request,
     is_source_link_request,
+    transcribe_audio,
 )
 from services.gdrive_service import (
     create_oauth_authorization,
@@ -36,13 +46,81 @@ from services.gdrive_service import (
 from services.sync_manager import DriveSyncManager
 
 
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "app_icon.png"
 st.set_page_config(
     page_title="JH Asisten AI",
-    page_icon="🕌",
+    page_icon=APP_ICON_PATH,
     layout="centered",
 )
 
 PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.json"
+CUSTOM_LOGO_PATH = PRIVATE_CONFIG_PATH.parent / ".app_custom_logo.png"
+MAX_LOGO_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_LOGO_IMAGE_PIXELS = 16_000_000
+MAX_CHAT_IMAGE_COUNT = 4
+MAX_CHAT_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
+APP_THEMES: dict[str, dict[str, str]] = {
+    "emerald": {
+        "label": "Zamrud & Gading",
+        "background": "#F3F6F1",
+        "surface": "#FFFFFF",
+        "sidebar": "#EAF1EB",
+        "text": "#20342C",
+        "primary": "#1F6A54",
+        "primary_text": "#FFFFFF",
+        "accent": "#B58B4B",
+        "chat": "#E8F0E9",
+        "border": "#D8E2D9",
+    },
+    "midnight": {
+        "label": "Galeri Tengah Malam",
+        "background": "#10141F",
+        "surface": "#171E2D",
+        "sidebar": "#131A28",
+        "text": "#E8EAF1",
+        "primary": "#78D6B0",
+        "primary_text": "#10251F",
+        "accent": "#C9A96E",
+        "chat": "#1D2638",
+        "border": "#30394C",
+    },
+    "terracotta": {
+        "label": "Atelier Terracotta",
+        "background": "#FAF4EE",
+        "surface": "#FFFDF9",
+        "sidebar": "#F5ECE3",
+        "text": "#3D2B26",
+        "primary": "#9D4F3B",
+        "primary_text": "#FFFFFF",
+        "accent": "#C78D52",
+        "chat": "#F3E7DC",
+        "border": "#E6D6C8",
+    },
+    "ocean": {
+        "label": "Biru Samudra",
+        "background": "#F0F6F8",
+        "surface": "#FCFEFF",
+        "sidebar": "#E9F1F4",
+        "text": "#203641",
+        "primary": "#26718B",
+        "primary_text": "#FFFFFF",
+        "accent": "#6BA9A6",
+        "chat": "#E3EFF2",
+        "border": "#D3E1E5",
+    },
+    "lavender": {
+        "label": "Lavender Artistik",
+        "background": "#F6F2F8",
+        "surface": "#FFFCFF",
+        "sidebar": "#F0EAF5",
+        "text": "#382D42",
+        "primary": "#77568B",
+        "primary_text": "#FFFFFF",
+        "accent": "#C27C9A",
+        "chat": "#EFE7F3",
+        "border": "#E4D7E9",
+    },
+}
 _WIB_TIMEZONE = ZoneInfo("Asia/Jakarta")
 _SUNDA_WEEKDAYS = (
     "Senén",
@@ -72,8 +150,30 @@ if PRIVATE_CONFIG_PATH.is_file():
 else:
     PRIVATE_CONFIG = {}
 
-DEFAULT_API_KEY = str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
+
+def _load_google_api_key() -> str:
+    if PRIVATE_CONFIG.get("google_api_key_override") is True:
+        return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
+
+    environment_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if environment_api_key:
+        return environment_api_key
+
+    secrets_path = PRIVATE_CONFIG_PATH.parent / "secrets.toml"
+    if secrets_path.is_file():
+        secrets_config = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
+        secrets_api_key = str(secrets_config.get("google_api_key", "")).strip()
+        if secrets_api_key:
+            return secrets_api_key
+
+    return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
+
+
+DEFAULT_API_KEY = _load_google_api_key()
 DEFAULT_FOLDER_ID = str(PRIVATE_CONFIG.get("google_drive_folder_id", "")).strip()
+APP_THEME_ID = str(PRIVATE_CONFIG.get("app_theme", "emerald"))
+if APP_THEME_ID not in APP_THEMES:
+    APP_THEME_ID = "emerald"
 _ARABIC_TEXT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
 
 
@@ -83,6 +183,71 @@ def _save_private_config(config: dict[str, object]) -> None:
         encoding="utf-8",
     )
     PRIVATE_CONFIG_PATH.chmod(0o600)
+
+
+def _prepare_custom_logo(image_bytes: bytes) -> bytes:
+    if not image_bytes:
+        raise ValueError("File logo kosong.")
+    if len(image_bytes) > MAX_LOGO_UPLOAD_BYTES:
+        raise ValueError("Ukuran logo maksimal 5 MB.")
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            if image.format not in {"PNG", "JPEG", "WEBP"}:
+                raise ValueError("Logo harus berformat PNG, JPG, atau WEBP.")
+            if image.width * image.height > MAX_LOGO_IMAGE_PIXELS:
+                raise ValueError("Resolusi logo terlalu besar.")
+
+            image.thumbnail((512, 512))
+            output = BytesIO()
+            image.convert("RGBA" if "A" in image.getbands() else "RGB").save(
+                output,
+                format="PNG",
+                optimize=True,
+            )
+    except (Image.DecompressionBombError, OSError) as error:
+        raise ValueError("File logo tidak dapat dibaca.") from error
+
+    return output.getvalue()
+
+
+def _save_custom_logo(image_bytes: bytes) -> None:
+    temporary_path = CUSTOM_LOGO_PATH.with_name(".app_custom_logo.png.tmp")
+    temporary_path.write_bytes(image_bytes)
+    temporary_path.chmod(0o600)
+    temporary_path.replace(CUSTOM_LOGO_PATH)
+
+
+def _prepare_chat_image(image_bytes: bytes) -> tuple[bytes, str]:
+    if not image_bytes:
+        raise ValueError("File gambar kosong.")
+    if len(image_bytes) > MAX_LOGO_UPLOAD_BYTES:
+        raise ValueError("Ukuran setiap gambar maksimal 5 MB.")
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            if image.format not in {"PNG", "JPEG", "WEBP"}:
+                raise ValueError("Gambar harus berformat PNG, JPG, atau WEBP.")
+            if image.width * image.height > MAX_LOGO_IMAGE_PIXELS:
+                raise ValueError("Resolusi gambar terlalu besar.")
+
+            image.thumbnail((1024, 1024))
+            output = BytesIO()
+            if "A" in image.getbands():
+                image.convert("RGBA").save(output, format="PNG", optimize=True)
+                mime_type = "image/png"
+            else:
+                image.convert("RGB").save(
+                    output,
+                    format="JPEG",
+                    quality=85,
+                    optimize=True,
+                )
+                mime_type = "image/jpeg"
+    except (Image.DecompressionBombError, OSError) as error:
+        raise ValueError("File gambar tidak dapat dibaca.") from error
+
+    return output.getvalue(), mime_type
 
 
 def _clean_legacy_assistant_message(content: str) -> str:
@@ -121,7 +286,7 @@ def _render_message_content(content: str) -> None:
                 unsafe_allow_html=True,
             )
         else:
-            markdown_lines.append(line)
+            markdown_lines.append(f"{line}  " if line else line)
     flush_markdown()
 
 
@@ -222,11 +387,26 @@ def _format_rpd_reset_time(reset_at: datetime) -> str:
     )
 
 
+def _format_sync_eta(seconds: float) -> str:
+    remaining_seconds = ceil(max(seconds, 0))
+    if remaining_seconds < 60:
+        return f"{remaining_seconds} detik"
+    minutes = ceil(remaining_seconds / 60)
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours:
+        return (
+            f"{hours} jam {remaining_minutes} menit"
+            if remaining_minutes
+            else f"{hours} jam"
+        )
+    return f"{minutes} menit"
+
+
 @st.fragment(run_every="1s")
-def _render_rpd_limit_notice() -> None:
+def _render_rpd_limit_notice(api_key: str) -> None:
     manager = _get_drive_sync_manager()
     now = datetime.now(timezone.utc)
-    status = manager.get_rpd_status(now)
+    status = manager.get_rpd_status(now, api_key=api_key)
     if status is None:
         if st.session_state.pop("_rpd_notice_was_active", False):
             st.rerun(scope="app")
@@ -253,25 +433,39 @@ def _render_rpd_limit_notice() -> None:
 @st.fragment(run_every="3s")
 def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
     manager = _get_drive_sync_manager()
+    if st.session_state.pop("_quota_resume_start_failed", False):
+        st.warning(
+            "API key tersimpan, tetapi sinkronisasi otomatis belum dapat dimulai. "
+            "Tekan Sinkronkan Sekarang untuk melanjutkan indeks."
+        )
     snapshot = manager.snapshot()
-    rpd_status = manager.get_rpd_status()
+    rpd_status = manager.get_rpd_status(api_key=api_key)
     result = snapshot["result"]
     file_count = int(snapshot["file_count"])
+    embedding_total = int(snapshot.get("embedding_total", 0))
 
     if result:
         file_count = int(result["file_count"])
         st.session_state.document_count = file_count
         generation = int(snapshot["generation"])
         if generation != st.session_state.get("drive_sync_generation_seen", 0):
-            st.session_state.drive_sync_generation_seen = generation
             st.session_state.index_manifest_files = result["files"]
             st.session_state.index_has_index = bool(result["has_index"])
             if result["index_updated"]:
-                index = manager.load_local_index(folder_id, api_key)
+                try:
+                    index = manager.load_local_index(folder_id, api_key)
+                except EOFError:
+                    st.warning(
+                        "Indeks FAISS belum terbaca karena berkasnya belum lengkap. "
+                        "Aplikasi akan mencoba lagi."
+                    )
+                    return
                 st.session_state.search_index = index
                 st.session_state.index_folder_id = folder_id
                 st.session_state.index_api_key = api_key
+                st.session_state.drive_sync_generation_seen = generation
                 st.rerun(scope="app")
+            st.session_state.drive_sync_generation_seen = generation
 
     st.caption(f"File Drive terpantau: {file_count}")
     if snapshot["phase"] == "quota_error" and rpd_status is None:
@@ -285,6 +479,34 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
         downloaded = int(snapshot["downloaded_count"])
         fraction = downloaded / total if total else 0.0
         st.progress(fraction, text=str(snapshot["status"]))
+    elif snapshot["phase"] == "embedding" and embedding_total:
+        total = embedding_total
+        done = int(snapshot.get("embedding_done_count", 0))
+        fraction = done / total
+        st.progress(
+            fraction,
+            text=f"{snapshot['status']} ({fraction:.0%})",
+        )
+        eta = snapshot.get("embedding_eta_seconds")
+        if str(snapshot["status"]).startswith("Jeda aman embedding"):
+            st.caption(str(snapshot["status"]))
+        elif eta is None:
+            st.caption(
+                "Estimasi waktu batch ini dihitung setelah batch embedding pertama selesai."
+            )
+        elif done < total:
+            st.caption(f"Estimasi waktu batch ini: {_format_sync_eta(float(eta))}")
+        else:
+            st.caption("Embedding batch selesai; hasil sedang disimpan.")
+    elif (
+        snapshot["phase"] == "embedding"
+        and "embedding_total" not in snapshot
+    ):
+        st.caption(str(snapshot["status"]))
+        st.info(
+            "Sinkronisasi ini memakai status versi lama. Setelah selesai, "
+            "mulai ulang aplikasi untuk menampilkan progres embedding."
+        )
     elif snapshot["phase"] in {"embedding", "saving"}:
         st.caption(str(snapshot["status"]))
     else:
@@ -327,23 +549,20 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
         st.rerun(scope="fragment")
 
     with st.expander(f"Daftar sumber ({len(files)})"):
-        state_order = {
-            "downloading": 0,
-            "downloaded": 1,
-            "embedding": 2,
-            "queued": 3,
-            "failed": 4,
-            "ready": 5,
-        }
-        for file_status in sorted(files, key=lambda item: state_order.get(item["state"], 5)):
-            file_id = file_status["id"]
-            state = file_status["state"]
-            columns = st.columns([4, 1])
-            with columns[0]:
-                st.write(f"{file_status['name']} · {status_labels.get(state, state)}")
-                if file_status.get("error"):
-                    st.caption(file_status["error"])
-            if state == "failed":
+        failed_files = [
+            file_status for file_status in files if file_status["state"] == "failed"
+        ]
+        if failed_files:
+            st.markdown(f"**File gagal ({len(failed_files)})**")
+            for file_status in failed_files:
+                file_id = file_status["id"]
+                columns = st.columns([4, 1])
+                with columns[0]:
+                    st.write(file_status["name"])
+                    st.caption(
+                        file_status.get("error")
+                        or "Teks kosong atau rusak, silakan konversi ke Google Docs"
+                    )
                 with columns[1]:
                     if st.button(
                         "Coba ulang",
@@ -353,6 +572,28 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
                         if manager.retry_file(file_id):
                             manager.start_sync(folder_id, api_key)
                         st.rerun(scope="fragment")
+            st.divider()
+        else:
+            st.caption("Tidak ada file yang gagal.")
+
+        state_order = {
+            "downloading": 0,
+            "downloaded": 1,
+            "embedding": 2,
+            "queued": 3,
+            "failed": 4,
+            "ready": 5,
+        }
+        for file_status in sorted(files, key=lambda item: state_order.get(item["state"], 5)):
+            if file_status["state"] == "failed":
+                continue
+            file_id = file_status["id"]
+            state = file_status["state"]
+            columns = st.columns([4, 1])
+            with columns[0]:
+                st.write(f"{file_status['name']} · {status_labels.get(state, state)}")
+                if file_status.get("error"):
+                    st.caption(file_status["error"])
 
     ready_files = [file_status for file_status in files if file_status["state"] == "ready"]
     with st.expander(f"Pratinjau sumber tersedia ({len(ready_files)})"):
@@ -430,23 +671,82 @@ if "app_title" not in st.session_state:
     st.session_state.app_title = str(
         PRIVATE_CONFIG.get("app_title", "✨ Asisten AI Pribadi")
     )
+theme = APP_THEMES[APP_THEME_ID]
 st.markdown(
-    """
+    f"""
     <style>
-    .block-container { max-width: 860px; padding-top: 2rem; }
-    [data-testid="stChatMessage"] { border-radius: 0.8rem; }
-    .arabic-chat-line {
+    html, body, [data-testid="stAppViewContainer"], .stApp {{
+        background-color: {theme["background"]};
+        color: {theme["text"]};
+    }}
+    [data-testid="stHeader"] {{ background: transparent; }}
+    [data-testid="stSidebar"],
+    [data-testid="stSidebar"] > div:first-child {{
+        background-color: {theme["sidebar"]};
+        border-right: 1px solid {theme["border"]};
+    }}
+    .block-container {{ max-width: 860px; padding-top: 2rem; }}
+    [data-testid="stChatMessage"] {{
+        background-color: {theme["chat"]};
+        border: 1px solid {theme["border"]};
+        border-radius: 0.9rem;
+    }}
+    [data-testid="stChatInput"] {{
+        background-color: {theme["surface"]};
+        border-color: {theme["border"]};
+        border-radius: 0.9rem;
+    }}
+    [data-testid="stExpander"] {{ border-color: {theme["border"]}; }}
+    [data-testid="stFileUploader"] {{
+        background-color: {theme["surface"]};
+        border: 1px dashed {theme["accent"]};
+        border-radius: 0.8rem;
+    }}
+    a {{ color: {theme["primary"]} !important; }}
+    div.stButton > button {{
+        background-color: {theme["surface"]};
+        border: 1px solid {theme["accent"]};
+        border-radius: 0.7rem;
+        color: {theme["text"]};
+        transition: transform 120ms ease, box-shadow 120ms ease;
+    }}
+    div.stButton > button:hover {{
+        border-color: {theme["primary"]};
+        box-shadow: 0 3px 12px {theme["border"]};
+        transform: translateY(-1px);
+    }}
+    div.stButton > button[kind="primary"] {{
+        background-color: {theme["primary"]};
+        color: {theme["primary_text"]};
+    }}
+    input, textarea {{
+        background-color: {theme["surface"]} !important;
+        color: {theme["text"]} !important;
+        border-color: {theme["border"]} !important;
+    }}
+    .arabic-chat-line {{
         direction: rtl;
         text-align: right;
         font-family: "Noto Naskh Arabic", "Amiri", "Traditional Arabic", serif;
         font-size: 1.25rem;
         line-height: 2;
         margin: 0.35rem 0;
-    }
-    @media (max-width: 640px) {
-        .block-container { padding: 1rem 0.8rem 2rem; }
-        h1 { font-size: 1.8rem !important; }
-    }
+    }}
+    .app-brand-title {{
+        font-size: 88px;
+        line-height: 1;
+        margin: 0;
+    }}
+    @media (max-width: 850px) {{
+        .app-brand-title {{ font-size: 48px; }}
+        .block-container [data-testid="stImage"] img {{ width: 48px !important; }}
+    }}
+    @media (max-width: 640px) {{
+        .block-container {{ padding: 1rem 0.8rem 2rem; }}
+        h1 {{ font-size: 1.8rem !important; }}
+        .app-brand-title {{ font-size: 32px !important; }}
+        .block-container [data-testid="stImage"] img {{ width: 32px !important; }}
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -482,12 +782,109 @@ with st.sidebar:
             PRIVATE_CONFIG["app_title"] = edited_title
             _save_private_config(PRIVATE_CONFIG)
 
-st.title(st.session_state.app_title)
-st.caption("✨ JH Asisten AI - Memori Otomatis Terhubung dengan Google Drive")
+        with st.form("google_api_key_form", clear_on_submit=True):
+            edited_api_key = st.text_input(
+                "API Key Google Gemini",
+                type="password",
+                placeholder="Tempel API key baru",
+            )
+            save_api_key = st.form_submit_button("Simpan API key")
+
+        if save_api_key:
+            edited_api_key = edited_api_key.strip()
+            if not edited_api_key:
+                st.error("API key tidak boleh kosong.")
+            else:
+                previous_api_key = str(st.session_state.google_api_key)
+                manager = _get_drive_sync_manager()
+                resume_quota_sync = (
+                    edited_api_key != previous_api_key
+                    and (
+                        manager.snapshot()["phase"] == "quota_error"
+                        or manager.get_rpd_status(api_key=previous_api_key) is not None
+                    )
+                )
+                PRIVATE_CONFIG["google_api_key"] = edited_api_key
+                PRIVATE_CONFIG["google_api_key_override"] = True
+                _save_private_config(PRIVATE_CONFIG)
+                if resume_quota_sync and folder_id:
+                    if not manager.start_sync(folder_id, edited_api_key):
+                        st.session_state["_quota_resume_start_failed"] = True
+                st.rerun()
+
+        if PRIVATE_CONFIG.get("google_api_key_override") is True:
+            st.caption("Aplikasi memakai API key yang disimpan dari menu ini.")
+            if st.button(
+                "Gunakan key dari konfigurasi server",
+                key="use_server_google_api_key",
+            ):
+                PRIVATE_CONFIG.pop("google_api_key", None)
+                PRIVATE_CONFIG.pop("google_api_key_override", None)
+                _save_private_config(PRIVATE_CONFIG)
+                st.rerun()
+
+        with st.form("appearance_settings_form", clear_on_submit=False):
+            selected_theme = st.selectbox(
+                "Tema aplikasi",
+                options=list(APP_THEMES),
+                index=list(APP_THEMES).index(APP_THEME_ID),
+                format_func=lambda theme_id: APP_THEMES[theme_id]["label"],
+            )
+            uploaded_logo = st.file_uploader(
+                "Logo aplikasi (PNG, JPG, WEBP)",
+                type=["png", "jpg", "jpeg", "webp"],
+            )
+            save_appearance = st.form_submit_button("Simpan tampilan")
+
+        if save_appearance:
+            try:
+                prepared_logo = None
+                if uploaded_logo is not None:
+                    if uploaded_logo.size > MAX_LOGO_UPLOAD_BYTES:
+                        raise ValueError("Ukuran logo maksimal 5 MB.")
+                    prepared_logo = _prepare_custom_logo(uploaded_logo.getvalue())
+
+                if prepared_logo is not None:
+                    _save_custom_logo(prepared_logo)
+                PRIVATE_CONFIG["app_theme"] = selected_theme
+                _save_private_config(PRIVATE_CONFIG)
+            except (OSError, ValueError) as error:
+                st.error(f"Tampilan tidak dapat disimpan: {error}")
+            else:
+                st.rerun()
+
+        if CUSTOM_LOGO_PATH.is_file() and st.button(
+            "Hapus logo unggahan",
+            key="remove_custom_logo",
+        ):
+            try:
+                CUSTOM_LOGO_PATH.unlink()
+            except OSError as error:
+                st.error(f"Logo tidak dapat dihapus: {error}")
+            else:
+                st.rerun()
+
+if CUSTOM_LOGO_PATH.is_file():
+    logo_column, title_column = st.columns([1, 8], vertical_alignment="center")
+    with logo_column:
+        st.image(str(CUSTOM_LOGO_PATH), width=88)
+    with title_column:
+        st.markdown(
+            f'<h1 class="app-brand-title">{html.escape(st.session_state.app_title)}</h1>',
+            unsafe_allow_html=True,
+        )
+else:
+    st.title(st.session_state.app_title)
+st.caption("JH Asisten AI - Naroskeun - Nalaah - Milari")
 
 api_key = st.session_state.google_api_key
 if not api_key:
     st.info("Atur GOOGLE_API_KEY sebelum menggunakan fitur pencarian AI.")
+else:
+    try:
+        _get_drive_sync_manager().get_rpd_status(api_key=api_key)
+    except (OSError, ValueError) as error:
+        st.warning(f"Status jeda kuota Gemini tidak dapat diperbarui: {error}")
 if not folder_id:
     st.info("Atur GOOGLE_DRIVE_FOLDER_ID untuk menghubungkan memori Google Drive.")
 
@@ -502,6 +899,11 @@ if api_key and folder_id:
             st.session_state.search_index = manager.load_local_index(folder_id, api_key)
             st.session_state.index_folder_id = folder_id
             st.session_state.index_api_key = api_key
+    except EOFError:
+        st.warning(
+            "Indeks FAISS belum terbaca karena berkasnya belum lengkap. "
+            "Muat ulang aplikasi setelah sinkronisasi selesai."
+        )
     except (GoogleAPIError, GoogleAuthError, HttpError, OSError, ValueError) as error:
         st.warning(f"Indeks lokal belum dapat dimuat: {error}")
 
@@ -560,7 +962,7 @@ if api_key and folder_id:
 if api_key and folder_id and drive_authorized:
     try:
         with st.sidebar:
-            _render_rpd_limit_notice()
+            _render_rpd_limit_notice(api_key)
             _render_drive_sync_status(folder_id, api_key)
     except (GoogleAPIError, GoogleAuthError, HttpError, OSError, ValueError) as error:
         st.warning(f"Sinkronisasi Drive berjalan di latar belakang; indeks lokal tetap digunakan bila tersedia. {error}")
@@ -573,6 +975,14 @@ for message in st.session_state.messages:
         message["content"] = _clean_legacy_assistant_message(message["content"])
     with st.chat_message(message["role"]):
         _render_message_content(message["content"])
+        for image_data in message.get("images", []):
+            st.image(base64.b64decode(image_data), width=260)
+        audio_data = message.get("audio")
+        if isinstance(audio_data, dict):
+            st.audio(
+                base64.b64decode(audio_data["data"]),
+                format=audio_data["mime_type"],
+            )
         if message["role"] == "assistant":
             _render_source_links(
                 message.get("sources", []),
@@ -583,16 +993,97 @@ for message in st.session_state.messages:
                 f"history_copy_{len(st.session_state.messages)}_{id(message)}",
             )
 
-question = st.chat_input("Tanyakan sesuatu dari dokumen Anda...")
-if question:
-    st.session_state.messages.append({"role": "user", "content": question})
+chat_submission = st.chat_input(
+    "Tulis, rekam suara, atau lampirkan gambar...",
+    accept_file="multiple",
+    file_type=["png", "jpg", "jpeg", "webp"],
+    accept_audio=True,
+    max_upload_size=10,
+)
+if chat_submission is not None:
+    typed_question = chat_submission.text.strip()
+    image_uploads = chat_submission.files
+    audio_upload = chat_submission.audio
+    media_parts: list[dict[str, str]] = []
+    image_previews: list[str] = []
+    audio_preview: dict[str, str] | None = None
+    transcript = ""
+    processing_error: Exception | None = None
+    try:
+        if len(image_uploads) > MAX_CHAT_IMAGE_COUNT:
+            raise ValueError(f"Maksimal {MAX_CHAT_IMAGE_COUNT} gambar per pesan.")
+
+        total_image_bytes = 0
+        for image_upload in image_uploads:
+            image_bytes = image_upload.getvalue()
+            total_image_bytes += len(image_bytes)
+            if total_image_bytes > MAX_CHAT_IMAGE_TOTAL_BYTES:
+                raise ValueError("Total ukuran gambar per pesan maksimal 10 MB.")
+            prepared_image, mime_type = _prepare_chat_image(image_bytes)
+            encoded_image = base64.b64encode(prepared_image).decode("ascii")
+            media_parts.append(
+                {
+                    "type": "file",
+                    "source_type": "base64",
+                    "mime_type": mime_type,
+                    "data": encoded_image,
+                }
+            )
+            image_previews.append(encoded_image)
+
+        if audio_upload is not None:
+            audio_bytes = audio_upload.getvalue()
+            transcript = transcribe_audio(
+                audio_bytes,
+                audio_upload.type or "audio/wav",
+                api_key=api_key,
+            )
+            audio_preview = {
+                "data": base64.b64encode(audio_bytes).decode("ascii"),
+                "mime_type": audio_upload.type or "audio/wav",
+            }
+
+        question_parts = [part for part in (typed_question, transcript) if part]
+        question = "\n\n".join(question_parts)
+        if not question and image_previews:
+            question = "Jelaskan gambar yang saya lampirkan."
+        if not question:
+            raise ValueError("Tulis pertanyaan, rekam suara, atau lampirkan gambar.")
+    except (GoogleAPIError, GoogleGenerativeAIError, ValueError) as error:
+        processing_error = error
+        question = typed_question or "Pesan suara atau gambar terlampir."
+
+    displayed_question = question
+    if transcript and typed_question:
+        displayed_question = f"{typed_question}\n\n🎙️ {transcript}"
+    elif transcript:
+        displayed_question = f"🎙️ {transcript}"
+
+    user_message: dict[str, object] = {
+        "role": "user",
+        "content": displayed_question,
+        "images": image_previews,
+    }
+    if audio_preview is not None:
+        user_message["audio"] = audio_preview
+    st.session_state.messages.append(user_message)
     with st.chat_message("user"):
-        _render_message_content(question)
+        _render_message_content(displayed_question)
+        for image_data in image_previews:
+            st.image(base64.b64decode(image_data), width=260)
+        if audio_preview is not None:
+            st.audio(
+                base64.b64decode(audio_preview["data"]),
+                format=audio_preview["mime_type"],
+            )
 
     with st.chat_message("assistant"):
         index: FAISS | None = st.session_state.get("search_index")
         response_sources: list[dict[str, str]] = []
-        if is_source_link_request(question):
+        if processing_error is not None:
+            response_text = f"Pesan tidak dapat diproses: {processing_error}"
+            _render_message_content(response_text)
+        elif is_source_link_request(question) and not media_parts:
             response_sources = find_source_link_matches(question, index)
             if response_sources:
                 response_text = "Berikut tautan sumber yang paling cocok:"
@@ -600,30 +1091,95 @@ if question:
                 response_text = "Belum ditemukan nama sumber yang cocok di daftar Drive."
             _render_message_content(response_text)
             _render_source_links(response_sources, "requested_source")
-        elif index is None:
+        elif index is None and not media_parts:
             response_text = (
                 "Indeks awal sedang disiapkan di latar belakang. "
                 "Coba kirim pertanyaan lagi setelah status memori siap."
             )
             _render_message_content(response_text)
         else:
-            try:
-                spinner_text = (
-                    "Mencari dan menyusun hingga 25 bagian berurutan..."
-                    if is_full_context_request(question)
-                    else "Mencari jawaban..."
+            manager = _get_drive_sync_manager()
+            is_index_busy = getattr(manager, "is_index_busy", None)
+            force_local_search = (
+                bool(is_index_busy()) if callable(is_index_busy) else False
+            )
+            answer_signature = signature(answer_question)
+            answer_parameters = answer_signature.parameters
+            supports_search_progress = "on_progress" in answer_parameters
+            supports_answer_streaming = "on_token" in answer_parameters
+            supports_local_search = "force_local_search" in answer_parameters
+            if not supports_search_progress or not supports_answer_streaming:
+                st.warning(
+                    "Layanan pencarian yang sedang berjalan masih versi lama. "
+                    "Jawaban tetap diproses, tetapi mulai ulang proses Streamlit "
+                    "untuk mengaktifkan status progres."
                 )
-                with st.spinner(spinner_text):
+
+            answer_message = st.empty()
+            streamed_answer: list[str] = []
+
+            search_status = st.status(
+                "Mencari di indeks lokal..."
+                if force_local_search
+                else "Menghubungi Gemini untuk embedding pertanyaan...",
+                expanded=False,
+            )
+
+            def update_search_progress(message: str) -> None:
+                search_status.update(label=message, state="running")
+
+            def show_answer_token(token: str | None) -> None:
+                if token is None:
+                    streamed_answer.clear()
+                    answer_message.empty()
+                    return
+                streamed_answer.append(token)
+                update_search_progress("Menerima jawaban dari Gemini...")
+                answer_message.markdown("".join(streamed_answer))
+
+            local_search_options = (
+                {"force_local_search": force_local_search}
+                if supports_local_search
+                else {}
+            )
+            try:
+                if supports_search_progress and supports_answer_streaming:
                     response_text, response_sources = answer_question(
                         index,
                         question,
                         api_key=api_key,
+                        media_parts=media_parts,
+                        on_progress=update_search_progress,
+                        on_token=show_answer_token,
+                        **local_search_options,
                     )
+                elif supports_search_progress:
+                    response_text, response_sources = answer_question(
+                        index,
+                        question,
+                        api_key=api_key,
+                        media_parts=media_parts,
+                        on_progress=update_search_progress,
+                        **local_search_options,
+                    )
+                else:
+                    response_text, response_sources = answer_question(
+                        index,
+                        question,
+                        api_key=api_key,
+                        media_parts=media_parts,
+                        **local_search_options,
+                    )
+            except (GoogleAPIError, GoogleGenerativeAIError, ValueError) as error:
+                answer_message.empty()
+                response_text = f"Pencarian gagal: {error}"
+                search_status.update(label="Pencarian gagal", state="error")
+                st.error(response_text)
+            else:
+                answer_message.empty()
+                search_status.update(label="Selesai", state="complete")
                 _render_message_content(response_text)
                 _render_source_links(response_sources, "answer_source")
-            except (GoogleAPIError, GoogleGenerativeAIError, ValueError) as error:
-                response_text = f"Pencarian gagal: {error}"
-                st.error(response_text)
         _render_copy_button(response_text, "current_answer_copy")
 
     st.session_state.messages.append(
