@@ -146,34 +146,44 @@ _SUNDA_MONTHS = (
     "Désémber",
 )
 if PRIVATE_CONFIG_PATH.is_file():
-    PRIVATE_CONFIG = json.loads(PRIVATE_CONFIG_PATH.read_text(encoding="utf-8"))
+  PRIVATE_CONFIG = json.loads(PRIVATE_CONFIG_PATH.read_text(encoding="utf-8"))
 else:
-    PRIVATE_CONFIG = {}
+  PRIVATE_CONFIG = {}
+
+try:
+  for _k, _v in st.secrets.items():
+    if _k not in PRIVATE_CONFIG and isinstance(_v, (str, int, float, bool)):
+      PRIVATE_CONFIG[_k] = _v
+except Exception:
+  pass
 
 
 def _load_google_api_key() -> str:
-    if PRIVATE_CONFIG.get("google_api_key_override") is True:
-        return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
-
-    environment_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if environment_api_key:
-        return environment_api_key
-
-    secrets_path = PRIVATE_CONFIG_PATH.parent / "secrets.toml"
-    if secrets_path.is_file():
-        secrets_config = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
-        secrets_api_key = str(secrets_config.get("google_api_key", "")).strip()
-        if secrets_api_key:
-            return secrets_api_key
-
+  if PRIVATE_CONFIG.get("google_api_key_override") is True:
     return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
+
+  environment_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+  if environment_api_key:
+    return environment_api_key
+
+  secrets_path = PRIVATE_CONFIG_PATH.parent / "secrets.toml"
+  if secrets_path.is_file():
+    secrets_config = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
+    secrets_api_key = str(secrets_config.get("google_api_key", "")).strip()
+    if secrets_api_key:
+      return secrets_api_key
+
+  return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
 
 
 DEFAULT_API_KEY = _load_google_api_key()
-DEFAULT_FOLDER_ID = str(PRIVATE_CONFIG.get("google_drive_folder_id", "")).strip()
+DEFAULT_FOLDER_ID = (
+    os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    or str(PRIVATE_CONFIG.get("google_drive_folder_id", "")).strip()
+)
 APP_THEME_ID = str(PRIVATE_CONFIG.get("app_theme", "emerald"))
 if APP_THEME_ID not in APP_THEMES:
-    APP_THEME_ID = "emerald"
+  APP_THEME_ID = "emerald"
 _ARABIC_TEXT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
 
 
