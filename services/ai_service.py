@@ -34,15 +34,51 @@ from services.gdrive_service import DriveDocument
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INDEX_DIRECTORY = PROJECT_ROOT / "faiss_index"
 MANIFEST_FILENAME = "drive_manifest.json"
-EMBEDDING_TOKENS_PER_MINUTE = 27_000
+
+
+def _env_number(name: str, default, cast=int):
+    """Baca angka positif dari environment variable; pakai default jika kosong/salah."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# --- Kalibrasi kuota gemini-embedding-001 (tier gratis) ---------------------
+# Kuota berlaku per PROYEK Google Cloud (bukan per API key). Nilai di bawah bisa
+# diubah lewat environment variable bila batas di AI Studio Anda berbeda
+# (cek: AI Studio > Rate limits). Semua dihitung dengan margin keamanan.
+EMBEDDING_FREE_TIER_RPM = _env_number("GEMINI_EMBED_RPM", 100)
+EMBEDDING_FREE_TIER_TPM = _env_number("GEMINI_EMBED_TPM", 30_000)
+EMBEDDING_SAFETY_FACTOR = 0.85
 EMBEDDING_WINDOW_SECONDS = 60.0
-EMBEDDING_TARGET_BATCH_TOKENS = 22_000
-EMBEDDING_MAX_REQUESTS_PER_MINUTE = 30
-EMBEDDING_MAX_BATCH_SIZE = 20
-EMBEDDING_MAX_BATCH_CHARACTERS = 15_000
-EMBEDDING_MAX_QUOTA_RETRIES = 2
+# Anggaran per jendela 60 detik. Teks dalam satu batch DIHITUNG SATU PER SATU
+# untuk RPM (laporan komunitas: batchEmbedContents berisi N teks = N request).
+EMBEDDING_TOKENS_PER_MINUTE = int(EMBEDDING_FREE_TIER_TPM * EMBEDDING_SAFETY_FACTOR)
+EMBEDDING_TEXTS_PER_MINUTE = int(EMBEDDING_FREE_TIER_RPM * EMBEDDING_SAFETY_FACTOR)
+EMBEDDING_MAX_REQUESTS_PER_MINUTE = 30  # panggilan HTTP, hanya agar tidak "menembak" API
+EMBEDDING_MAX_BATCH_SIZE = 100  # batas teks per panggilan API
+# Batas per panggilan API ~20.000 token; dibatasi juga separuh anggaran TPM agar
+# dua batch bisa muat dalam satu jendela menit dan jendela terisi merata.
+EMBEDDING_TARGET_BATCH_TOKENS = min(18_000, EMBEDDING_TOKENS_PER_MINUTE // 2)
+EMBEDDING_MAX_BATCH_CHARACTERS = EMBEDDING_TARGET_BATCH_TOKENS * 3  # estimasi 1 token = 3 karakter
+EMBEDDING_MAX_TEXT_CHARACTERS = 6_000  # 1 teks maksimal 2.048 token; lebih dari itu dipotong diam-diam
+EMBEDDING_MAX_QUOTA_RETRIES = 3  # retry untuk 429 per-menit
+EMBEDDING_UNKNOWN_QUOTA_RETRIES = 1  # retry untuk 429 yang tidak jelas menit/harian
+EMBEDDING_MIN_QUOTA_WAIT_SECONDS = 30.0
+EMBEDDING_MAX_QUOTA_WAIT_SECONDS = 70.0
 EMBEDDING_DEFAULT_QUOTA_RETRY_DELAY_SECONDS = EMBEDDING_WINDOW_SECONDS
 EMBEDDING_MAX_AUTOMATIC_QUOTA_WAIT_SECONDS = 300.0
+# --- Chunking ----------------------------------------------------------------
+# Satu halaman PDF dipecah sendiri-sendiri (page_sections), jadi halaman <= 3.500
+# karakter selalu menjadi tepat 1 chunk. Dimensi vektor tidak terpengaruh.
+RAG_CHUNK_SIZE = _env_number("RAG_CHUNK_SIZE", 3_500)
+RAG_CHUNK_OVERLAP = min(_env_number("RAG_CHUNK_OVERLAP", 350), RAG_CHUNK_SIZE // 4)
+RAG_CLEAN_OCR = os.getenv("RAG_CLEAN_OCR", "").strip().lower() in {"1", "true", "yes"}
 EMBEDDING_REQUEST_TIMEOUT_MS = 30_000
 CHAT_QUERY_EMBEDDING_TIMEOUT_MS = 5_000
 CHAT_MODEL_REQUEST_TIMEOUT_SECONDS = 180
@@ -80,59 +116,83 @@ def reduce_embedding_vector(vector: Sequence[float]) -> list[float]:
 
 
 class _EmbeddingRateLimiter:
+    """Jendela geser 60 detik: token (TPM), teks (RPM per teks), dan panggilan HTTP."""
+
     def __init__(self) -> None:
         self._lock = Lock()
-        self._requests: deque[tuple[float, int]] = deque()
+        # (waktu, token, jumlah teks)
+        self._events: deque[tuple[float, int, int]] = deque()
+        self._throttle_factor = 1.0
+
+    @staticmethod
+    def _wait_for(
+        events: deque[tuple[float, int, int]],
+        value_of: Callable[[tuple[float, int, int]], int],
+        limit: int,
+        need: int,
+        now: float,
+    ) -> float:
+        used = sum(value_of(event) for event in events)
+        if used + need <= limit:
+            return 0.0
+        remaining = used
+        for event in events:
+            remaining -= value_of(event)
+            if remaining + need <= limit:
+                return max(0.0, event[0] + EMBEDDING_WINDOW_SECONDS - now)
+        return EMBEDDING_WINDOW_SECONDS
+
+    def penalize(self) -> None:
+        """Dipanggil saat 429: turunkan laju sementara."""
+        with self._lock:
+            self._throttle_factor = max(0.4, self._throttle_factor * 0.7)
+
+    def reward(self) -> None:
+        """Dipanggil saat sukses: pulihkan laju bertahap."""
+        with self._lock:
+            self._throttle_factor = min(1.0, self._throttle_factor + 0.05)
 
     def acquire(
         self,
         estimated_tokens: int,
+        text_count: int = 1,
         on_wait: Callable[[float], None] | None = None,
     ) -> None:
-        if estimated_tokens > EMBEDDING_TARGET_BATCH_TOKENS:
+        estimated_tokens = max(int(estimated_tokens), 1)
+        text_count = max(int(text_count), 1)
+        if estimated_tokens > EMBEDDING_TOKENS_PER_MINUTE:
             raise ValueError(
-                "Մեկ embedding հարցման գնահատված token-ների քանակը գերազանցում է "
-                f"{EMBEDDING_TARGET_BATCH_TOKENS}-ի անվտանգ սահմանը։"
+                "Estimasi token satu permintaan embedding melebihi anggaran aman "
+                f"{EMBEDDING_TOKENS_PER_MINUTE} token/menit."
             )
-        estimated_tokens = max(estimated_tokens, 1)
+        if text_count > EMBEDDING_TEXTS_PER_MINUTE:
+            raise ValueError(
+                "Jumlah teks satu permintaan embedding melebihi anggaran aman "
+                f"{EMBEDDING_TEXTS_PER_MINUTE} teks/menit."
+            )
         while True:
             with self._lock:
                 now = time.monotonic()
                 while (
-                    self._requests
-                    and now - self._requests[0][0] >= EMBEDDING_WINDOW_SECONDS
+                    self._events
+                    and now - self._events[0][0] >= EMBEDDING_WINDOW_SECONDS
                 ):
-                    self._requests.popleft()
+                    self._events.popleft()
 
-                tokens_in_window = sum(tokens for _, tokens in self._requests)
-                requests_wait = (
-                    max(
-                        0.0,
-                        self._requests[0][0] + EMBEDDING_WINDOW_SECONDS - now,
-                    )
-                    if len(self._requests) >= EMBEDDING_MAX_REQUESTS_PER_MINUTE
-                    else 0.0
+                factor = self._throttle_factor
+                token_limit = max(int(EMBEDDING_TOKENS_PER_MINUTE * factor), estimated_tokens)
+                text_limit = max(int(EMBEDDING_TEXTS_PER_MINUTE * factor), text_count)
+                wait_seconds = max(
+                    self._wait_for(self._events, lambda e: e[1], token_limit, estimated_tokens, now),
+                    self._wait_for(self._events, lambda e: e[2], text_limit, text_count, now),
+                    self._wait_for(
+                        self._events, lambda e: 1, EMBEDDING_MAX_REQUESTS_PER_MINUTE, 1, now
+                    ),
                 )
-                tokens_wait = 0.0
-                if tokens_in_window + estimated_tokens > EMBEDDING_TARGET_BATCH_TOKENS:
-                    remaining_tokens = tokens_in_window
-                    for request_time, request_tokens in self._requests:
-                        remaining_tokens -= request_tokens
-                        if (
-                            remaining_tokens + estimated_tokens
-                            <= EMBEDDING_TARGET_BATCH_TOKENS
-                        ):
-                            tokens_wait = max(
-                                0.0,
-                                request_time + EMBEDDING_WINDOW_SECONDS - now,
-                            )
-                            break
-
-                if requests_wait == 0 and tokens_wait == 0:
-                    self._requests.append((now, estimated_tokens))
+                if wait_seconds <= 0:
+                    self._events.append((now, estimated_tokens, text_count))
                     return
-
-                wait_seconds = max(0.1, requests_wait, tokens_wait)
+                wait_seconds = max(0.1, wait_seconds)
 
             if on_wait:
                 on_wait(wait_seconds)
@@ -159,34 +219,41 @@ class _QuotaAwareEmbeddings(Embeddings):
         vectors: list[list[float]] = []
         completed = 0
         for batch, estimated_tokens in _make_embedding_batches(texts):
-            retries = 0
+            minute_retries = 0
+            unknown_retries = 0
             while True:
                 if self._on_progress:
                     self._on_progress(completed, len(texts))
-                _EMBEDDING_RATE_LIMITER.acquire(estimated_tokens, self._on_wait)
+                _EMBEDDING_RATE_LIMITER.acquire(
+                    estimated_tokens, len(batch), self._on_wait
+                )
                 try:
                     batch_vectors = self._client.embed_documents(
                         batch,
                         batch_size=len(batch),
                     )
                 except Exception as error:
-                    if (
-                        not is_embedding_quota_error(error)
-                        or is_embedding_daily_quota_error(error)
-                        or retries >= EMBEDDING_MAX_QUOTA_RETRIES
-                    ):
+                    kind = classify_embedding_quota_error(error)
+                    # Bukan 429, atau limit HARIAN: berhenti segera (jangan buang request).
+                    if kind is None or kind == "daily":
                         raise
-                    retry_delay = (
-                        get_quota_retry_delay_seconds(error)
-                        or EMBEDDING_DEFAULT_QUOTA_RETRY_DELAY_SECONDS
-                    )
-                    if retry_delay > EMBEDDING_MAX_AUTOMATIC_QUOTA_WAIT_SECONDS:
+                    _EMBEDDING_RATE_LIMITER.penalize()
+                    if kind == "minute":
+                        if minute_retries >= EMBEDDING_MAX_QUOTA_RETRIES:
+                            raise
+                        minute_retries += 1
+                    else:  # 429 tanpa penanda jelas: coba sekali lagi, lalu berhenti aman
+                        if unknown_retries >= EMBEDDING_UNKNOWN_QUOTA_RETRIES:
+                            raise
+                        unknown_retries += 1
+                    retry_delay = _quota_wait_seconds(error)
+                    if retry_delay is None:
                         raise
                     if self._on_wait:
                         self._on_wait(retry_delay)
                     time.sleep(retry_delay)
-                    retries += 1
                     continue
+                _EMBEDDING_RATE_LIMITER.reward()
                 vectors.extend(reduce_embedding_vector(vector) for vector in batch_vectors)
                 completed += len(batch)
                 if self._on_progress:
@@ -205,6 +272,7 @@ class _QuotaAwareEmbeddings(Embeddings):
         if self._limit_query_rate:
             _EMBEDDING_RATE_LIMITER.acquire(
                 (len(text.encode("utf-8")) + 3) // 4 + 8,
+                1,
                 self._on_wait if on_wait is None else on_wait,
             )
         return reduce_embedding_vector(self._client.embed_query(text))
@@ -304,6 +372,45 @@ def is_embedding_daily_quota_error(error: Exception) -> bool:
     return False
 
 
+def _quota_message_markers(error: Exception) -> tuple[bool, bool]:
+    """Kembalikan (ada_penanda_harian, ada_penanda_menit) dari seluruh rantai error."""
+    current: BaseException | None = error
+    visited: set[int] = set()
+    daily = minute = False
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        compact = re.sub(r"[^a-z0-9]", "", str(current).casefold())
+        if "perday" in compact or "daily" in compact or "requestsperday" in compact:
+            daily = True
+        if "perminute" in compact or "permin" in compact:
+            minute = True
+        current = current.__cause__ or current.__context__
+    return daily, minute
+
+
+def classify_embedding_quota_error(error: Exception) -> str | None:
+    """Bedakan jenis 429: 'daily' (RPD/TPD), 'minute' (RPM/TPM), 'unknown', atau None."""
+    if not is_embedding_quota_error(error):
+        return None
+    daily, minute = _quota_message_markers(error)
+    if daily:  # jika pesan memuat keduanya, harian yang menentukan
+        return "daily"
+    return "minute" if minute else "unknown"
+
+
+def _quota_wait_seconds(error: Exception) -> float | None:
+    """Jeda sebelum retry 429 non-harian: 30-70 detik; None bila terlalu lama."""
+    parsed = get_quota_retry_delay_seconds(error)
+    if parsed is None:
+        return EMBEDDING_DEFAULT_QUOTA_RETRY_DELAY_SECONDS
+    if parsed > EMBEDDING_MAX_AUTOMATIC_QUOTA_WAIT_SECONDS:
+        return None
+    return min(
+        max(parsed + 2.0, EMBEDDING_MIN_QUOTA_WAIT_SECONDS),
+        EMBEDDING_MAX_QUOTA_WAIT_SECONDS,
+    )
+
+
 def get_quota_retry_delay_seconds(error: Exception) -> float | None:
     """Extract retry duration from Gemini's RetryInfo or human-readable message."""
     current: BaseException | None = error
@@ -334,14 +441,21 @@ def get_quota_retry_delay_seconds(error: Exception) -> float | None:
 
 
 def _make_embedding_batches(texts: list[str]) -> list[tuple[list[str], int]]:
+    """Kelompokkan teks: maks 100 teks/batch, dibatasi estimasi token & karakter."""
     batches: list[tuple[list[str], int]] = []
     current_batch: list[str] = []
     current_tokens = 0
     current_characters = 0
 
     for text in texts:
-        estimated_tokens = max(1, len(text) // 3)
         character_count = len(text)
+        if character_count > EMBEDDING_MAX_TEXT_CHARACTERS:
+            raise ValueError(
+                f"Satu chunk berisi {character_count} karakter; batas aman "
+                f"{EMBEDDING_MAX_TEXT_CHARACTERS} (model memotong teks di 2.048 token). "
+                "Kecilkan RAG_CHUNK_SIZE."
+            )
+        estimated_tokens = max(1, character_count // 3)
         if current_batch and (
             len(current_batch) >= EMBEDDING_MAX_BATCH_SIZE
             or current_characters + character_count > EMBEDDING_MAX_BATCH_CHARACTERS
@@ -351,16 +465,6 @@ def _make_embedding_batches(texts: list[str]) -> list[tuple[list[str], int]]:
             current_batch = []
             current_tokens = 0
             current_characters = 0
-        if character_count > EMBEDDING_MAX_BATCH_CHARACTERS:
-            raise ValueError(
-                "Մեկ embedding chunk-ի նիշերի քանակը գերազանցում է "
-                f"{EMBEDDING_MAX_BATCH_CHARACTERS}-ի սահմանը։"
-            )
-        if estimated_tokens > EMBEDDING_TARGET_BATCH_TOKENS:
-            raise ValueError(
-                "Մեկ embedding chunk-ի գնահատված token-ների քանակը գերազանցում է "
-                f"{EMBEDDING_TARGET_BATCH_TOKENS}-ի անվտանգ սահմանը։"
-            )
 
         current_batch.append(text)
         current_tokens += estimated_tokens
@@ -416,12 +520,22 @@ def _get_chat_query_embeddings(api_key: str | None = None) -> _QuotaAwareEmbeddi
     return _QuotaAwareEmbeddings(client, limit_query_rate=False)
 
 
+try:  # pembersih OCR opsional (aktif jika RAG_CLEAN_OCR=1)
+    from services.text_cleaner import clean_ocr_text as _clean_ocr
+except ImportError:  # pragma: no cover
+    try:
+        from services.text_cleaner import clean_ocr_text as _clean_ocr
+    except ImportError:
+        def _clean_ocr(text: str) -> str:
+            return text
+
+
 def _to_langchain_documents(
     source_documents: Sequence[DriveDocument],
 ) -> list[Document]:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=200,
+        chunk_size=RAG_CHUNK_SIZE,
+        chunk_overlap=RAG_CHUNK_OVERLAP,
     )
     chunks: list[Document] = []
     for source in source_documents:
@@ -437,6 +551,8 @@ def _to_langchain_documents(
         }
         sections = source.page_sections or (("", source.text),)
         for page_label, section_text in sections:
+            if RAG_CLEAN_OCR:
+                section_text = _clean_ocr(section_text)
             if not section_text.strip():
                 continue
             metadata = dict(base_metadata)
@@ -491,6 +607,14 @@ def load_search_index(
     )
 
 
+def _chunk_fingerprint(chunk: Document) -> tuple[str, str]:
+    """Identitas isi chunk: (label halaman, SHA-256 teks)."""
+    return (
+        str(chunk.metadata.get("page_label", "")),
+        hashlib.sha256(chunk.page_content.encode("utf-8")).hexdigest(),
+    )
+
+
 def update_search_index(
     index: FAISS | None,
     source_documents: Sequence[DriveDocument],
@@ -500,81 +624,68 @@ def update_search_index(
     on_checkpoint: Callable[[FAISS], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> FAISS | None:
-    """Replace changed file chunks and checkpoint each successfully embedded batch."""
+    """Ganti chunk file yang berubah; chunk dengan isi identik dipakai ulang (tanpa embedding)."""
     chunks = _to_langchain_documents(source_documents)
     if not chunks and index is None:
         return None
 
-    chunks_by_file: dict[str, dict[int, Document]] = {}
+    chunks_by_file: dict[str, list[Document]] = {}
     for chunk in chunks:
         file_id = str(chunk.metadata.get("file_id", ""))
-        chunk_index = int(chunk.metadata.get("chunk_index", 0))
-        chunks_by_file.setdefault(file_id, {})[chunk_index] = chunk
+        chunks_by_file.setdefault(file_id, []).append(chunk)
 
-    existing_chunks: set[tuple[str, str, int]] = set()
-    if index is not None:
-        stale_ids: list[str] = []
-        for document_id in index.index_to_docstore_id.values():
+    reused_chunk_ids: set[int] = set()
+    if index is not None and replaced_file_ids:
+        stored_by_file: dict[str, dict[tuple[str, str], list[str]]] = {}
+        for document_id in list(index.index_to_docstore_id.values()):
             stored_document = index.docstore.search(document_id)
             if not isinstance(stored_document, Document):
                 continue
             file_id = str(stored_document.metadata.get("file_id", ""))
             if file_id not in replaced_file_ids:
                 continue
-            desired_chunks = chunks_by_file.get(file_id)
-            chunk_index = int(stored_document.metadata.get("chunk_index", -1))
-            desired_chunk = desired_chunks.get(chunk_index) if desired_chunks else None
-            if (
-                desired_chunk is not None
-                and stored_document.metadata.get("modified_time")
-                == desired_chunk.metadata.get("modified_time")
-                and stored_document.page_content == desired_chunk.page_content
-            ):
-                existing_chunks.add(
-                    (
-                        file_id,
-                        str(stored_document.metadata.get("modified_time", "")),
-                        chunk_index,
-                    )
-                )
-            else:
-                stale_ids.append(document_id)
+            stored_by_file.setdefault(file_id, {}).setdefault(
+                _chunk_fingerprint(stored_document), []
+            ).append(document_id)
+
+        stale_ids: list[str] = []
+        for file_id, buckets in stored_by_file.items():
+            for chunk in chunks_by_file.get(file_id, []):
+                candidates = buckets.get(_chunk_fingerprint(chunk))
+                if not candidates:
+                    continue
+                stored_document = index.docstore.search(candidates.pop(0))
+                if isinstance(stored_document, Document):
+                    # Vektor lama tetap valid; cukup segarkan metadata (waktu ubah, nomor chunk, tautan).
+                    stored_document.metadata.update(chunk.metadata)
+                    reused_chunk_ids.add(id(chunk))
+            for leftover_ids in buckets.values():
+                stale_ids.extend(leftover_ids)
         if stale_ids:
             index.delete(ids=stale_ids)
 
-    pending_chunks = [
-        chunk
-        for chunk in chunks
-        if (
-            str(chunk.metadata.get("file_id", "")),
-            str(chunk.metadata.get("modified_time", "")),
-            int(chunk.metadata.get("chunk_index", 0)),
-        )
-        not in existing_chunks
-    ]
-    if pending_chunks:
-        total_pending = len(pending_chunks)
-        completed = 0
-        batch_offset = 0
-        batch_total = 0
+    pending_chunks = [chunk for chunk in chunks if id(chunk) not in reused_chunk_ids]
+    if not pending_chunks:
+        return index
 
-        def report_embedding_progress(
-            batch_done: int,
-            current_batch_total: int,
-        ) -> None:
-            if current_batch_total != batch_total:
-                raise RuntimeError("Embedding progress does not match its batch.")
-            if on_progress:
-                on_progress(
-                    batch_offset + batch_done,
-                    total_pending,
-                )
+    total_pending = len(pending_chunks)
+    completed = 0
+    batch_offset = 0
+    batch_total = 0
 
-        embeddings = _get_embeddings(
-            api_key,
-            on_wait,
-            report_embedding_progress,
-        )
+    def report_embedding_progress(batch_done: int, current_batch_total: int) -> None:
+        if current_batch_total != batch_total:
+            raise RuntimeError("Embedding progress does not match its batch.")
+        if on_progress:
+            on_progress(batch_offset + batch_done, total_pending)
+
+    embeddings = _get_embeddings(api_key, on_wait, report_embedding_progress)
+    # FAISS.add_documents memakai index.embedding_function (kwarg `embedding=` diabaikan),
+    # jadi pasang sementara agar API key, limiter, dan callback progres yang benar terpakai.
+    original_embedding_function = index.embedding_function if index is not None else None
+    if index is not None:
+        index.embedding_function = embeddings
+    try:
         for batch_info in _make_embedding_batches(
             [chunk.page_content for chunk in pending_chunks]
         ):
@@ -585,11 +696,15 @@ def update_search_index(
             batch_total = len(batch_chunks)
             if index is None:
                 index = FAISS.from_documents(batch_chunks, embeddings)
+                original_embedding_function = index.embedding_function
             else:
-                index.add_documents(batch_chunks, embedding=embeddings)
+                index.add_documents(batch_chunks)
             completed += len(batch_chunks)
             if on_checkpoint:
                 on_checkpoint(index)
+    finally:
+        if index is not None and original_embedding_function is not None:
+            index.embedding_function = original_embedding_function
     return index
 
 

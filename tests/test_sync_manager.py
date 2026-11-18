@@ -604,8 +604,8 @@ class DriveSyncManagerTests(unittest.TestCase):
         snapshot = manager.snapshot()
         self.assertTrue(snapshot["paused"])
         self.assertEqual(snapshot["phase"], "quota_error")
-        self.assertIn("օրական", snapshot["error"])
-        self.assertIn("պահպանված են", snapshot["error"])
+        self.assertIn("poéan", snapshot["error"])
+        self.assertIn("parantos disimpen", snapshot["error"])
         self.assertEqual(save_manifest.call_count, 2)
         file_states = {item["id"]: item["state"] for item in snapshot["files"]}
         self.assertEqual(file_states["file-0"], "ready")

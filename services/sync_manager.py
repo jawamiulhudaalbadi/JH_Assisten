@@ -421,10 +421,11 @@ class DriveSyncManager:
                     self._paused = True
                     self._resume_event.clear()
                     self._error = (
-                        "Gemini-ի օրական embedding քվոտան սպառվել է։ "
-                        "Սինքրոնացումը կանգնեցվել է, իսկ ավարտված ֆայլերի "
-                        "ինդեքսն ու manifest-ը պահպանված են։"
-                    )
+    "Kuota embedding poéan Gemini tos béak. "
+    "Sinkronisasi dieureunkeun heula, ari indéks jeung manifest "
+    "pikeun file anu tos réngsé mah parantos disimpen."
+)
+
                     self._phase = "quota_error"
                     self._status = self._error
             return

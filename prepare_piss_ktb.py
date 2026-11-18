@@ -16,7 +16,7 @@ from pathlib import Path
 
 import requests
 
-from text_cleaner import clean_ocr_text
+from services.text_cleaner import clean_ocr_text
 
 URL = (
     "https://archive.org/download/piss-ktb-kumpulan-tanya-jawab-keagamaan-2015/"

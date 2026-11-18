@@ -1,0 +1,9 @@
+[client]
+toolbarMode = "minimal"      # sembunyikan menu & tombol Deploy
+showErrorDetails = "none"    # pengunjung tidak melihat stack trace
+
+[browser]
+gatherUsageStats = false
+
+[server]
+enableXsrfProtection = true

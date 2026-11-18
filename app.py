@@ -361,26 +361,27 @@ def _render_copy_button(content: str, key: str) -> None:
 def _render_source_links(sources: list[dict[str, str]], key: str) -> None:
     if not sources:
         return
-    st.caption("Sumber:")
-    for source_number, source in enumerate(sources):
-        st.caption(source.get("name", "Dokumen"))
-        open_link = source.get("web_view_link", "")
-        download_link = source.get("download_url", "")
-        columns = st.columns(2)
-        if open_link:
-            columns[0].link_button(
-                "Buka di Drive",
-                open_link,
-                key=f"{key}_open_{source_number}",
-                use_container_width=True,
-            )
-        if download_link:
-            columns[1].link_button(
-                "Download",
-                download_link,
-                key=f"{key}_download_{source_number}",
-                use_container_width=True,
-            )
+    # Satu baris yang bisa diklik; tombol baru muncul setelah dibuka.
+    with st.expander(f"Sumber ({len(sources)})", expanded=False):
+        for source_number, source in enumerate(sources):
+            st.caption(source.get("name", "Dokumen"))
+            open_link = source.get("web_view_link", "")
+            download_link = source.get("download_url", "")
+            columns = st.columns(2)
+            if open_link:
+                columns[0].link_button(
+                    "Buka di Drive",
+                    open_link,
+                    key=f"{key}_open_{source_number}",
+                    use_container_width=True,
+                )
+            if download_link:
+                columns[1].link_button(
+                    "Download",
+                    download_link,
+                    key=f"{key}_download_{source_number}",
+                    use_container_width=True,
+                )
 
 
 @st.cache_resource
@@ -538,9 +539,14 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
     in_progress_count = (
         counts["downloading"] + counts["downloaded"] + counts["embedding"]
     )
-    st.caption(
-        f"Tersedia {counts['ready']} · Sedang dimuat {in_progress_count} · "
-        f"Belum dimuat {counts['queued']} · Gagal {counts['failed']}"
+    st.markdown(
+        '<div class="jh-chips">'
+        f'<span class="jh-chip ok"><b>{counts["ready"]}</b> Tersedia</span>'
+        f'<span class="jh-chip run"><b>{in_progress_count}</b> Dimuat</span>'
+        f'<span class="jh-chip"><b>{counts["queued"]}</b> Belum dimuat</span>'
+        f'<span class="jh-chip bad"><b>{counts["failed"]}</b> Gagal</span>'
+        "</div>",
+        unsafe_allow_html=True,
     )
     if snapshot["running"]:
         sync_label = "Lanjutkan muat" if snapshot["paused"] else "Jeda muat"
@@ -681,86 +687,192 @@ if "app_title" not in st.session_state:
     st.session_state.app_title = str(
         PRIVATE_CONFIG.get("app_title", "JH Asisten AI ")
     )
+_BADGE_SPACE_OFF = os.getenv("RESERVE_BADGE_SPACE", "").strip().lower() in {"0", "false", "no"}
+# Ruang kosong di kanan kolom chat pada layar sempit agar lencana "Hosted with Streamlit"
+# (mahkota) dan avatar GitHub di Streamlit Cloud tidak menutupi tombol kirim.
+# Matikan dengan RESERVE_BADGE_SPACE=0 bila aplikasi tidak di Streamlit Cloud.
+_BADGE_SPACE = "0px" if _BADGE_SPACE_OFF else "4.5rem"
+
+_APP_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* ---------- Dasar ---------- */
+html, body, [data-testid="stAppViewContainer"], .stApp {
+    background: __BG__;
+    color: __TEXT__;
+    -webkit-font-smoothing: antialiased;
+}
+.stApp, .stApp p, .stApp li, .stApp label, .stApp button, .stApp textarea,
+.stApp input, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+.stApp [data-testid="stMarkdownContainer"] {
+    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+.stApp .arabic-chat-line {
+    direction: rtl;
+    text-align: right;
+    font-family: "Noto Naskh Arabic", "Amiri", "Traditional Arabic", serif;
+    font-size: 1.3rem;
+    line-height: 2.1;
+    margin: 0.35rem 0;
+}
+a { color: __PRIMARY__ !important; text-underline-offset: 3px; }
+.block-container { max-width: 820px; padding: 1.6rem 1rem 7rem; }
+
+/* ---------- Sembunyikan chrome Streamlit (menu, deploy, footer) ---------- */
+#MainMenu, .stDeployButton, [data-testid="stToolbar"], [data-testid="stDecoration"],
+[data-testid="stStatusWidget"] { visibility: hidden !important; }
+footer { display: none !important; }
+[data-testid="stHeader"] { background: transparent; }
+/* tombol buka/tutup sidebar tetap terlihat */
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"], [data-testid="stSidebarCollapseButton"] {
+    visibility: visible !important;
+}
+
+/* ---------- Judul ---------- */
+.stApp h1 { font-weight: 700; letter-spacing: -0.02em; }
+.app-brand-title { font-size: 52px; line-height: 1.05; margin: 0; font-weight: 700; letter-spacing: -0.02em; }
+
+/* ---------- Sidebar ---------- */
+[data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child {
+    background: __SIDEBAR__;
+    border-right: 1px solid __BORDER__;
+}
+[data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+    font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em;
+}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { font-size: 0.8rem; opacity: 0.85; }
+
+/* ---------- Status & peringatan ---------- */
+[data-testid="stAlert"] {
+    border-radius: 0.9rem;
+    border: 1px solid __BORDER__;
+    font-size: 0.88rem;
+    line-height: 1.55;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+.jh-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.45rem 0 0.9rem; }
+.jh-chip {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    padding: 0.28rem 0.7rem; border-radius: 999px;
+    font-size: 0.78rem; line-height: 1.2;
+    background: __SURFACE__; color: __TEXT__; border: 1px solid __BORDER__;
+}
+.jh-chip b { font-weight: 700; }
+.jh-chip::before { content: ""; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #8a94a6; }
+.jh-chip.ok::before { background: #2e9e6b; }
+.jh-chip.run::before { background: __ACCENT__; }
+.jh-chip.bad::before { background: #d6504a; }
+.stProgress > div > div > div > div, [data-testid="stProgress"] [role="progressbar"] > div {
+    background-color: __PRIMARY__;
+}
+
+/* ---------- Pesan chat ---------- */
+[data-testid="stChatMessage"] {
+    background: __CHAT__;
+    border: 1px solid __BORDER__;
+    border-radius: 1.1rem;
+    padding: 0.9rem 1.05rem;
+    margin-bottom: 0.65rem;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 10px 24px -16px rgba(0,0,0,0.25);
+}
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]),
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+    background: __SURFACE__;
+    border-color: __ACCENT__;
+}
+[data-testid="stChatMessage"] p { line-height: 1.7; }
+
+/* ---------- Kolom input chat ---------- */
+[data-testid="stBottom"] {
+    background: linear-gradient(to top, __BG__ 62%, transparent) !important;
+}
+[data-testid="stBottom"] > div { background: transparent !important; }
+[data-testid="stBottomBlockContainer"] {
+    max-width: 820px;
+    padding: 0.5rem 1rem calc(1rem + env(safe-area-inset-bottom, 0px));
+}
+[data-testid="stChatInput"] {
+    background: __SURFACE__;
+    border: 1px solid __ACCENT__;
+    border-radius: 1.6rem;
+    box-shadow: 0 12px 32px -14px rgba(0,0,0,0.35);
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+[data-testid="stChatInput"]:focus-within {
+    border-color: __PRIMARY__;
+    box-shadow: 0 0 0 3px color-mix(in srgb, __PRIMARY__ 22%, transparent),
+                0 12px 32px -14px rgba(0,0,0,0.35);
+}
+[data-testid="stChatInput"] textarea { font-size: 0.98rem; }
+
+/* ---------- Tombol, expander, input ---------- */
+div.stButton > button, div.stDownloadButton > button, [data-testid="stLinkButton"] a {
+    background: __SURFACE__;
+    border: 1px solid __ACCENT__;
+    border-radius: 0.8rem;
+    color: __TEXT__ !important;
+    font-weight: 600;
+    min-height: 2.6rem;
+    transition: transform 120ms ease, box-shadow 120ms ease;
+}
+div.stButton > button:hover, [data-testid="stLinkButton"] a:hover {
+    border-color: __PRIMARY__;
+    box-shadow: 0 6px 16px -8px rgba(0,0,0,0.3);
+    transform: translateY(-1px);
+}
+div.stButton > button[kind="primary"] { background: __PRIMARY__; color: __PRIMARY_TEXT__ !important; border-color: __PRIMARY__; }
+[data-testid="stExpander"] {
+    border: 1px solid __BORDER__;
+    border-radius: 0.9rem;
+    background: __SURFACE__;
+}
+[data-testid="stFileUploader"] { background: __SURFACE__; border: 1px dashed __ACCENT__; border-radius: 0.9rem; }
+input, textarea {
+    background-color: __SURFACE__ !important;
+    color: __TEXT__ !important;
+    border-color: __BORDER__ !important;
+}
+
+/* ---------- Responsif ---------- */
+@media (max-width: 900px) {
+    .app-brand-title { font-size: 36px; }
+    .block-container [data-testid="stImage"] img { width: 40px !important; }
+    [data-testid="stBottomBlockContainer"] { padding-right: calc(1rem + __BADGE_SPACE__); }
+}
+@media (max-width: 640px) {
+    .block-container { padding: 0.8rem 0.75rem 7rem; }
+    .stApp h1 { font-size: 1.7rem !important; }
+    .app-brand-title { font-size: 28px !important; }
+    .block-container [data-testid="stImage"] img { width: 30px !important; }
+    [data-testid="stChatMessage"] { padding: 0.75rem 0.85rem; }
+}
+</style>
+"""
+
+
+def _build_app_css(theme: dict[str, str]) -> str:
+    replacements = {
+        "__BG__": theme["background"],
+        "__SURFACE__": theme["surface"],
+        "__SIDEBAR__": theme["sidebar"],
+        "__TEXT__": theme["text"],
+        "__PRIMARY__": theme["primary"],
+        "__PRIMARY_TEXT__": theme["primary_text"],
+        "__ACCENT__": theme["accent"],
+        "__CHAT__": theme["chat"],
+        "__BORDER__": theme["border"],
+        "__BADGE_SPACE__": _BADGE_SPACE,
+    }
+    css = _APP_CSS
+    for token, value in replacements.items():
+        css = css.replace(token, value)
+    return css
+
+
 theme = APP_THEMES[APP_THEME_ID]
-st.markdown(
-    f"""
-    <style>
-    html, body, [data-testid="stAppViewContainer"], .stApp {{
-        background-color: {theme["background"]};
-        color: {theme["text"]};
-    }}
-    [data-testid="stHeader"] {{ background: transparent; }}
-    [data-testid="stSidebar"],
-    [data-testid="stSidebar"] > div:first-child {{
-        background-color: {theme["sidebar"]};
-        border-right: 1px solid {theme["border"]};
-    }}
-    .block-container {{ max-width: 860px; padding-top: 2rem; }}
-    [data-testid="stChatMessage"] {{
-        background-color: {theme["chat"]};
-        border: 1px solid {theme["border"]};
-        border-radius: 0.9rem;
-    }}
-    [data-testid="stChatInput"] {{
-        background-color: {theme["surface"]};
-        border-color: {theme["border"]};
-        border-radius: 0.9rem;
-    }}
-    [data-testid="stExpander"] {{ border-color: {theme["border"]}; }}
-    [data-testid="stFileUploader"] {{
-        background-color: {theme["surface"]};
-        border: 1px dashed {theme["accent"]};
-        border-radius: 0.8rem;
-    }}
-    a {{ color: {theme["primary"]} !important; }}
-    div.stButton > button {{
-        background-color: {theme["surface"]};
-        border: 1px solid {theme["accent"]};
-        border-radius: 0.7rem;
-        color: {theme["text"]};
-        transition: transform 120ms ease, box-shadow 120ms ease;
-    }}
-    div.stButton > button:hover {{
-        border-color: {theme["primary"]};
-        box-shadow: 0 3px 12px {theme["border"]};
-        transform: translateY(-1px);
-    }}
-    div.stButton > button[kind="primary"] {{
-        background-color: {theme["primary"]};
-        color: {theme["primary_text"]};
-    }}
-    input, textarea {{
-        background-color: {theme["surface"]} !important;
-        color: {theme["text"]} !important;
-        border-color: {theme["border"]} !important;
-    }}
-    .arabic-chat-line {{
-        direction: rtl;
-        text-align: right;
-        font-family: "Noto Naskh Arabic", "Amiri", "Traditional Arabic", serif;
-        font-size: 1.25rem;
-        line-height: 2;
-        margin: 0.35rem 0;
-    }}
-    .app-brand-title {{
-        font-size: 88px;
-        line-height: 1;
-        margin: 0;
-    }}
-    @media (max-width: 850px) {{
-        .app-brand-title {{ font-size: 48px; }}
-        .block-container [data-testid="stImage"] img {{ width: 48px !important; }}
-    }}
-    @media (max-width: 640px) {{
-        .block-container {{ padding: 1rem 0.8rem 2rem; }}
-        h1 {{ font-size: 1.8rem !important; }}
-        .app-brand-title {{ font-size: 32px !important; }}
-        .block-container [data-testid="stImage"] img {{ width: 32px !important; }}
-    }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown(_build_app_css(theme), unsafe_allow_html=True)
 
 with st.sidebar:
     st.subheader("Sumber pengetahuan")
@@ -877,7 +989,7 @@ with st.sidebar:
 if CUSTOM_LOGO_PATH.is_file():
     logo_column, title_column = st.columns([1, 8], vertical_alignment="center")
     with logo_column:
-        st.image(str(CUSTOM_LOGO_PATH), width=88)
+        st.image(str(CUSTOM_LOGO_PATH), width=64)
     with title_column:
         st.markdown(
             f'<h1 class="app-brand-title">{html.escape(st.session_state.app_title)}</h1>',
