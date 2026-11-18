@@ -399,6 +399,24 @@ def _clean_legacy_assistant_message(content: str) -> str:
     )
 
 
+_MARKDOWN_SYNTAX_RE = re.compile(r"^\s*([-*+]|\d+[.)]|#|>|\|)\s")
+
+
+def _markdown_keep_indent(line: str) -> str:
+    """Pertahankan indentasi & baris baru saat teks dirender sebagai Markdown.
+
+    Markdown membuang spasi di awal baris, jadi bait yang menjorok tampil rata
+    kiri. Spasi awal diubah menjadi &nbsp; (kecuali baris daftar/heading/kutipan/
+    tabel), dan dua spasi di akhir baris dipertahankan sebagai hard line break.
+    """
+    expanded = line.expandtabs(4)
+    if expanded and not _MARKDOWN_SYNTAX_RE.match(expanded):
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        if indent:
+            expanded = "&nbsp;" * indent + expanded.lstrip(" ")
+    return f"{expanded}  " if expanded else expanded
+
+
 def _render_message_content(content: str) -> None:
     markdown_lines: list[str] = []
 
@@ -417,7 +435,7 @@ def _render_message_content(content: str) -> None:
                 unsafe_allow_html=True,
             )
         else:
-            markdown_lines.append(f"{line}  " if line else line)
+            markdown_lines.append(_markdown_keep_indent(line))
     flush_markdown()
 
 
