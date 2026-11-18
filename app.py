@@ -59,7 +59,12 @@ MAX_LOGO_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_LOGO_IMAGE_PIXELS = 16_000_000
 MAX_CHAT_IMAGE_COUNT = 4
 MAX_CHAT_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
+
+# --------------------------------------------------------------------------
+# Tema (10 total). Kunci opsional "gradient" = CSS background-image halaman.
+# --------------------------------------------------------------------------
 APP_THEMES: dict[str, dict[str, str]] = {
+    # ----- 5 tema lama (dipertahankan) -----
     "emerald": {
         "label": "Zamrud & Gading",
         "background": "#F3F6F1",
@@ -120,7 +125,120 @@ APP_THEMES: dict[str, dict[str, str]] = {
         "chat": "#EFE7F3",
         "border": "#E4D7E9",
     },
+    # ----- 5 tema baru -----
+    "cyberpunk": {
+        "label": "Cyberpunk Neon Glow",
+        "background": "#0B0714",
+        "surface": "#150E26",
+        "sidebar": "#0F0A1E",
+        "text": "#EDE7FF",
+        "primary": "#00E5F5",
+        "primary_text": "#03141A",
+        "accent": "#FF2BD6",
+        "chat": "#1B1133",
+        "border": "#3A2468",
+        "gradient": (
+            "radial-gradient(900px 520px at 90% -8%, rgba(255,43,214,0.22), transparent 60%),"
+            "radial-gradient(800px 480px at -10% 8%, rgba(0,229,245,0.16), transparent 58%)"
+        ),
+    },
+    "nordic": {
+        "label": "Nordic Aurora Glass",
+        "background": "#0E1B24",
+        "surface": "#142733",
+        "sidebar": "#0F202B",
+        "text": "#E6F3F1",
+        "primary": "#5EEAD4",
+        "primary_text": "#052B27",
+        "accent": "#8BA7FF",
+        "chat": "#17303D",
+        "border": "#2B4A5A",
+        "gradient": (
+            "radial-gradient(820px 500px at 8% -8%, rgba(94,234,212,0.20), transparent 60%),"
+            "radial-gradient(860px 560px at 100% 6%, rgba(139,167,255,0.20), transparent 60%)"
+        ),
+    },
+    "sunset": {
+        "label": "Warm Sunset Terracotta",
+        "background": "#FFF1E3",
+        "surface": "#FFFAF4",
+        "sidebar": "#FCE5D0",
+        "text": "#4A2418",
+        "primary": "#C94D28",
+        "primary_text": "#FFFFFF",
+        "accent": "#E8923A",
+        "chat": "#FDE3CB",
+        "border": "#F0C9A6",
+        "gradient": "linear-gradient(180deg, #FFE9D3 0%, #FFD8C0 55%, #FFF1E3 100%)",
+    },
+    "amoled": {
+        "label": "Midnight AMOLED Gold",
+        "background": "#000000",
+        "surface": "#0D0D0D",
+        "sidebar": "#050505",
+        "text": "#F2EBDD",
+        "primary": "#E7C15A",
+        "primary_text": "#1A1300",
+        "accent": "#B8902F",
+        "chat": "#141414",
+        "border": "#2A2418",
+        "gradient": "radial-gradient(760px 380px at 50% -8%, rgba(231,193,90,0.10), transparent 62%)",
+    },
+    "matcha": {
+        "label": "Matcha Zen Minimalist",
+        "background": "#F2F4EA",
+        "surface": "#FBFCF6",
+        "sidebar": "#E8ECDC",
+        "text": "#2B3326",
+        "primary": "#566F34",
+        "primary_text": "#FFFFFF",
+        "accent": "#A8B67D",
+        "chat": "#E9EEDC",
+        "border": "#D5DCC0",
+    },
 }
+
+# --------------------------------------------------------------------------
+# Font (5 pilihan Google Fonts).
+# --------------------------------------------------------------------------
+APP_FONTS: dict[str, dict[str, str]] = {
+    "jakarta": {
+        "label": "Plus Jakarta Sans - modern & profesional",
+        "import": "Plus+Jakarta+Sans:wght@400;500;600;700",
+        "stack": "'Plus Jakarta Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+        "line_height": "1.65",
+        "letter_spacing": "-0.003em",
+    },
+    "poppins": {
+        "label": "Poppins - geometris, ramah & kekinian",
+        "import": "Poppins:wght@400;500;600;700",
+        "stack": "'Poppins', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+        "line_height": "1.68",
+        "letter_spacing": "0em",
+    },
+    "inter": {
+        "label": "Inter - tajam untuk teks panjang",
+        "import": "Inter:wght@400;500;600;700",
+        "stack": "'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+        "line_height": "1.7",
+        "letter_spacing": "-0.006em",
+    },
+    "lora": {
+        "label": "Lora - serif editorial berkelas",
+        "import": "Lora:wght@400;500;600;700",
+        "stack": "'Lora', Georgia, 'Times New Roman', serif",
+        "line_height": "1.78",
+        "letter_spacing": "0em",
+    },
+    "space": {
+        "label": "Space Grotesk - futuristik & unik",
+        "import": "Space+Grotesk:wght@400;500;600;700",
+        "stack": "'Space Grotesk', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+        "line_height": "1.62",
+        "letter_spacing": "-0.008em",
+    },
+}
+
 _WIB_TIMEZONE = ZoneInfo("Asia/Jakarta")
 _SUNDA_WEEKDAYS = (
     "Senén",
@@ -146,34 +264,34 @@ _SUNDA_MONTHS = (
     "Désémber",
 )
 if PRIVATE_CONFIG_PATH.is_file():
-  PRIVATE_CONFIG = json.loads(PRIVATE_CONFIG_PATH.read_text(encoding="utf-8"))
+    PRIVATE_CONFIG = json.loads(PRIVATE_CONFIG_PATH.read_text(encoding="utf-8"))
 else:
-  PRIVATE_CONFIG = {}
+    PRIVATE_CONFIG = {}
 
 try:
-  for _k, _v in st.secrets.items():
-    if _k not in PRIVATE_CONFIG and isinstance(_v, (str, int, float, bool)):
-      PRIVATE_CONFIG[_k] = _v
+    for _k, _v in st.secrets.items():
+        if _k not in PRIVATE_CONFIG and isinstance(_v, (str, int, float, bool)):
+            PRIVATE_CONFIG[_k] = _v
 except Exception:
-  pass
+    pass
 
 
 def _load_google_api_key() -> str:
-  if PRIVATE_CONFIG.get("google_api_key_override") is True:
+    if PRIVATE_CONFIG.get("google_api_key_override") is True:
+        return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
+
+    environment_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if environment_api_key:
+        return environment_api_key
+
+    secrets_path = PRIVATE_CONFIG_PATH.parent / "secrets.toml"
+    if secrets_path.is_file():
+        secrets_config = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
+        secrets_api_key = str(secrets_config.get("google_api_key", "")).strip()
+        if secrets_api_key:
+            return secrets_api_key
+
     return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
-
-  environment_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-  if environment_api_key:
-    return environment_api_key
-
-  secrets_path = PRIVATE_CONFIG_PATH.parent / "secrets.toml"
-  if secrets_path.is_file():
-    secrets_config = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
-    secrets_api_key = str(secrets_config.get("google_api_key", "")).strip()
-    if secrets_api_key:
-      return secrets_api_key
-
-  return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
 
 
 DEFAULT_API_KEY = _load_google_api_key()
@@ -183,7 +301,10 @@ DEFAULT_FOLDER_ID = (
 )
 APP_THEME_ID = str(PRIVATE_CONFIG.get("app_theme", "emerald"))
 if APP_THEME_ID not in APP_THEMES:
-  APP_THEME_ID = "emerald"
+    APP_THEME_ID = "emerald"
+APP_FONT_ID = str(PRIVATE_CONFIG.get("app_font", "jakarta"))
+if APP_FONT_ID not in APP_FONTS:
+    APP_FONT_ID = "jakarta"
 _ARABIC_TEXT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
 
 
@@ -321,41 +442,39 @@ def _reconstruct_source_text(chunks: list[Document]) -> str:
 
 
 def _render_copy_button(content: str, key: str) -> None:
-        encoded_content = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        st.html(
-                f"""
-                <div class="copy-answer-control">
-                    <button type="button" style="padding: 6px 10px; cursor: pointer;">
-                        Salin Jawaban
-                    </button>
-                    <span role="status" style="margin-left: 8px;"></span>
-                </div>
-                <script>
-                    (() => {{
-                        const root = document.currentScript.parentElement;
-                        const encoded = "{encoded_content}";
-                        const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
-                        const answer = new TextDecoder("utf-8").decode(bytes);
-                        const button = root.querySelector("button");
-                        const status = root.querySelector("[role=status]");
-                        button.addEventListener("click", async () => {{
-                            try {{
-                                await navigator.clipboard.writeText(answer);
-                            }} catch (error) {{
-                                const textarea = document.createElement("textarea");
-                                textarea.value = answer;
-                                document.body.appendChild(textarea);
-                                textarea.select();
-                                document.execCommand("copy");
-                                textarea.remove();
-                            }}
-                            status.textContent = "Tersalin";
-                        }});
-                    }})();
-                </script>
-                """,
-                unsafe_allow_javascript=True,
-        )
+    encoded_content = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    st.html(
+        f"""
+        <div class="copy-answer-control">
+            <button type="button">Salin Jawaban</button>
+            <span role="status"></span>
+        </div>
+        <script>
+            (() => {{
+                const root = document.currentScript.parentElement;
+                const encoded = "{encoded_content}";
+                const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+                const answer = new TextDecoder("utf-8").decode(bytes);
+                const button = root.querySelector("button");
+                const status = root.querySelector("[role=status]");
+                button.addEventListener("click", async () => {{
+                    try {{
+                        await navigator.clipboard.writeText(answer);
+                    }} catch (error) {{
+                        const textarea = document.createElement("textarea");
+                        textarea.value = answer;
+                        document.body.appendChild(textarea);
+                        textarea.select();
+                        document.execCommand("copy");
+                        textarea.remove();
+                    }}
+                    status.textContent = "Tersalin";
+                }});
+            }})();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
 
 
 def _render_source_links(sources: list[dict[str, str]], key: str) -> None:
@@ -687,52 +806,145 @@ if "app_title" not in st.session_state:
     st.session_state.app_title = str(
         PRIVATE_CONFIG.get("app_title", "JH Asisten AI ")
     )
-_BADGE_SPACE_OFF = os.getenv("RESERVE_BADGE_SPACE", "").strip().lower() in {"0", "false", "no"}
-# Ruang kosong di kanan kolom chat pada layar sempit agar lencana "Hosted with Streamlit"
-# (mahkota) dan avatar GitHub di Streamlit Cloud tidak menutupi tombol kirim.
-# Matikan dengan RESERVE_BADGE_SPACE=0 bila aplikasi tidak di Streamlit Cloud.
-_BADGE_SPACE = "0px" if _BADGE_SPACE_OFF else "4.5rem"
+
+
+# ==========================================================================
+# Sistem tampilan: warna, font, dan CSS (ditulis ulang dari nol).
+# ==========================================================================
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+
+
+def _rgba(color: str, alpha: float) -> str:
+    red, green, blue = _hex_to_rgb(color)
+    return f"rgba({red},{green},{blue},{alpha})"
+
+
+def _mix(first: str, second: str, weight: float) -> str:
+    """Campur dua warna hex; weight = porsi warna pertama (0..1)."""
+    a = _hex_to_rgb(first)
+    b = _hex_to_rgb(second)
+    mixed = tuple(round(a[i] * weight + b[i] * (1 - weight)) for i in range(3))
+    return "#{:02X}{:02X}{:02X}".format(*mixed)
+
+
+def _is_dark(color: str) -> bool:
+    red, green, blue = _hex_to_rgb(color)
+    return (0.2126 * red + 0.7152 * green + 0.0722 * blue) < 128
+
+
+# Pemilih pesan pengguna (balon di kanan). Tiap varian :has() ditulis terpisah
+# agar satu pemilih yang tidak dikenali tidak membatalkan seluruh aturan.
+_USER_MESSAGE_SELECTORS = (
+    '[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])',
+    '[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"])',
+)
+_USER_TEXT_TAGS = ("p", "li", "span", "a", "strong", "em", "code")
 
 _APP_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+__FONT_IMPORT__
 
-/* ---------- Dasar ---------- */
-html, body, [data-testid="stAppViewContainer"], .stApp {
-    background: __BG__;
+/* ---------- Kunci skema warna (anti force-dark Android) ---------- */
+:root, html, body, .stApp, [data-testid="stAppViewContainer"] {
+    color-scheme: __SCHEME__;
+}
+html, body { background: __BG__; -webkit-text-size-adjust: 100%; }
+
+/* ---------- Dasar halaman ---------- */
+.stApp, [data-testid="stAppViewContainer"] {
+    background-color: __BG__;
+    background-image: __BG_IMAGE__;
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+    background-size: cover;
     color: __TEXT__;
     -webkit-font-smoothing: antialiased;
 }
-.stApp, .stApp p, .stApp li, .stApp label, .stApp button, .stApp textarea,
-.stApp input, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
-.stApp [data-testid="stMarkdownContainer"] {
-    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+[data-testid="stMain"], [data-testid="stMainBlockContainer"] { background: transparent; }
+
+/* ---------- Tipografi (font pilihan pengguna) ---------- */
+.stApp, .stApp button, .stApp input, .stApp textarea, .stApp select,
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+.stApp p, .stApp li, .stApp label, .stApp summary,
+.stApp [data-testid="stMarkdownContainer"],
+.stApp [data-testid="stCaptionContainer"],
+.stApp [data-testid="stWidgetLabel"],
+.stApp [data-baseweb="select"], .stApp [data-baseweb="menu"],
+.stApp [data-baseweb="tab"], .stApp .jh-chip {
+    font-family: __FONT_STACK__;
+    letter-spacing: __LETTER__;
 }
+.stApp p, .stApp li, .stApp [data-testid="stMarkdownContainer"] { line-height: __LINE__; }
+.stApp h1, .stApp h2, .stApp h3, .stApp h4 { line-height: 1.2; letter-spacing: -0.015em; }
 .stApp .arabic-chat-line {
     direction: rtl;
     text-align: right;
     font-family: "Noto Naskh Arabic", "Amiri", "Traditional Arabic", serif;
+    letter-spacing: 0;
     font-size: 1.3rem;
     line-height: 2.1;
     margin: 0.35rem 0;
 }
-a { color: __PRIMARY__ !important; text-underline-offset: 3px; }
-.block-container { max-width: 820px; padding: 1.6rem 1rem 7rem; }
 
-/* ---------- Sembunyikan chrome Streamlit (menu, deploy, footer) ---------- */
-#MainMenu, .stDeployButton, [data-testid="stToolbar"], [data-testid="stDecoration"],
+/* ---------- Warna teks ---------- */
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+.stApp p, .stApp li, .stApp label, .stApp summary, .stApp summary span,
+.stApp [data-testid="stMarkdownContainer"],
+.stApp [data-testid="stWidgetLabel"] p,
+.stApp [data-baseweb="tab"] { color: __TEXT__; }
+.stApp [data-testid="stCaptionContainer"],
+.stApp [data-testid="stCaptionContainer"] p { color: __MUTED__; }
+a { color: __PRIMARY__ !important; text-underline-offset: 3px; }
+
+/* ---------- Tata letak utama & jarak aman ---------- */
+.block-container, [data-testid="stMainBlockContainer"] {
+    max-width: 820px;
+    padding-top: calc(3.6rem + env(safe-area-inset-top, 0px)) !important;
+    padding-left: 1rem;
+    padding-right: 1rem;
+    padding-bottom: calc(9rem + env(safe-area-inset-bottom, 0px)) !important;
+}
+
+/* ---------- Sembunyikan chrome Streamlit ---------- */
+#MainMenu, .stDeployButton, [data-testid="stAppDeployButton"],
+[data-testid="stToolbar"], [data-testid="stDecoration"],
 [data-testid="stStatusWidget"] { visibility: hidden !important; }
 footer { display: none !important; }
-[data-testid="stHeader"] { background: transparent; }
+[data-testid="stHeader"] { background: transparent !important; }
 /* tombol buka/tutup sidebar tetap terlihat */
 [data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
 [data-testid="collapsedControl"], [data-testid="stSidebarCollapseButton"] {
     visibility: visible !important;
 }
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"] { color: __TEXT__; }
 
-/* ---------- Judul ---------- */
-.stApp h1 { font-weight: 700; letter-spacing: -0.02em; }
-.app-brand-title { font-size: 52px; line-height: 1.05; margin: 0; font-weight: 700; letter-spacing: -0.02em; }
+/* ---------- Header aplikasi ---------- */
+.app-brand-title {
+    font-size: clamp(1.7rem, 6.4vw, 2.6rem);
+    line-height: 1.1;
+    margin: 0;
+    padding: 0;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: __TEXT__;
+}
+.app-brand-title::after {
+    content: "";
+    display: block;
+    width: 3rem;
+    height: 3px;
+    margin-top: 0.55rem;
+    border-radius: 3px;
+    background: linear-gradient(90deg, __PRIMARY__, __ACCENT__);
+}
+.app-brand-sub {
+    margin: 0.5rem 0 1.1rem;
+    font-size: 0.92rem;
+    color: __MUTED__ !important;
+}
 
 /* ---------- Sidebar ---------- */
 [data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child {
@@ -742,16 +954,19 @@ footer { display: none !important; }
 [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
     font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em;
 }
-[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { font-size: 0.8rem; opacity: 0.85; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { font-size: 0.8rem; }
+[data-testid="stSidebar"] hr { border-color: __BORDER__; }
 
 /* ---------- Status & peringatan ---------- */
 [data-testid="stAlert"] {
-    border-radius: 0.9rem;
+    background: __SURFACE__;
     border: 1px solid __BORDER__;
+    border-left: 4px solid __ACCENT__;
+    border-radius: 0.9rem;
     font-size: 0.88rem;
-    line-height: 1.55;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
 }
+[data-testid="stAlert"] p, [data-testid="stAlert"] div { color: __TEXT__; }
 .jh-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.45rem 0 0.9rem; }
 .jh-chip {
     display: inline-flex; align-items: center; gap: 0.4rem;
@@ -768,111 +983,228 @@ footer { display: none !important; }
     background-color: __PRIMARY__;
 }
 
-/* ---------- Pesan chat ---------- */
-[data-testid="stChatMessage"] {
-    background: __CHAT__;
-    border: 1px solid __BORDER__;
-    border-radius: 1.1rem;
-    padding: 0.9rem 1.05rem;
-    margin-bottom: 0.65rem;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 10px 24px -16px rgba(0,0,0,0.25);
+/* ---------- Pesan chat: tanpa avatar ---------- */
+[data-testid="stChatMessageAvatarUser"], [data-testid="stChatMessageAvatarAssistant"],
+[data-testid^="stChatMessageAvatar"], [data-testid^="chatAvatarIcon"] {
+    display: none !important;
 }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]),
-[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
-    background: __SURFACE__;
-    border-color: __ACCENT__;
+[data-testid="stChatMessage"] > div:has([data-testid^="stChatMessageAvatar"]),
+[data-testid="stChatMessage"] > div:has([data-testid^="chatAvatarIcon"]) {
+    display: none !important;
 }
-[data-testid="stChatMessage"] p { line-height: 1.7; }
 
-/* ---------- Kolom input chat ---------- */
-[data-testid="stBottom"] {
-    background: linear-gradient(to top, __BG__ 62%, transparent) !important;
+/* ---------- Pesan chat: balasan AI (kiri, lebar penuh, kaca tipis) ---------- */
+[data-testid="stChatMessage"] {
+    display: flex;
+    gap: 0;
+    width: 100%;
+    margin: 0 0 0.75rem;
+    padding: 0.9rem 1.05rem;
+    background: __CHAT_GLASS__;
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid __BORDER__;
+    border-left: 3px solid __ACCENT__;
+    border-radius: 6px 20px 20px 20px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05), 0 14px 30px -18px __SHADOW__;
 }
-[data-testid="stBottom"] > div { background: transparent !important; }
+[data-testid="stChatMessageContent"] { width: 100%; min-width: 0; }
+[data-testid="stChatMessage"] p { line-height: __LINE__; margin-bottom: 0.5rem; }
+[data-testid="stChatMessage"] p:last-child { margin-bottom: 0; }
+
+/* ---------- Pesan chat: pertanyaan pengguna (kanan, ringkas) ---------- */
+__U__ {
+    width: fit-content;
+    max-width: 88%;
+    margin-left: auto;
+    background: __USER_BG__;
+    border: 1px solid transparent;
+    border-radius: 20px 20px 6px 20px;
+    box-shadow: 0 10px 24px -14px __SHADOW__;
+}
+__U_TXT__ { color: __PRIMARY_TEXT__ !important; }
+
+/* ---------- Tombol salin jawaban ---------- */
+.copy-answer-control { margin-top: 0.4rem; }
+.copy-answer-control button {
+    background: transparent;
+    color: __TEXT__;
+    border: 1px solid __BORDER__;
+    border-radius: 999px;
+    padding: 0.3rem 0.85rem;
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+.copy-answer-control button:active { border-color: __PRIMARY__; }
+.copy-answer-control [role=status] { margin-left: 0.5rem; font-size: 0.78rem; color: __MUTED__; }
+
+/* ---------- Kotak input chat (pill ala Gemini, lebar penuh) ---------- */
+[data-testid="stBottom"] { background: transparent !important; }
+[data-testid="stBottom"] > div {
+    background: linear-gradient(to top, __BG__ 68%, transparent) !important;
+    width: 100%;
+}
 [data-testid="stBottomBlockContainer"] {
+    width: 100%;
     max-width: 820px;
-    padding: 0.5rem 1rem calc(1rem + env(safe-area-inset-bottom, 0px));
+    margin: 0 auto;
+    padding: 0.6rem 1rem calc(0.9rem + env(safe-area-inset-bottom, 0px));
+    box-sizing: border-box;
 }
 [data-testid="stChatInput"] {
+    width: 100%;
     background: __SURFACE__;
-    border: 1px solid __ACCENT__;
-    border-radius: 1.6rem;
-    box-shadow: 0 12px 32px -14px rgba(0,0,0,0.35);
-    transition: border-color 120ms ease, box-shadow 120ms ease;
+    border: 1.5px solid __BORDER__;
+    border-radius: 26px;
+    box-shadow: 0 8px 28px -12px __SHADOW__;
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+[data-testid="stChatInput"] > div {
+    background: transparent !important;
+    border: none !important;
+    border-radius: 26px;
 }
 [data-testid="stChatInput"]:focus-within {
     border-color: __PRIMARY__;
-    box-shadow: 0 0 0 3px color-mix(in srgb, __PRIMARY__ 22%, transparent),
-                0 12px 32px -14px rgba(0,0,0,0.35);
+    box-shadow: 0 0 0 3px __FOCUS__, 0 8px 28px -12px __SHADOW__;
 }
-[data-testid="stChatInput"] textarea { font-size: 0.98rem; }
+[data-testid="stChatInput"] textarea {
+    background: transparent !important;
+    color: __TEXT__ !important;
+    font-size: 1rem;
+    line-height: 1.5;
+    caret-color: __PRIMARY__;
+}
+[data-testid="stChatInput"] textarea::placeholder { color: __MUTED__; opacity: 1; }
+[data-testid="stChatInput"] button { color: __TEXT__; }
+[data-testid="stChatInputSubmitButton"] {
+    background: __PRIMARY__ !important;
+    color: __PRIMARY_TEXT__ !important;
+    border-radius: 50%;
+}
 
 /* ---------- Tombol, expander, input ---------- */
-div.stButton > button, div.stDownloadButton > button, [data-testid="stLinkButton"] a {
+div.stButton > button, div.stDownloadButton > button, [data-testid="stLinkButton"] a,
+[data-testid="stFormSubmitButton"] button {
     background: __SURFACE__;
     border: 1px solid __ACCENT__;
     border-radius: 0.8rem;
     color: __TEXT__ !important;
     font-weight: 600;
     min-height: 2.6rem;
-    transition: transform 120ms ease, box-shadow 120ms ease;
+    transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
 }
-div.stButton > button:hover, [data-testid="stLinkButton"] a:hover {
+div.stButton > button:hover, [data-testid="stLinkButton"] a:hover,
+[data-testid="stFormSubmitButton"] button:hover {
     border-color: __PRIMARY__;
-    box-shadow: 0 6px 16px -8px rgba(0,0,0,0.3);
+    box-shadow: 0 6px 16px -8px __SHADOW__;
     transform: translateY(-1px);
 }
-div.stButton > button[kind="primary"] { background: __PRIMARY__; color: __PRIMARY_TEXT__ !important; border-color: __PRIMARY__; }
+div.stButton > button[kind="primary"] {
+    background: __PRIMARY__; color: __PRIMARY_TEXT__ !important; border-color: __PRIMARY__;
+}
 [data-testid="stExpander"] {
     border: 1px solid __BORDER__;
     border-radius: 0.9rem;
     background: __SURFACE__;
 }
 [data-testid="stFileUploader"] { background: __SURFACE__; border: 1px dashed __ACCENT__; border-radius: 0.9rem; }
+[data-testid="stFileUploaderDropzone"] { background: __CHAT__; border-radius: 0.8rem; }
+[data-testid="stFileUploaderDropzone"] * { color: __TEXT__; }
 input, textarea {
     background-color: __SURFACE__ !important;
     color: __TEXT__ !important;
     border-color: __BORDER__ !important;
 }
+textarea:disabled { -webkit-text-fill-color: __TEXT__ !important; opacity: 0.92; }
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"],
+[data-baseweb="select"] > div {
+    background-color: __SURFACE__ !important;
+    border-color: __BORDER__ !important;
+    color: __TEXT__ !important;
+}
+[data-baseweb="select"] span, [data-baseweb="select"] svg { color: __TEXT__ !important; fill: __TEXT__ !important; }
+[data-baseweb="popover"] > div, [data-baseweb="popover"] ul, [data-baseweb="menu"] {
+    background: __SURFACE__ !important;
+    color: __TEXT__ !important;
+}
+[data-baseweb="popover"] li, [data-baseweb="popover"] [role="option"] { color: __TEXT__ !important; background: transparent !important; }
+[data-baseweb="popover"] li:hover, [data-baseweb="popover"] [aria-selected="true"] { background: __CHAT__ !important; }
+[data-baseweb="tab-highlight"] { background-color: __PRIMARY__ !important; }
+[data-testid="stStatus"], [data-testid="stStatusWidget"] + div { color: __TEXT__; }
 
 /* ---------- Responsif ---------- */
 @media (max-width: 900px) {
-    .app-brand-title { font-size: 36px; }
+    [data-testid="stBottomBlockContainer"] { max-width: 100%; }
     .block-container [data-testid="stImage"] img { width: 40px !important; }
-    [data-testid="stBottomBlockContainer"] { padding-right: calc(1rem + __BADGE_SPACE__); }
 }
 @media (max-width: 640px) {
-    .block-container { padding: 0.8rem 0.75rem 7rem; }
-    .stApp h1 { font-size: 1.7rem !important; }
-    .app-brand-title { font-size: 28px !important; }
-    .block-container [data-testid="stImage"] img { width: 30px !important; }
-    [data-testid="stChatMessage"] { padding: 0.75rem 0.85rem; }
+    .block-container, [data-testid="stMainBlockContainer"] {
+        padding-left: 0.85rem;
+        padding-right: 0.85rem;
+    }
+    [data-testid="stBottomBlockContainer"] {
+        padding-left: 0.7rem;
+        padding-right: 0.7rem;
+    }
+    [data-testid="stChatMessage"] { padding: 0.75rem 0.9rem; }
+    __U__ { max-width: 92%; }
+    .block-container [data-testid="stImage"] img { width: 34px !important; }
 }
 </style>
 """
 
 
-def _build_app_css(theme: dict[str, str]) -> str:
+def _build_app_css(theme: dict[str, str], font: dict[str, str]) -> str:
+    dark = _is_dark(theme["background"])
+    shadow = _rgba("#000000", 0.55) if dark else _rgba(theme["primary"], 0.38)
+    user_bg = (
+        f"linear-gradient(135deg, {theme['primary']}, "
+        f"{_mix(theme['primary'], theme['accent'], 0.78)})"
+    )
+    gradient = theme.get("gradient", "none")
+    user_selectors = ", ".join(_USER_MESSAGE_SELECTORS)
+    user_text_selectors = ", ".join(
+        f"{prefix} {tag}"
+        for prefix in _USER_MESSAGE_SELECTORS
+        for tag in _USER_TEXT_TAGS
+    )
     replacements = {
+        "__FONT_IMPORT__": (
+            f"@import url('https://fonts.googleapis.com/css2?family={font['import']}&display=swap');"
+        ),
+        "__FONT_STACK__": font["stack"],
+        "__LINE__": font["line_height"],
+        "__LETTER__": font["letter_spacing"],
+        "__SCHEME__": "dark" if dark else "only light",
         "__BG__": theme["background"],
+        "__BG_IMAGE__": gradient,
         "__SURFACE__": theme["surface"],
         "__SIDEBAR__": theme["sidebar"],
         "__TEXT__": theme["text"],
+        "__MUTED__": _mix(theme["text"], theme["background"], 0.72),
         "__PRIMARY__": theme["primary"],
         "__PRIMARY_TEXT__": theme["primary_text"],
         "__ACCENT__": theme["accent"],
         "__CHAT__": theme["chat"],
+        "__CHAT_GLASS__": _rgba(theme["chat"], 0.78),
         "__BORDER__": theme["border"],
-        "__BADGE_SPACE__": _BADGE_SPACE,
+        "__SHADOW__": shadow,
+        "__FOCUS__": _rgba(theme["primary"], 0.28),
+        "__USER_BG__": user_bg,
+        "__U__": user_selectors,
+        "__U_TXT__": user_text_selectors,
     }
-    css = _APP_CSS
-    for token, value in replacements.items():
-        css = css.replace(token, value)
-    return css
+    return re.sub(
+        r"__[A-Z_]+?__",
+        lambda match: replacements.get(match.group(0), match.group(0)),
+        _APP_CSS,
+    )
 
 
 theme = APP_THEMES[APP_THEME_ID]
-st.markdown(_build_app_css(theme), unsafe_allow_html=True)
+st.markdown(_build_app_css(theme, APP_FONTS[APP_FONT_ID]), unsafe_allow_html=True)
 
 with st.sidebar:
     st.subheader("Sumber pengetahuan")
@@ -952,6 +1284,12 @@ with st.sidebar:
                 index=list(APP_THEMES).index(APP_THEME_ID),
                 format_func=lambda theme_id: APP_THEMES[theme_id]["label"],
             )
+            selected_font = st.selectbox(
+                "Jenis font",
+                options=list(APP_FONTS),
+                index=list(APP_FONTS).index(APP_FONT_ID),
+                format_func=lambda font_id: APP_FONTS[font_id]["label"],
+            )
             uploaded_logo = st.file_uploader(
                 "Logo aplikasi (PNG, JPG, WEBP)",
                 type=["png", "jpg", "jpeg", "webp"],
@@ -969,6 +1307,7 @@ with st.sidebar:
                 if prepared_logo is not None:
                     _save_custom_logo(prepared_logo)
                 PRIVATE_CONFIG["app_theme"] = selected_theme
+                PRIVATE_CONFIG["app_font"] = selected_font
                 _save_private_config(PRIVATE_CONFIG)
             except (OSError, ValueError) as error:
                 st.error(f"Tampilan tidak dapat disimpan: {error}")
@@ -986,18 +1325,23 @@ with st.sidebar:
             else:
                 st.rerun()
 
-if CUSTOM_LOGO_PATH.is_file():
-    logo_column, title_column = st.columns([1, 8], vertical_alignment="center")
-    with logo_column:
-        st.image(str(CUSTOM_LOGO_PATH), width=64)
-    with title_column:
-        st.markdown(
-            f'<h1 class="app-brand-title">{html.escape(st.session_state.app_title)}</h1>',
-            unsafe_allow_html=True,
-        )
-else:
-    st.title(st.session_state.app_title)
-st.caption("JH Asisten AI - Naroskeun - Nalaah - Milari")
+
+def _render_header() -> None:
+    title_html = (
+        f'<h1 class="app-brand-title">{html.escape(st.session_state.app_title.strip())}</h1>'
+        '<p class="app-brand-sub">JH Asisten AI - Naroskeun - Nalaah - Milari</p>'
+    )
+    if CUSTOM_LOGO_PATH.is_file():
+        logo_column, title_column = st.columns([1, 6], vertical_alignment="center")
+        with logo_column:
+            st.image(str(CUSTOM_LOGO_PATH), width=56)
+        with title_column:
+            st.markdown(title_html, unsafe_allow_html=True)
+    else:
+        st.markdown(title_html, unsafe_allow_html=True)
+
+
+_render_header()
 
 api_key = st.session_state.google_api_key
 if not api_key:
