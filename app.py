@@ -299,12 +299,14 @@ DEFAULT_FOLDER_ID = (
     os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
     or str(PRIVATE_CONFIG.get("google_drive_folder_id", "")).strip()
 )
-APP_THEME_ID = str(PRIVATE_CONFIG.get("app_theme", "emerald"))
+DEFAULT_THEME_ID = "amoled"
+DEFAULT_FONT_ID = "lora"
+APP_THEME_ID = str(PRIVATE_CONFIG.get("app_theme", DEFAULT_THEME_ID))
 if APP_THEME_ID not in APP_THEMES:
-    APP_THEME_ID = "emerald"
-APP_FONT_ID = str(PRIVATE_CONFIG.get("app_font", "jakarta"))
+    APP_THEME_ID = DEFAULT_THEME_ID
+APP_FONT_ID = str(PRIVATE_CONFIG.get("app_font", DEFAULT_FONT_ID))
 if APP_FONT_ID not in APP_FONTS:
-    APP_FONT_ID = "jakarta"
+    APP_FONT_ID = DEFAULT_FONT_ID
 _ARABIC_TEXT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
 
 
@@ -399,44 +401,39 @@ def _clean_legacy_assistant_message(content: str) -> str:
     )
 
 
-_MARKDOWN_SYNTAX_RE = re.compile(r"^\s*([-*+]|\d+[.)]|#|>|\|)\s")
-
-
-def _markdown_keep_indent(line: str) -> str:
-    """Pertahankan indentasi & baris baru saat teks dirender sebagai Markdown.
-
-    Markdown membuang spasi di awal baris, jadi bait yang menjorok tampil rata
-    kiri. Spasi awal diubah menjadi &nbsp; (kecuali baris daftar/heading/kutipan/
-    tabel), dan dua spasi di akhir baris dipertahankan sebagai hard line break.
-    """
-    expanded = line.expandtabs(4)
-    if expanded and not _MARKDOWN_SYNTAX_RE.match(expanded):
-        indent = len(expanded) - len(expanded.lstrip(" "))
-        if indent:
-            expanded = "&nbsp;" * indent + expanded.lstrip(" ")
-    return f"{expanded}  " if expanded else expanded
-
-
 def _render_message_content(content: str) -> None:
-    markdown_lines: list[str] = []
+    """Render konten pesan chat dengan mempertahankan indentasi/spasi asli."""
+    lines = content.splitlines()
+    has_arabic = any(_ARABIC_TEXT_RE.search(line) for line in lines)
 
-    def flush_markdown() -> None:
-        if markdown_lines:
-            st.markdown("\n".join(markdown_lines))
-            markdown_lines.clear()
-
-    for line in content.splitlines():
-        if _ARABIC_TEXT_RE.search(line):
-            flush_markdown()
-            st.markdown(
-                '<div class="arabic-chat-line" dir="rtl" lang="ar">'
-                f"{html.escape(line)}"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            markdown_lines.append(_markdown_keep_indent(line))
-    flush_markdown()
+    if has_arabic:
+        # Jika ada teks Arab, render per-baris agar RTL tidak merusak indentasi Latin
+        for line in lines:
+            if _ARABIC_TEXT_RE.search(line):
+                st.markdown(
+                    '<div class="arabic-chat-line" dir="rtl" lang="ar">'
+                    f"{html.escape(line)}"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Gunakan <pre> untuk mempertahankan indentasi spasi/tab pada baris Latin
+                escaped = html.escape(line)
+                st.markdown(
+                    f'<pre style="white-space: pre-wrap; font-family: inherit; '
+                    f'margin: 0; padding: 0; background: transparent; border: none;">'
+                    f"{escaped}</pre>",
+                    unsafe_allow_html=True,
+                )
+    else:
+        # Tidak ada teks Arab → render seluruh blok dalam satu <pre> agar lebih efisien
+        escaped = html.escape(content)
+        st.markdown(
+            f'<pre style="white-space: pre-wrap; font-family: inherit; '
+            f'margin: 0; padding: 0; background: transparent; border: none;">'
+            f"{escaped}</pre>",
+            unsafe_allow_html=True,
+        )
 
 
 def _reconstruct_source_text(chunks: list[Document]) -> str:
