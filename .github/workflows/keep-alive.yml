@@ -1,0 +1,125 @@
+name: Keep Streamlit App Alive
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # setiap 6 jam (waktu UTC)
+  workflow_dispatch:         # bisa dijalankan manual dari tab Actions
+
+permissions:
+  contents: read
+  actions: write   # dipakai agar workflow memperbarui dirinya sendiri (anti auto-disable 60 hari)
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
+
+jobs:
+  wake-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright + Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Open app and wake it if sleeping
+        env:
+          APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          import time
+
+          from playwright.sync_api import TimeoutError as PlaywrightTimeout
+          from playwright.sync_api import sync_playwright
+
+          DEFAULT_APP_URL = "https://jhassisten-ai.streamlit.app/"
+          APP_URL = os.environ.get("APP_URL", "").strip() or DEFAULT_APP_URL
+          if not APP_URL.startswith("http"):
+              sys.exit("URL aplikasi tidak valid.")
+
+          WAKE_BUTTON = re.compile(r"get this app back up", re.IGNORECASE)
+          BOOT_TIMEOUT_SECONDS = 300
+
+
+          def app_is_ready(page) -> bool:
+              """Aplikasi siap bila elemen utama Streamlit tampil (di halaman atau di iframe)."""
+              selectors = [
+                  page.locator('[data-testid="stApp"]'),
+                  page.frame_locator('iframe[title="streamlitApp"]').locator(
+                      '[data-testid="stApp"]'
+                  ),
+              ]
+              for locator in selectors:
+                  try:
+                      if locator.count() > 0 and locator.first.is_visible():
+                          return True
+                  except Exception:
+                      continue
+              return False
+
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              context = browser.new_context(viewport={"width": 1280, "height": 800})
+              page = context.new_page()
+              try:
+                  print(f"Membuka {APP_URL}")
+                  page.goto(APP_URL, wait_until="domcontentloaded", timeout=90_000)
+
+                  wake_button = page.get_by_role("button", name=WAKE_BUTTON)
+                  try:
+                      wake_button.wait_for(state="visible", timeout=20_000)
+                      sleeping = True
+                  except PlaywrightTimeout:
+                      sleeping = False
+
+                  if sleeping:
+                      print("Aplikasi tertidur. Mengklik tombol 'Yes, get this app back up!'")
+                      wake_button.click()
+                      time.sleep(3)
+                  else:
+                      print("Tombol wake-up tidak muncul; aplikasi kemungkinan sudah aktif.")
+
+                  deadline = time.monotonic() + BOOT_TIMEOUT_SECONDS
+                  while time.monotonic() < deadline:
+                      if app_is_ready(page):
+                          print("Aplikasi aktif dan siap.")
+                          break
+                      time.sleep(5)
+                  else:
+                      page.screenshot(path="keep-alive-failed.png", full_page=True)
+                      sys.exit(
+                          f"Aplikasi belum siap setelah {BOOT_TIMEOUT_SECONDS} detik."
+                      )
+
+                  # Tahan sebentar agar koneksi websocket terdaftar sebagai aktivitas.
+                  time.sleep(15)
+                  print("Selesai.")
+              finally:
+                  browser.close()
+          PY
+
+      - name: Renew workflow (cegah dinonaktifkan GitHub setelah 60 hari)
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable keep-alive.yml --repo "${{ github.repository }}"
+
+      - name: Upload screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keep-alive-screenshot
+          path: keep-alive-failed.png
+          if-no-files-found: ignore
