@@ -659,7 +659,6 @@ def _render_rpd_limit_notice_live(api_key: str) -> None:
 
 
 def _render_rpd_limit_notice(api_key: str) -> None:
-    # Hanya jalankan polling 1 detik jika limit poéan memang sedang aktif.
     status = _get_drive_sync_manager().get_rpd_status(api_key=api_key)
     if status is not None:
         _render_rpd_limit_notice_live(api_key)
@@ -909,7 +908,6 @@ def _render_drive_sync_status_live(folder_id: str, api_key: str) -> None:
 
 
 def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
-    # Polling 3 detik hanya berjalan saat sinkronisasi sedang aktif (tidak membebani HP).
     if _get_drive_sync_manager().snapshot()["running"]:
         _render_drive_sync_status_live(folder_id, api_key)
     else:
@@ -1700,7 +1698,6 @@ if chat_submission is not None:
 
             answer_message = st.empty()
             streamed_answer: list[str] = []
-            receiving_announced = False
 
             search_status = st.status(
                 "Mencari di indeks lokal..."
@@ -1713,15 +1710,13 @@ if chat_submission is not None:
                 search_status.update(label=message, state="running")
 
             def show_answer_token(token: str | None) -> None:
-                nonlocal receiving_announced
                 if token is None:
                     streamed_answer.clear()
-                    receiving_announced = False
                     answer_message.empty()
                     return
+                is_first_token = not streamed_answer
                 streamed_answer.append(token)
-                if not receiving_announced:
-                    receiving_announced = True
+                if is_first_token:
                     update_search_progress("Menerima jawaban dari Gemini...")
                 answer_message.markdown("".join(streamed_answer))
 
