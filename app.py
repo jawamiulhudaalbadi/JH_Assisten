@@ -7,6 +7,7 @@ import base64
 import html
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from importlib import import_module
 from inspect import signature
@@ -36,6 +37,7 @@ from services.ai_service import (
     answer_question,
     find_source_link_matches,
     is_source_link_request,
+    start_model_warmup,
     transcribe_audio,
 )
 from services.gdrive_service import (
@@ -55,6 +57,9 @@ st.set_page_config(
 
 PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.json"
 CUSTOM_LOGO_PATH = PRIVATE_CONFIG_PATH.parent / ".app_custom_logo.png"
+CHAT_HISTORY_DIR = PRIVATE_CONFIG_PATH.parent / "chat_history"
+LATEST_CHAT_POINTER = CHAT_HISTORY_DIR / "_latest_chat_id.txt"
+MAX_SAVED_CHAT_MESSAGES = 40
 MAX_LOGO_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_LOGO_IMAGE_PIXELS = 16_000_000
 MAX_CHAT_IMAGE_COUNT = 4
@@ -64,7 +69,6 @@ MAX_CHAT_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
 # Tema (10 total). Kunci opsional "gradient" = CSS background-image halaman.
 # --------------------------------------------------------------------------
 APP_THEMES: dict[str, dict[str, str]] = {
-    # ----- 5 tema lama (dipertahankan) -----
     "emerald": {
         "label": "Zamrud & Gading",
         "background": "#F3F6F1",
@@ -125,7 +129,6 @@ APP_THEMES: dict[str, dict[str, str]] = {
         "chat": "#EFE7F3",
         "border": "#E4D7E9",
     },
-    # ----- 5 tema baru -----
     "cyberpunk": {
         "label": "Cyberpunk Neon Glow",
         "background": "#0B0714",
@@ -310,6 +313,80 @@ if APP_FONT_ID not in APP_FONTS:
 _ARABIC_TEXT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
 
 
+# --------------------------------------------------------------------------
+# Penyimpanan riwayat chat persisten (tahan putus WebSocket & reload Android).
+# --------------------------------------------------------------------------
+def _safe_chat_id(raw: object) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw or ""))
+    return cleaned[:32]
+
+
+def _get_or_create_chat_id() -> str:
+    CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    param_chat_id = _safe_chat_id(st.query_params.get("chat"))
+    if param_chat_id:
+        try:
+            LATEST_CHAT_POINTER.write_text(param_chat_id, encoding="utf-8")
+        except OSError:
+            pass
+        return param_chat_id
+
+    if LATEST_CHAT_POINTER.is_file():
+        saved_id = _safe_chat_id(LATEST_CHAT_POINTER.read_text(encoding="utf-8").strip())
+        if saved_id:
+            st.query_params["chat"] = saved_id
+            return saved_id
+
+    new_id = uuid.uuid4().hex[:12]
+    st.query_params["chat"] = new_id
+    try:
+        LATEST_CHAT_POINTER.write_text(new_id, encoding="utf-8")
+    except OSError:
+        pass
+    return new_id
+
+
+def _load_persisted_messages(chat_id: str) -> list[dict]:
+    history_path = CHAT_HISTORY_DIR / f"{chat_id}.json"
+    if not history_path.is_file():
+        return []
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data[-MAX_SAVED_CHAT_MESSAGES:]
+    except Exception:
+        pass
+    return []
+
+
+def _save_persisted_messages(chat_id: str, messages: list[dict]) -> None:
+    CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    history_path = CHAT_HISTORY_DIR / f"{chat_id}.json"
+    temp_path = history_path.with_suffix(".tmp")
+    trimmed = messages[-MAX_SAVED_CHAT_MESSAGES:]
+    try:
+        temp_path.write_text(
+            json.dumps(trimmed, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temp_path.replace(history_path)
+        LATEST_CHAT_POINTER.write_text(chat_id, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _start_new_chat() -> None:
+    CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    new_id = uuid.uuid4().hex[:12]
+    st.query_params["chat"] = new_id
+    try:
+        LATEST_CHAT_POINTER.write_text(new_id, encoding="utf-8")
+    except OSError:
+        pass
+    st.session_state.chat_id = new_id
+    st.session_state.messages = []
+
+
 def _save_private_config(config: dict[str, object]) -> None:
     PRIVATE_CONFIG_PATH.write_text(
         json.dumps(config, ensure_ascii=False, indent=2),
@@ -402,38 +479,25 @@ def _clean_legacy_assistant_message(content: str) -> str:
 
 
 def _render_message_content(content: str) -> None:
-    """Render konten pesan chat dengan mempertahankan indentasi/spasi asli."""
-    lines = content.splitlines()
-    has_arabic = any(_ARABIC_TEXT_RE.search(line) for line in lines)
+    markdown_lines: list[str] = []
 
-    if has_arabic:
-        # Jika ada teks Arab, render per-baris agar RTL tidak merusak indentasi Latin
-        for line in lines:
-            if _ARABIC_TEXT_RE.search(line):
-                st.markdown(
-                    '<div class="arabic-chat-line" dir="rtl" lang="ar">'
-                    f"{html.escape(line)}"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                # Gunakan <pre> untuk mempertahankan indentasi spasi/tab pada baris Latin
-                escaped = html.escape(line)
-                st.markdown(
-                    f'<pre style="white-space: pre-wrap; font-family: inherit; '
-                    f'margin: 0; padding: 0; background: transparent; border: none;">'
-                    f"{escaped}</pre>",
-                    unsafe_allow_html=True,
-                )
-    else:
-        # Tidak ada teks Arab → render seluruh blok dalam satu <pre> agar lebih efisien
-        escaped = html.escape(content)
-        st.markdown(
-            f'<pre style="white-space: pre-wrap; font-family: inherit; '
-            f'margin: 0; padding: 0; background: transparent; border: none;">'
-            f"{escaped}</pre>",
-            unsafe_allow_html=True,
-        )
+    def flush_markdown() -> None:
+        if markdown_lines:
+            st.markdown("\n".join(markdown_lines))
+            markdown_lines.clear()
+
+    for line in content.splitlines():
+        if _ARABIC_TEXT_RE.search(line):
+            flush_markdown()
+            st.markdown(
+                '<div class="arabic-chat-line" dir="rtl" lang="ar">'
+                f"{html.escape(line)}"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            markdown_lines.append(f"{line}  " if line else line)
+    flush_markdown()
 
 
 def _reconstruct_source_text(chunks: list[Document]) -> str:
@@ -495,7 +559,6 @@ def _render_copy_button(content: str, key: str) -> None:
 def _render_source_links(sources: list[dict[str, str]], key: str) -> None:
     if not sources:
         return
-    # Satu baris yang bisa diklik; tombol baru muncul setelah dibuka.
     with st.expander(f"Sumber ({len(sources)})", expanded=False):
         for source_number, source in enumerate(sources):
             st.caption(source.get("name", "Dokumen"))
@@ -523,6 +586,26 @@ def _get_drive_sync_manager() -> DriveSyncManager:
     return DriveSyncManager()
 
 
+@st.cache_resource(show_spinner=False)
+def _load_cached_local_index(
+    folder_id: str,
+    api_key: str,
+    sync_generation: int,
+) -> FAISS | None:
+    """Simpan indeks FAISS di RAM agar reconnect di HP tidak baca ulang dari disk."""
+    _ = sync_generation
+    return _get_drive_sync_manager().load_local_index(folder_id, api_key)
+
+
+@st.cache_resource(show_spinner=False)
+def _warm_up_models_once(api_key: str) -> bool:
+    try:
+        start_model_warmup(api_key)
+    except Exception:
+        pass
+    return True
+
+
 def _format_rpd_reset_time(reset_at: datetime) -> str:
     wib_time = reset_at.astimezone(_WIB_TIMEZONE)
     return (
@@ -548,7 +631,7 @@ def _format_sync_eta(seconds: float) -> str:
 
 
 @st.fragment(run_every="1s")
-def _render_rpd_limit_notice(api_key: str) -> None:
+def _render_rpd_limit_notice_live(api_key: str) -> None:
     manager = _get_drive_sync_manager()
     now = datetime.now(timezone.utc)
     status = manager.get_rpd_status(now, api_key=api_key)
@@ -575,8 +658,14 @@ def _render_rpd_limit_notice(api_key: str) -> None:
     )
 
 
-@st.fragment(run_every="3s")
-def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
+def _render_rpd_limit_notice(api_key: str) -> None:
+    # Hanya jalankan polling 1 detik jika limit poéan memang sedang aktif.
+    status = _get_drive_sync_manager().get_rpd_status(api_key=api_key)
+    if status is not None:
+        _render_rpd_limit_notice_live(api_key)
+
+
+def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
     manager = _get_drive_sync_manager()
     if st.session_state.pop("_quota_resume_start_failed", False):
         st.warning(
@@ -598,7 +687,7 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
             st.session_state.index_has_index = bool(result["has_index"])
             if result["index_updated"]:
                 try:
-                    index = manager.load_local_index(folder_id, api_key)
+                    index = _load_cached_local_index(folder_id, api_key, generation)
                 except EOFError:
                     st.warning(
                         "Indeks FAISS belum terbaca karena berkasnya belum lengkap. "
@@ -694,9 +783,10 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
     ):
         if snapshot["running"]:
             manager.resume() if snapshot["paused"] else manager.pause()
+            st.rerun(scope="fragment")
         else:
             manager.start_sync(folder_id, api_key)
-        st.rerun(scope="fragment")
+            st.rerun(scope="app")
 
     with st.expander(f"Daftar sumber ({len(files)})"):
         failed_files = [
@@ -721,7 +811,7 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
                     ):
                         if manager.retry_file(file_id):
                             manager.start_sync(folder_id, api_key)
-                        st.rerun(scope="fragment")
+                        st.rerun(scope="app")
             st.divider()
         else:
             st.caption("Tidak ada file yang gagal.")
@@ -737,7 +827,6 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
         for file_status in sorted(files, key=lambda item: state_order.get(item["state"], 5)):
             if file_status["state"] == "failed":
                 continue
-            file_id = file_status["id"]
             state = file_status["state"]
             columns = st.columns([4, 1])
             with columns[0]:
@@ -814,6 +903,19 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
                 )
 
 
+@st.fragment(run_every="3s")
+def _render_drive_sync_status_live(folder_id: str, api_key: str) -> None:
+    _render_drive_sync_status_body(folder_id, api_key)
+
+
+def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
+    # Polling 3 detik hanya berjalan saat sinkronisasi sedang aktif (tidak membebani HP).
+    if _get_drive_sync_manager().snapshot()["running"]:
+        _render_drive_sync_status_live(folder_id, api_key)
+    else:
+        _render_drive_sync_status_body(folder_id, api_key)
+
+
 st.session_state["google_api_key"] = DEFAULT_API_KEY
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
 
@@ -824,7 +926,7 @@ if "app_title" not in st.session_state:
 
 
 # ==========================================================================
-# Sistem tampilan: warna, font, dan CSS (ditulis ulang dari nol).
+# Sistem tampilan: warna, font, dan CSS (ringan di Android).
 # ==========================================================================
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
     color = color.lstrip("#")
@@ -837,7 +939,6 @@ def _rgba(color: str, alpha: float) -> str:
 
 
 def _mix(first: str, second: str, weight: float) -> str:
-    """Campur dua warna hex; weight = porsi warna pertama (0..1)."""
     a = _hex_to_rgb(first)
     b = _hex_to_rgb(second)
     mixed = tuple(round(a[i] * weight + b[i] * (1 - weight)) for i in range(3))
@@ -849,8 +950,6 @@ def _is_dark(color: str) -> bool:
     return (0.2126 * red + 0.7152 * green + 0.0722 * blue) < 128
 
 
-# Pemilih pesan pengguna (balon di kanan). Tiap varian :has() ditulis terpisah
-# agar satu pemilih yang tidak dikenali tidak membatalkan seluruh aturan.
 _USER_MESSAGE_SELECTORS = (
     '[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])',
     '[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"])',
@@ -861,13 +960,15 @@ _APP_CSS = """
 <style>
 __FONT_IMPORT__
 
-/* ---------- Kunci skema warna (anti force-dark Android) ---------- */
 :root, html, body, .stApp, [data-testid="stAppViewContainer"] {
     color-scheme: __SCHEME__;
 }
-html, body { background: __BG__; -webkit-text-size-adjust: 100%; }
+html, body {
+    background: __BG__;
+    -webkit-text-size-adjust: 100%;
+    overscroll-behavior-y: contain;
+}
 
-/* ---------- Dasar halaman ---------- */
 .stApp, [data-testid="stAppViewContainer"] {
     background-color: __BG__;
     background-image: __BG_IMAGE__;
@@ -879,7 +980,6 @@ html, body { background: __BG__; -webkit-text-size-adjust: 100%; }
 }
 [data-testid="stMain"], [data-testid="stMainBlockContainer"] { background: transparent; }
 
-/* ---------- Tipografi (font pilihan pengguna) ---------- */
 .stApp, .stApp button, .stApp input, .stApp textarea, .stApp select,
 .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
 .stApp p, .stApp li, .stApp label, .stApp summary,
@@ -903,7 +1003,6 @@ html, body { background: __BG__; -webkit-text-size-adjust: 100%; }
     margin: 0.35rem 0;
 }
 
-/* ---------- Warna teks ---------- */
 .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
 .stApp p, .stApp li, .stApp label, .stApp summary, .stApp summary span,
 .stApp [data-testid="stMarkdownContainer"],
@@ -913,7 +1012,6 @@ html, body { background: __BG__; -webkit-text-size-adjust: 100%; }
 .stApp [data-testid="stCaptionContainer"] p { color: __MUTED__; }
 a { color: __PRIMARY__ !important; text-underline-offset: 3px; }
 
-/* ---------- Tata letak utama & jarak aman ---------- */
 .block-container, [data-testid="stMainBlockContainer"] {
     max-width: 820px;
     padding-top: calc(3.6rem + env(safe-area-inset-top, 0px)) !important;
@@ -922,13 +1020,11 @@ a { color: __PRIMARY__ !important; text-underline-offset: 3px; }
     padding-bottom: calc(9rem + env(safe-area-inset-bottom, 0px)) !important;
 }
 
-/* ---------- Sembunyikan chrome Streamlit ---------- */
 #MainMenu, .stDeployButton, [data-testid="stAppDeployButton"],
 [data-testid="stToolbar"], [data-testid="stDecoration"],
 [data-testid="stStatusWidget"] { visibility: hidden !important; }
 footer { display: none !important; }
 [data-testid="stHeader"] { background: transparent !important; }
-/* tombol buka/tutup sidebar tetap terlihat */
 [data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
 [data-testid="collapsedControl"], [data-testid="stSidebarCollapseButton"] {
     visibility: visible !important;
@@ -936,7 +1032,6 @@ footer { display: none !important; }
 [data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
 [data-testid="collapsedControl"] { color: __TEXT__; }
 
-/* ---------- Header aplikasi ---------- */
 .app-brand-title {
     font-size: clamp(1.7rem, 6.4vw, 2.6rem);
     line-height: 1.1;
@@ -961,7 +1056,6 @@ footer { display: none !important; }
     color: __MUTED__ !important;
 }
 
-/* ---------- Sidebar ---------- */
 [data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child {
     background: __SIDEBAR__;
     border-right: 1px solid __BORDER__;
@@ -972,7 +1066,6 @@ footer { display: none !important; }
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] { font-size: 0.8rem; }
 [data-testid="stSidebar"] hr { border-color: __BORDER__; }
 
-/* ---------- Status & peringatan ---------- */
 [data-testid="stAlert"] {
     background: __SURFACE__;
     border: 1px solid __BORDER__;
@@ -998,7 +1091,6 @@ footer { display: none !important; }
     background-color: __PRIMARY__;
 }
 
-/* ---------- Pesan chat: tanpa avatar ---------- */
 [data-testid="stChatMessageAvatarUser"], [data-testid="stChatMessageAvatarAssistant"],
 [data-testid^="stChatMessageAvatar"], [data-testid^="chatAvatarIcon"] {
     display: none !important;
@@ -1008,7 +1100,6 @@ footer { display: none !important; }
     display: none !important;
 }
 
-/* ---------- Pesan chat: balasan AI (kiri, lebar penuh, kaca tipis) ---------- */
 [data-testid="stChatMessage"] {
     display: flex;
     gap: 0;
@@ -1027,7 +1118,6 @@ footer { display: none !important; }
 [data-testid="stChatMessage"] p { line-height: __LINE__; margin-bottom: 0.5rem; }
 [data-testid="stChatMessage"] p:last-child { margin-bottom: 0; }
 
-/* ---------- Pesan chat: pertanyaan pengguna (kanan, ringkas) ---------- */
 __U__ {
     width: fit-content;
     max-width: 88%;
@@ -1039,7 +1129,6 @@ __U__ {
 }
 __U_TXT__ { color: __PRIMARY_TEXT__ !important; }
 
-/* ---------- Tombol salin jawaban ---------- */
 .copy-answer-control { margin-top: 0.4rem; }
 .copy-answer-control button {
     background: transparent;
@@ -1054,7 +1143,6 @@ __U_TXT__ { color: __PRIMARY_TEXT__ !important; }
 .copy-answer-control button:active { border-color: __PRIMARY__; }
 .copy-answer-control [role=status] { margin-left: 0.5rem; font-size: 0.78rem; color: __MUTED__; }
 
-/* ---------- Kotak input chat (pill ala Gemini, lebar penuh) ---------- */
 [data-testid="stBottom"] { background: transparent !important; }
 [data-testid="stBottom"] > div {
     background: linear-gradient(to top, __BG__ 68%, transparent) !important;
@@ -1099,7 +1187,6 @@ __U_TXT__ { color: __PRIMARY_TEXT__ !important; }
     border-radius: 50%;
 }
 
-/* ---------- Tombol, expander, input ---------- */
 div.stButton > button, div.stDownloadButton > button, [data-testid="stLinkButton"] a,
 [data-testid="stFormSubmitButton"] button {
     background: __SURFACE__;
@@ -1149,8 +1236,15 @@ textarea:disabled { -webkit-text-fill-color: __TEXT__ !important; opacity: 0.92;
 [data-baseweb="tab-highlight"] { background-color: __PRIMARY__ !important; }
 [data-testid="stStatus"], [data-testid="stStatusWidget"] + div { color: __TEXT__; }
 
-/* ---------- Responsif ---------- */
+/* ---------- Optimasi GPU & scroll HP Android ---------- */
 @media (max-width: 900px) {
+    .stApp, [data-testid="stAppViewContainer"] { background-attachment: scroll; }
+    [data-testid="stChatMessage"] {
+        background: __CHAT__;
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
+        box-shadow: none;
+    }
     [data-testid="stBottomBlockContainer"] { max-width: 100%; }
     .block-container [data-testid="stImage"] img { width: 40px !important; }
 }
@@ -1222,6 +1316,11 @@ theme = APP_THEMES[APP_THEME_ID]
 st.markdown(_build_app_css(theme, APP_FONTS[APP_FONT_ID]), unsafe_allow_html=True)
 
 with st.sidebar:
+    if st.button("Mulai Chat Baru", key="new_chat_button", use_container_width=True):
+        _start_new_chat()
+        st.rerun()
+
+    st.divider()
     st.subheader("Sumber pengetahuan")
     folder_id = st.session_state.google_drive_folder_id
     if not folder_id:
@@ -1362,10 +1461,7 @@ api_key = st.session_state.google_api_key
 if not api_key:
     st.info("Atur GOOGLE_API_KEY sebelum menggunakan fitur pencarian AI.")
 else:
-    try:
-        _get_drive_sync_manager().get_rpd_status(api_key=api_key)
-    except (OSError, ValueError) as error:
-        st.warning(f"Status jeda kuota Gemini tidak dapat diperbarui: {error}")
+    _warm_up_models_once(api_key)
 if not folder_id:
     st.info("Atur GOOGLE_DRIVE_FOLDER_ID untuk menghubungkan memori Google Drive.")
 
@@ -1373,11 +1469,17 @@ drive_authorized = False
 if api_key and folder_id:
     try:
         manager = _get_drive_sync_manager()
+        current_generation = int(manager.snapshot()["generation"])
         if (
             st.session_state.get("index_folder_id") != folder_id
             or st.session_state.get("index_api_key") != api_key
+            or st.session_state.get("search_index") is None
         ):
-            st.session_state.search_index = manager.load_local_index(folder_id, api_key)
+            st.session_state.search_index = _load_cached_local_index(
+                folder_id,
+                api_key,
+                current_generation,
+            )
             st.session_state.index_folder_id = folder_id
             st.session_state.index_api_key = api_key
     except EOFError:
@@ -1448,8 +1550,12 @@ if api_key and folder_id and drive_authorized:
     except (GoogleAPIError, GoogleAuthError, HttpError, OSError, ValueError) as error:
         st.warning(f"Sinkronisasi Drive berjalan di latar belakang; indeks lokal tetap digunakan bila tersedia. {error}")
 
+if "chat_id" not in st.session_state:
+    st.session_state.chat_id = _get_or_create_chat_id()
+chat_id = st.session_state.chat_id
+
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = _load_persisted_messages(chat_id)
 
 for message in st.session_state.messages:
     if message["role"] == "assistant":
@@ -1548,6 +1654,8 @@ if chat_submission is not None:
     if audio_preview is not None:
         user_message["audio"] = audio_preview
     st.session_state.messages.append(user_message)
+    _save_persisted_messages(chat_id, st.session_state.messages)
+
     with st.chat_message("user"):
         _render_message_content(displayed_question)
         for image_data in image_previews:
@@ -1589,15 +1697,10 @@ if chat_submission is not None:
             supports_search_progress = "on_progress" in answer_parameters
             supports_answer_streaming = "on_token" in answer_parameters
             supports_local_search = "force_local_search" in answer_parameters
-            if not supports_search_progress or not supports_answer_streaming:
-                st.warning(
-                    "Layanan pencarian yang sedang berjalan masih versi lama. "
-                    "Jawaban tetap diproses, tetapi mulai ulang proses Streamlit "
-                    "untuk mengaktifkan status progres."
-                )
 
             answer_message = st.empty()
             streamed_answer: list[str] = []
+            receiving_announced = False
 
             search_status = st.status(
                 "Mencari di indeks lokal..."
@@ -1610,12 +1713,16 @@ if chat_submission is not None:
                 search_status.update(label=message, state="running")
 
             def show_answer_token(token: str | None) -> None:
+                nonlocal receiving_announced
                 if token is None:
                     streamed_answer.clear()
+                    receiving_announced = False
                     answer_message.empty()
                     return
                 streamed_answer.append(token)
-                update_search_progress("Menerima jawaban dari Gemini...")
+                if not receiving_announced:
+                    receiving_announced = True
+                    update_search_progress("Menerima jawaban dari Gemini...")
                 answer_message.markdown("".join(streamed_answer))
 
             local_search_options = (
@@ -1670,3 +1777,4 @@ if chat_submission is not None:
             "sources": response_sources,
         }
     )
+    _save_persisted_messages(chat_id, st.session_state.messages)

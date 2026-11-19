@@ -1,5 +1,7 @@
 """Build a semantic search index and answer questions with Gemini."""
+
 from __future__ import annotations
+
 import base64
 import hashlib
 import json
@@ -19,6 +21,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from threading import Lock
 from typing import Callable
+
 from google import genai
 from langchain_core.embeddings import Embeddings
 from langchain_core.documents import Document
@@ -27,8 +30,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from services.gdrive_service import DriveDocument
 
+from services.gdrive_service import DriveDocument
 try:  # model_router.py boleh diletakkan di folder yang sama dengan file ini
     from services.model_router import router
 except ImportError:
@@ -55,36 +58,24 @@ def _env_number(name: str, default, cast=int):
 
 
 # --- Kalibrasi kuota gemini-embedding-001 (tier gratis) ---------------------
-# Kuota berlaku per PROYEK Google Cloud (bukan per API key). Nilai di bawah bisa
-# diubah lewat environment variable bila batas di AI Studio Anda berbeda
-# (cek: AI Studio > Rate limits). Semua dihitung dengan margin keamanan.
 EMBEDDING_FREE_TIER_RPM = _env_number("GEMINI_EMBED_RPM", 100)
 EMBEDDING_FREE_TIER_TPM = _env_number("GEMINI_EMBED_TPM", 30_000)
 EMBEDDING_SAFETY_FACTOR = 0.85
 EMBEDDING_WINDOW_SECONDS = 60.0
-
-# Anggaran per jendela 60 detik. Teks dalam satu batch DIHITUNG SATU PER SATU
-# untuk RPM (laporan komunitas: batchEmbedContents berisi N teks = N request).
 EMBEDDING_TOKENS_PER_MINUTE = int(EMBEDDING_FREE_TIER_TPM * EMBEDDING_SAFETY_FACTOR)
 EMBEDDING_TEXTS_PER_MINUTE = int(EMBEDDING_FREE_TIER_RPM * EMBEDDING_SAFETY_FACTOR)
-EMBEDDING_MAX_REQUESTS_PER_MINUTE = 30  # panggilan HTTP, hanya agar tidak "menembak" API
-EMBEDDING_MAX_BATCH_SIZE = 100  # batas teks per panggilan API
-
-# Batas per panggilan API ~20.000 token; dibatasi juga separuh anggaran TPM agar
-# dua batch bisa muat dalam satu jendela menit dan jendela terisi merata.
+EMBEDDING_MAX_REQUESTS_PER_MINUTE = 30
+EMBEDDING_MAX_BATCH_SIZE = 100
 EMBEDDING_TARGET_BATCH_TOKENS = min(18_000, EMBEDDING_TOKENS_PER_MINUTE // 2)
-EMBEDDING_MAX_BATCH_CHARACTERS = EMBEDDING_TARGET_BATCH_TOKENS * 3  # estimasi 1 token = 3 karakter
-EMBEDDING_MAX_TEXT_CHARACTERS = 6_000  # 1 teks maksimal 2.048 token; lebih dari itu dipotong diam-diam
-EMBEDDING_MAX_QUOTA_RETRIES = 3  # retry untuk 429 per-menit
-EMBEDDING_UNKNOWN_QUOTA_RETRIES = 1  # retry untuk 429 yang tidak jelas menit/harian
+EMBEDDING_MAX_BATCH_CHARACTERS = EMBEDDING_TARGET_BATCH_TOKENS * 3
+EMBEDDING_MAX_TEXT_CHARACTERS = 6_000
+EMBEDDING_MAX_QUOTA_RETRIES = 3
+EMBEDDING_UNKNOWN_QUOTA_RETRIES = 1
 EMBEDDING_MIN_QUOTA_WAIT_SECONDS = 30.0
 EMBEDDING_MAX_QUOTA_WAIT_SECONDS = 70.0
 EMBEDDING_DEFAULT_QUOTA_RETRY_DELAY_SECONDS = EMBEDDING_WINDOW_SECONDS
 EMBEDDING_MAX_AUTOMATIC_QUOTA_WAIT_SECONDS = 300.0
-
 # --- Chunking ----------------------------------------------------------------
-# Satu halaman PDF dipecah sendiri-sendiri (page_sections), jadi halaman <= 3.500
-# karakter selalu menjadi tepat 1 chunk. Dimensi vektor tidak terpengaruh.
 RAG_CHUNK_SIZE = _env_number("RAG_CHUNK_SIZE", 3_500)
 RAG_CHUNK_OVERLAP = min(_env_number("RAG_CHUNK_OVERLAP", 350), RAG_CHUNK_SIZE // 4)
 RAG_CLEAN_OCR = os.getenv("RAG_CLEAN_OCR", "").strip().lower() in {"1", "true", "yes"}
@@ -93,37 +84,28 @@ CHAT_QUERY_EMBEDDING_TIMEOUT_MS = 5_000
 CHAT_MODEL_REQUEST_TIMEOUT_SECONDS = 180
 CHAT_MAX_OUTPUT_TOKENS = 8192
 CHAT_MAX_CONTINUATIONS = 5
+CHAT_SAME_MODEL_RESUME_RETRIES = 2
 CONTINUE_PROMPT = (
     "Lanjutkan jawaban di atas tepat dari titik terakhir yang terpotong. "
-    "Jangan mengulang bagian yang sudah ditulis dan jangan membuat pembuka baru."
+    "Jangan mengulang bagian yang sudah ditulis dan jangan membuat pembuka baru. "
+    "Pertahankan format baris dan ejaan yang sama persis."
 )
 EMBEDDING_MAX_RETRIES = 0
-MODEL_LIST_CACHE_SECONDS = 300.0
-
-# Urutan model chat. Yang paling kiri dicoba lebih dulu. Bisa diganti tanpa
-# mengubah kode lewat environment variable, contoh:
-# GEMINI_CHAT_MODELS="gemini-2.0-flash,gemini-1.5-flash"
-# Prioritas KUALITAS: model terbaru/terkuat dulu. Model "lite" hanya jaring
-# pengaman terakhir bila semua model di atasnya sibuk atau gagal.
+MODEL_LIST_CACHE_SECONDS = 1800.0
 _DEFAULT_CHAT_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash-8b",
 )
-
 FALLBACK_CHAT_MODELS = tuple(
     name.strip()
     for name in os.getenv("GEMINI_CHAT_MODELS", "").split(",")
     if name.strip()
 ) or _DEFAULT_CHAT_MODELS
-
 PREFERRED_CHAT_MODEL_ORDER = {
     model: position for position, model in enumerate(FALLBACK_CHAT_MODELS)
 }
-
-# Model yang bukan untuk chat teks (gambar, riset, embedding, dsb.) dibuang dari
-# daftar otomatis agar tidak membuang waktu dengan error 404/429.
 EXCLUDED_CHAT_MODEL_MARKERS = (
     "image",
     "deep-research",
@@ -134,28 +116,24 @@ EXCLUDED_CHAT_MODEL_MARKERS = (
     "embedding",
     "live",
     "aqa",
+    "robotics",
+    "computer-use",
+    "veo",
+    "imagen",
+    "lyria",
+    "learnlm",
 )
-
 # --- Balapan model (hedged request) -----------------------------------------
-# Model teratas dimulai lebih dulu. Bila belum ada token pertama setelah
-# CHAT_HEDGE_SECONDS, model berikutnya dijalankan BERSAMAAN (yang pertama tidak
-# dibuang). Pemenangnya adalah yang lebih dulu mengeluarkan token; sisanya
-# dibatalkan. Model yang error langsung diganti tanpa menunggu timeout.
-CHAT_HEDGE_SECONDS = _env_number("CHAT_HEDGE_SECONDS", 4.0, float)
-CHAT_MAX_PARALLEL = _env_number("CHAT_MAX_PARALLEL", 3)
-CHAT_MAX_ATTEMPTS = _env_number("CHAT_MAX_ATTEMPTS", 6)
-
-# Batas mutlak menunggu token pertama untuk satu model (ditambah menurut ukuran prompt).
-CHAT_FIRST_TOKEN_TIMEOUT_SECONDS = _env_number("CHAT_FIRST_TOKEN_TIMEOUT", 15.0, float)
-# Jeda maksimal antar potongan jawaban setelah jawaban mulai mengalir.
-CHAT_CHUNK_TIMEOUT_SECONDS = _env_number("CHAT_CHUNK_TIMEOUT", 60.0, float)
-
-# Tingkat "berpikir" Gemini: makin rendah makin cepat jawaban pertama muncul.
-# Nilai: minimal | low | medium | high. Kosongkan untuk memakai bawaan Google.
+CHAT_HEDGE_SECONDS = _env_number("CHAT_HEDGE_SECONDS", 7.0, float)
+CHAT_MAX_PARALLEL = _env_number("CHAT_MAX_PARALLEL", 2)
+CHAT_MAX_ATTEMPTS = _env_number("CHAT_MAX_ATTEMPTS", 5)
+CHAT_FIRST_TOKEN_TIMEOUT_SECONDS = _env_number("CHAT_FIRST_TOKEN_TIMEOUT", 18.0, float)
+CHAT_CHUNK_TIMEOUT_SECONDS = _env_number("CHAT_CHUNK_TIMEOUT", 45.0, float)
 CHAT_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "minimal").strip().lower()
-
 _CHAT_MODEL_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
 _CHAT_MODEL_CACHE_LOCK = Lock()
+_QUERY_EMBEDDING_CACHE: dict[str, _QuotaAwareEmbeddings] = {}
+_QUERY_EMBEDDING_CACHE_LOCK = Lock()
 EMBEDDING_DIMENSIONS = 768
 
 
@@ -175,7 +153,6 @@ class _EmbeddingRateLimiter:
 
     def __init__(self) -> None:
         self._lock = Lock()
-        # (waktu, token, jumlah teks)
         self._events: deque[tuple[float, int, int]] = deque()
         self._throttle_factor = 1.0
 
@@ -198,12 +175,10 @@ class _EmbeddingRateLimiter:
         return EMBEDDING_WINDOW_SECONDS
 
     def penalize(self) -> None:
-        """Dipanggil saat 429: turunkan laju sementara."""
         with self._lock:
             self._throttle_factor = max(0.4, self._throttle_factor * 0.7)
 
     def reward(self) -> None:
-        """Dipanggil saat sukses: pulihkan laju bertahap."""
         with self._lock:
             self._throttle_factor = min(1.0, self._throttle_factor + 0.05)
 
@@ -233,6 +208,7 @@ class _EmbeddingRateLimiter:
                     and now - self._events[0][0] >= EMBEDDING_WINDOW_SECONDS
                 ):
                     self._events.popleft()
+
                 factor = self._throttle_factor
                 token_limit = max(int(EMBEDDING_TOKENS_PER_MINUTE * factor), estimated_tokens)
                 text_limit = max(int(EMBEDDING_TEXTS_PER_MINUTE * factor), text_count)
@@ -247,6 +223,7 @@ class _EmbeddingRateLimiter:
                     self._events.append((now, estimated_tokens, text_count))
                     return
                 wait_seconds = max(0.1, wait_seconds)
+
             if on_wait:
                 on_wait(wait_seconds)
             time.sleep(wait_seconds)
@@ -287,7 +264,6 @@ class _QuotaAwareEmbeddings(Embeddings):
                     )
                 except Exception as error:
                     kind = classify_embedding_quota_error(error)
-                    # Bukan 429, atau limit HARIAN: berhenti segera (jangan buang request).
                     if kind is None or kind == "daily":
                         raise
                     _EMBEDDING_RATE_LIMITER.penalize()
@@ -295,7 +271,7 @@ class _QuotaAwareEmbeddings(Embeddings):
                         if minute_retries >= EMBEDDING_MAX_QUOTA_RETRIES:
                             raise
                         minute_retries += 1
-                    else:  # 429 tanpa penanda jelas: coba sekali lagi, lalu berhenti aman
+                    else:
                         if unknown_retries >= EMBEDDING_UNKNOWN_QUOTA_RETRIES:
                             raise
                         unknown_retries += 1
@@ -426,7 +402,6 @@ def is_embedding_daily_quota_error(error: Exception) -> bool:
 
 
 def _quota_message_markers(error: Exception) -> tuple[bool, bool]:
-    """Kembalikan (ada_penanda_harian, ada_penanda_menit) dari seluruh rantai error."""
     current: BaseException | None = error
     visited: set[int] = set()
     daily = minute = False
@@ -442,17 +417,15 @@ def _quota_message_markers(error: Exception) -> tuple[bool, bool]:
 
 
 def classify_embedding_quota_error(error: Exception) -> str | None:
-    """Bedakan jenis 429: 'daily' (RPD/TPD), 'minute' (RPM/TPM), 'unknown', atau None."""
     if not is_embedding_quota_error(error):
         return None
     daily, minute = _quota_message_markers(error)
-    if daily:  # jika pesan memuat keduanya, harian yang menentukan
+    if daily:
         return "daily"
     return "minute" if minute else "unknown"
 
 
 def _quota_wait_seconds(error: Exception) -> float | None:
-    """Jeda sebelum retry 429 non-harian: 30-70 detik; None bila terlalu lama."""
     parsed = get_quota_retry_delay_seconds(error)
     if parsed is None:
         return EMBEDDING_DEFAULT_QUOTA_RETRY_DELAY_SECONDS
@@ -476,6 +449,7 @@ def get_quota_retry_delay_seconds(error: Exception) -> float | None:
         )
         if retry_delay:
             return float(retry_delay.group(1))
+
         human_delay = re.search(
             r"retry in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+(?:\.\d+)?)s)?",
             message,
@@ -493,11 +467,11 @@ def get_quota_retry_delay_seconds(error: Exception) -> float | None:
 
 
 def _make_embedding_batches(texts: list[str]) -> list[tuple[list[str], int]]:
-    """Kelompokkan teks: maks 100 teks/batch, dibatasi estimasi token & karakter."""
     batches: list[tuple[list[str], int]] = []
     current_batch: list[str] = []
     current_tokens = 0
     current_characters = 0
+
     for text in texts:
         character_count = len(text)
         if character_count > EMBEDDING_MAX_TEXT_CHARACTERS:
@@ -516,9 +490,11 @@ def _make_embedding_batches(texts: list[str]) -> list[tuple[list[str], int]]:
             current_batch = []
             current_tokens = 0
             current_characters = 0
+
         current_batch.append(text)
         current_tokens += estimated_tokens
         current_characters += character_count
+
     if current_batch:
         batches.append((current_batch, current_tokens))
     return batches
@@ -565,18 +541,24 @@ def _create_embedding_client(
 
 
 def _get_chat_query_embeddings(api_key: str | None = None) -> _QuotaAwareEmbeddings:
-    client = _create_embedding_client(api_key, CHAT_QUERY_EMBEDDING_TIMEOUT_MS)
-    return _QuotaAwareEmbeddings(client, limit_query_rate=False)
+    _check_api_key(api_key)
+    resolved_api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
+    cache_key = hashlib.sha256(resolved_api_key.encode("utf-8")).hexdigest()
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        cached = _QUERY_EMBEDDING_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        client = _create_embedding_client(resolved_api_key, CHAT_QUERY_EMBEDDING_TIMEOUT_MS)
+        wrapper = _QuotaAwareEmbeddings(client, limit_query_rate=False)
+        _QUERY_EMBEDDING_CACHE[cache_key] = wrapper
+        return wrapper
 
 
 try:  # pembersih OCR opsional (aktif jika RAG_CLEAN_OCR=1)
     from services.text_cleaner import clean_ocr_text as _clean_ocr
 except ImportError:  # pragma: no cover
-    try:
-        from services.text_cleaner import clean_ocr_text as _clean_ocr
-    except ImportError:
-        def _clean_ocr(text: str) -> str:
-            return text
+    def _clean_ocr(text: str) -> str:
+        return text
 
 
 def _to_langchain_documents(
@@ -614,6 +596,7 @@ def _to_langchain_documents(
                     [Document(page_content=section_text, metadata=metadata)]
                 )
             )
+
     next_chunk_index: Counter[str] = Counter()
     for chunk in chunks:
         file_id = str(chunk.metadata.get("file_id", ""))
@@ -636,6 +619,7 @@ def create_search_index(
             "Tidak ada teks DOCX atau PDF yang dapat diindeks di folder Google Drive tersebut."
         )
     _check_api_key(api_key)
+
     documents = _to_langchain_documents(source_documents)
     return FAISS.from_documents(documents, _get_embeddings(api_key, on_wait))
 
@@ -655,7 +639,6 @@ def load_search_index(
 
 
 def _chunk_fingerprint(chunk: Document) -> tuple[str, str]:
-    """Identitas isi chunk: (label halaman, SHA-256 teks)."""
     return (
         str(chunk.metadata.get("page_label", "")),
         hashlib.sha256(chunk.page_content.encode("utf-8")).hexdigest(),
@@ -675,10 +658,12 @@ def update_search_index(
     chunks = _to_langchain_documents(source_documents)
     if not chunks and index is None:
         return None
+
     chunks_by_file: dict[str, list[Document]] = {}
     for chunk in chunks:
         file_id = str(chunk.metadata.get("file_id", ""))
         chunks_by_file.setdefault(file_id, []).append(chunk)
+
     reused_chunk_ids: set[int] = set()
     if index is not None and replaced_file_ids:
         stored_by_file: dict[str, dict[tuple[str, str], list[str]]] = {}
@@ -692,6 +677,7 @@ def update_search_index(
             stored_by_file.setdefault(file_id, {}).setdefault(
                 _chunk_fingerprint(stored_document), []
             ).append(document_id)
+
         stale_ids: list[str] = []
         for file_id, buckets in stored_by_file.items():
             for chunk in chunks_by_file.get(file_id, []):
@@ -700,16 +686,17 @@ def update_search_index(
                     continue
                 stored_document = index.docstore.search(candidates.pop(0))
                 if isinstance(stored_document, Document):
-                    # Vektor lama tetap valid; cukup segarkan metadata (waktu ubah, nomor chunk, tautan).
                     stored_document.metadata.update(chunk.metadata)
                     reused_chunk_ids.add(id(chunk))
             for leftover_ids in buckets.values():
                 stale_ids.extend(leftover_ids)
         if stale_ids:
             index.delete(ids=stale_ids)
+
     pending_chunks = [chunk for chunk in chunks if id(chunk) not in reused_chunk_ids]
     if not pending_chunks:
         return index
+
     total_pending = len(pending_chunks)
     completed = 0
     batch_offset = 0
@@ -722,8 +709,6 @@ def update_search_index(
             on_progress(batch_offset + batch_done, total_pending)
 
     embeddings = _get_embeddings(api_key, on_wait, report_embedding_progress)
-    # FAISS.add_documents memakai index.embedding_function (kwarg `embedding=` diabaikan),
-    # jadi pasang sementara agar API key, limiter, dan callback progres yang benar terpakai.
     original_embedding_function = index.embedding_function if index is not None else None
     if index is not None:
         index.embedding_function = embeddings
@@ -751,9 +736,9 @@ def update_search_index(
 
 
 def get_index_file_manifest(index: FAISS | None) -> dict[str, str]:
-    """Recover file IDs and modification times from a legacy local index."""
     if index is None:
         return {}
+
     manifest: dict[str, str] = {}
     for document_id in index.index_to_docstore_id.values():
         stored_document = index.docstore.search(document_id)
@@ -769,7 +754,6 @@ def get_index_file_manifest(index: FAISS | None) -> dict[str, str]:
 def load_index_manifest(
     index_directory: Path = DEFAULT_INDEX_DIRECTORY,
 ) -> dict[str, object] | None:
-    """Load the local Drive inventory associated with the FAISS index."""
     manifest_path = index_directory / MANIFEST_FILENAME
     if not manifest_path.is_file():
         return None
@@ -787,7 +771,6 @@ def save_index_manifest(
     index_directory: Path = DEFAULT_INDEX_DIRECTORY,
     sources: dict[str, dict[str, str]] | None = None,
 ) -> None:
-    """Persist Drive modification times next to the local FAISS index."""
     index_directory.mkdir(parents=True, exist_ok=True)
     manifest_path = index_directory / MANIFEST_FILENAME
     temporary_path = manifest_path.with_suffix(".tmp")
@@ -836,15 +819,29 @@ def _extract_stream_chunk_text(content: object) -> str:
     return ""
 
 
+_QUERY_STOPWORDS = {
+    "apa", "apakah", "bagaimana", "mengapa", "kenapa", "siapa", "kapan", "dimana",
+    "tolong", "coba", "mohon", "bisa", "minta", "tampilkan", "tuliskan", "bacakan",
+    "jelaskan", "uraikan", "terangkan", "bahas", "lengkap", "semua", "utuh", "full",
+    "tentang", "mengenai", "dari", "yang", "dan", "atau", "untuk", "pada", "dalam",
+    "dengan", "secara", "detail", "rinci", "lirik", "nadzom", "nadhom", "syair",
+    "bait", "dangding", "pupuh", "lagu", "sholawat", "shalawat", "qasidah", "qosidah",
+    "sama", "sampai", "selesai", "seluruhnya", "seluruh", "itu", "ini", "tersebut",
+}
+
+
 def _keyword_search(index: FAISS, question: str, k: int = 5) -> list[Document]:
-    """Rank indexed chunks locally when Gemini query embeddings are unavailable."""
-    query_terms = {
+    """Rank indexed chunks locally when Gemini embeddings or chat models are unavailable."""
+    raw_terms = [
         term
         for term in re.findall(r"\w+", question.casefold(), flags=re.UNICODE)
         if len(term) > 2
-    }
+    ]
+    meaningful_terms = {term for term in raw_terms if term not in _QUERY_STOPWORDS}
+    query_terms = meaningful_terms or set(raw_terms)
     if not query_terms:
         return []
+
     indexed_documents: list[tuple[Document, Counter[str]]] = []
     document_frequencies: Counter[str] = Counter()
     for document_id in index.index_to_docstore_id.values():
@@ -860,6 +857,7 @@ def _keyword_search(index: FAISS, question: str, k: int = 5) -> list[Document]:
         )
         indexed_documents.append((document, counts))
         document_frequencies.update(query_terms & counts.keys())
+
     document_count = len(indexed_documents)
     ranked_documents = []
     for position, (document, counts) in enumerate(indexed_documents):
@@ -869,44 +867,51 @@ def _keyword_search(index: FAISS, question: str, k: int = 5) -> list[Document]:
             for term in query_terms
             if counts[term]
         )
+        source_name = str(document.metadata.get("source", "")).casefold()
+        title_hits = sum(1 for term in query_terms if term in source_name)
+        if title_hits:
+            score += title_hits * 2.5
         if score:
             ranked_documents.append((score, position, document))
+
     ranked_documents.sort(key=lambda result: (-result[0], result[1]))
     return [document for _, _, document in ranked_documents[:k]]
 
 
 _FULL_CONTEXT_RE = re.compile(
-    r"\b(?:lengkap|sampai\s+selesai|seluruh(?:nya)?|utuh|semua(?:\s+bait)?|full|bacakan|tuliskan|tampilkan|bait|nadhom|nadzom|syair)\b",
+    r"\b(?:lengkap|sampai\s+selesai|seluruh(?:nya)?|utuh|semua(?:\s+bait)?|full|"
+    r"bacakan|tuliskan|tampilkan|lirik|bait|nadhom|nadzom|syair|dangding|pupuh|"
+    r"sholawat|shalawat|qasidah|qosidah|lagu)\b",
     re.IGNORECASE,
 )
-# Batas atas jumlah chunk berurutan yang dikirim pada permintaan "lengkap".
-# 12 chunk (~40 rb karakter) cukup untuk nadzom 100 bait. Jendela sebenarnya
-# ADAPTIF: nadzom pendek hanya mengirim 4-6 chunk, jadi tetap cepat.
-FULL_CONTEXT_CHUNK_COUNT = 12
+_DISCUSSION_RE = re.compile(
+    r"\b(?:jelas(?:kan|in)?|urai(?:kan)?|terang(?:kan)?|bahas(?:kan)?|diskusi(?:kan)?|"
+    r"persoalan|masalah|hukum(?:nya)?|makna|arti(?:nya)?|maksud(?:nya)?|tafsir|kandungan|"
+    r"hikmah|syarat|rukun|dalil|alasan|penyebab|sebab|dampak|solusi|cara|langkah|"
+    r"bagaimana|mengapa|kenapa|perbedaan|banding(?:kan)?|analisis|kesimpulan|"
+    r"detail|rinci|apa\s+(?:itu|saja|maksud|hukum|pendapat))\b",
+    re.IGNORECASE,
+)
+_JUDUL_MARKER_RE = re.compile(r"(?:^|\n)\s*JUDUL\s*:", re.IGNORECASE)
+
+FULL_CONTEXT_CHUNK_COUNT = 14
 FULL_CONTEXT_RETRIEVAL_COUNT = 10
-FULL_CONTEXT_MIN_CHUNKS = 4
+DISCUSSION_RETRIEVAL_COUNT = 10
+DISCUSSION_MAX_CHUNKS = 12
 
 
 def is_full_context_request(question: str) -> bool:
     return bool(_FULL_CONTEXT_RE.search(question))
 
 
-def _full_context_window(
+def is_discussion_request(question: str) -> bool:
+    return bool(_DISCUSSION_RE.search(question))
+
+
+def _ordered_file_chunks(
     index: FAISS,
-    matches: list[Document],
-    window_size: int = FULL_CONTEXT_CHUNK_COUNT,
-    anchor_vector_position: int | None = None,
-) -> list[Document]:
-    """Perluas hasil terbaik menjadi chunk berurutan dari dokumen yang sama.
-    Jendela mengikuti sebaran hasil pencarian: hasil yang berdekatan (nadzom
-    pendek) menghasilkan jendela kecil; hasil yang tersebar (nadzom panjang)
-    menghasilkan jendela besar, maksimal window_size.
-    """
-    if not matches:
-        return []
-    file_id = str(matches[0].metadata.get("file_id", ""))
-    if not file_id:
-        return matches
+    file_id: str,
+) -> list[tuple[int, int, Document]]:
     source_chunks: list[tuple[int, int, Document]] = []
     fallback_index = 0
     for vector_position, document_id in sorted(index.index_to_docstore_id.items()):
@@ -922,9 +927,81 @@ def _full_context_window(
             chunk_index = fallback_index
         source_chunks.append((chunk_index, vector_position, document))
         fallback_index += 1
+    source_chunks.sort(key=lambda item: (item[0], item[1]))
+    return source_chunks
+
+
+def _expand_discussion_neighbors(
+    index: FAISS,
+    matches: list[Document],
+    max_total: int = DISCUSSION_MAX_CHUNKS,
+) -> list[Document]:
+    """Tambahkan chunk tetangga (±1) dari hit teratas agar pembahasan kitab tidak terpotong."""
+    if not matches:
+        return []
+    expanded: list[Document] = list(matches)
+    seen_keys: set[tuple[str, int | None, str]] = {
+        (
+            str(doc.metadata.get("file_id", "")),
+            doc.metadata.get("chunk_index"),
+            doc.page_content[:80],
+        )
+        for doc in expanded
+    }
+    cache_by_file: dict[str, list[tuple[int, int, Document]]] = {}
+    for top_doc in matches[:2]:
+        file_id = str(top_doc.metadata.get("file_id", ""))
+        if not file_id:
+            continue
+        source_chunks = cache_by_file.setdefault(
+            file_id, _ordered_file_chunks(index, file_id)
+        )
+        pos = next(
+            (i for i, (_, _, d) in enumerate(source_chunks) if d is top_doc),
+            None,
+        )
+        if pos is None:
+            top_idx = top_doc.metadata.get("chunk_index")
+            pos = next(
+                (i for i, (ci, _, _) in enumerate(source_chunks) if ci == top_idx),
+                None,
+            )
+        if pos is None:
+            continue
+        for offset in (1, -1):
+            neighbor_pos = pos + offset
+            if 0 <= neighbor_pos < len(source_chunks):
+                neighbor = source_chunks[neighbor_pos][2]
+                key = (
+                    file_id,
+                    neighbor.metadata.get("chunk_index"),
+                    neighbor.page_content[:80],
+                )
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    expanded.append(neighbor)
+                    if len(expanded) >= max_total:
+                        return expanded
+    return expanded[:max_total]
+
+
+def _full_context_window(
+    index: FAISS,
+    matches: list[Document],
+    window_size: int = FULL_CONTEXT_CHUNK_COUNT,
+    anchor_vector_position: int | None = None,
+) -> list[Document]:
+    """Otomatis menyesuaikan jumlah chunk: sedikit untuk nadzom pendek, banyak untuk nadzom panjang."""
+    if not matches:
+        return []
+    file_id = str(matches[0].metadata.get("file_id", ""))
+    if not file_id:
+        return matches
+
+    source_chunks = _ordered_file_chunks(index, file_id)
     if not source_chunks:
         return matches
-    source_chunks.sort(key=lambda item: (item[0], item[1]))
+
     if anchor_vector_position is not None:
         best_position = next(
             (
@@ -958,6 +1035,33 @@ def _full_context_window(
                 if document.page_content == matches[0].page_content
             ]
             best_position = matching_positions[-1] if matching_positions else 0
+
+    total = len(source_chunks)
+    cap = max(1, min(window_size, total))
+
+    judul_positions = [
+        i
+        for i, (_, _, doc) in enumerate(source_chunks)
+        if _JUDUL_MARKER_RE.search(doc.page_content)
+    ]
+    if len(judul_positions) <= 1 and total <= cap:
+        return [document for _, _, document in source_chunks]
+
+    if len(judul_positions) > 1:
+        section_start = max(
+            (p for p in judul_positions if p <= best_position),
+            default=0,
+        )
+        section_end = min(
+            (p for p in judul_positions if p > best_position),
+            default=total,
+        )
+        if section_end - section_start <= cap:
+            return [document for _, _, document in source_chunks[section_start:section_end]]
+        low = max(section_start, best_position - 2)
+        high = min(section_end, low + cap)
+        return [document for _, _, document in source_chunks[low:high]]
+
     position_by_object = {
         id(document): position
         for position, (_, _, document) in enumerate(source_chunks)
@@ -969,14 +1073,9 @@ def _full_context_window(
         position = position_by_object.get(id(other))
         if position is not None:
             hit_positions.append(position)
-    total = len(source_chunks)
-    cap = max(1, min(window_size, total))
+
     low = max(0, min(hit_positions) - 1)
-    high = min(total, max(hit_positions) + 3)
-    minimum = min(FULL_CONTEXT_MIN_CHUNKS, total)
-    if high - low < minimum:
-        high = min(total, low + minimum)
-        low = max(0, high - minimum)
+    high = min(total, max(hit_positions) + 2)
     if high - low > cap:
         start = min(max(low, best_position - 3), total - cap)
         low, high = start, start + cap
@@ -988,7 +1087,6 @@ def _similarity_search_with_position(
     query_vector: list[float],
     k: int,
 ) -> tuple[list[Document], int | None]:
-    """Search FAISS while retaining the exact vector row for the best hit."""
     query_matrix = np.asarray([query_vector], dtype=np.float32)
     if index._normalize_L2:
         faiss.normalize_L2(query_matrix)
@@ -1037,7 +1135,6 @@ def find_source_link_matches(
     limit: int = 3,
     index_directory: Path = DEFAULT_INDEX_DIRECTORY,
 ) -> list[dict[str, str]]:
-    """Find up to three Drive files whose names resemble the requested title."""
     manifest = load_index_manifest(index_directory) or {}
     manifest_sources = manifest.get("sources", {})
     candidates: dict[str, dict[str, str]] = {}
@@ -1049,6 +1146,7 @@ def find_source_link_matches(
                     for key, value in source.items()
                     if value is not None
                 }
+
     if index is not None:
         for document_id in index.index_to_docstore_id.values():
             document = index.docstore.search(document_id)
@@ -1066,6 +1164,7 @@ def find_source_link_matches(
                     if key == "web_view_link":
                         value = value or document.metadata.get("webViewLink", "")
                     source[key] = str(value)
+
     query_terms = [
         term
         for term in _normalize_source_query(question).split()
@@ -1106,14 +1205,28 @@ def find_source_link_matches(
             f"https://drive.google.com/uc?export=download&id={file_id}"
         )
         ranked.append((score, source))
+
     ranked.sort(
         key=lambda result: (-result[0], result[1].get("name", "").casefold())
     )
     return [source for _, source in ranked[: min(limit, 3)]]
 
 
+def _model_sort_key(name: str) -> tuple:
+    lowered = name.casefold()
+    if name in PREFERRED_CHAT_MODEL_ORDER:
+        return (0, PREFERRED_CHAT_MODEL_ORDER[name], 0, 0, lowered)
+    version_match = re.search(r"gemini-(\d+)(?:\.(\d+))?", lowered)
+    major = int(version_match.group(1)) if version_match else 0
+    minor = int(version_match.group(2)) if version_match and version_match.group(2) else 0
+    is_flash = 0 if "flash" in lowered else 1
+    is_lite = 1 if "lite" in lowered else 0
+    is_preview = 1 if ("preview" in lowered or "exp" in lowered) else 0
+    return (1, is_flash, is_lite, -major, -minor, is_preview, lowered)
+
+
 def get_available_chat_models(api_key: str | None = None) -> list[str]:
-    """Discover and briefly cache models that support generateContent."""
+    """Discover and cache Gemini models that support generateContent."""
     _check_api_key(api_key)
     resolved_api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
     cache_key = hashlib.sha256(resolved_api_key.encode("utf-8")).hexdigest()
@@ -1122,6 +1235,7 @@ def get_available_chat_models(api_key: str | None = None) -> list[str]:
         cached = _CHAT_MODEL_CACHE.get(cache_key)
         if cached and now - cached[0] < MODEL_LIST_CACHE_SECONDS:
             return router.rank(cached[1])
+
     discovered: set[str] = set()
     client = None
     try:
@@ -1131,7 +1245,11 @@ def get_available_chat_models(api_key: str | None = None) -> list[str]:
             if "generateContent" not in actions:
                 continue
             model_name = str(getattr(model, "name", "")).rsplit("/", 1)[-1]
-            if model_name and not _is_excluded_chat_model(model_name):
+            if (
+                model_name
+                and "gemini" in model_name.casefold()
+                and not _is_excluded_chat_model(model_name)
+            ):
                 discovered.add(model_name)
     except Exception:
         discovered.clear()
@@ -1141,17 +1259,9 @@ def get_available_chat_models(api_key: str | None = None) -> list[str]:
                 client.close()
             except Exception:
                 pass
+
     candidates = discovered or set(FALLBACK_CHAT_MODELS)
-    model_names = tuple(
-        sorted(
-            candidates,
-            key=lambda name: (
-                PREFERRED_CHAT_MODEL_ORDER.get(name, len(PREFERRED_CHAT_MODEL_ORDER)),
-                0 if "flash" in name.casefold() else 1,
-                name.casefold(),
-            ),
-        )
-    )
+    model_names = tuple(sorted(candidates, key=_model_sort_key))
     with _CHAT_MODEL_CACHE_LOCK:
         _CHAT_MODEL_CACHE[cache_key] = (time.monotonic(), model_names)
     return router.rank(model_names)
@@ -1163,7 +1273,6 @@ def _is_excluded_chat_model(model_name: str) -> bool:
 
 
 def _mark_chat_model_failed(model_name: str, error: Exception | str = "") -> None:
-    """Catat kegagalan ke router (cooldown bertingkat; 404 dilewati lama)."""
     router.record_failure(model_name, error)
 
 
@@ -1208,7 +1317,11 @@ def _is_chat_model_fallback_error(error: Exception) -> bool:
                 "connection reset",
                 "network error",
                 "overloaded",
-                "408", "500", "502", "503", "504",
+                "408",
+                "500",
+                "502",
+                "503",
+                "504",
             )
         ) or any(marker in class_name for marker in ("timeout", "connection", "network")):
             return True
@@ -1216,7 +1329,7 @@ def _is_chat_model_fallback_error(error: Exception) -> bool:
     return False
 
 
-def _is_chat_quota_error(error: Exception) -> bool:
+def _is_chat_quota_error(error: BaseException) -> bool:
     current: BaseException | None = error
     visited: set[int] = set()
     while current is not None and id(current) not in visited:
@@ -1279,9 +1392,12 @@ def _format_source_references(matches: list[Document]) -> str:
         section_index = metadata.get("section_index", metadata.get("chunk_index"))
         if section_index is not None:
             try:
-                reference["sections"].append(str(int(section_index) + (0 if "section_index" in metadata else 1)))
+                reference["sections"].append(
+                    str(int(section_index) + (0 if "section_index" in metadata else 1))
+                )
             except (TypeError, ValueError):
                 pass
+
     formatted = []
     for number, reference in enumerate(references.values(), start=1):
         page_reference = _format_reference_values(reference["pages"], "Halaman")
@@ -1313,20 +1429,25 @@ def _create_chat_model(
         request_timeout=CHAT_MODEL_REQUEST_TIMEOUT_SECONDS,
         max_output_tokens=max_output_tokens,
     )
-    if thinking and CHAT_THINKING_LEVEL and router.thinking_supported(model_name):
-        try:
-            return ChatGoogleGenerativeAI(**kwargs, thinking_level=CHAT_THINKING_LEVEL)
-        except Exception:  # versi library tanpa parameter ini
-            pass
+    if thinking and router.thinking_supported(model_name):
+        lowered = model_name.casefold()
+        if "gemini-2.5-flash" in lowered:
+            try:
+                return ChatGoogleGenerativeAI(**kwargs, thinking_budget=0)
+            except Exception:
+                pass
+        elif "gemini-3" in lowered and CHAT_THINKING_LEVEL:
+            try:
+                return ChatGoogleGenerativeAI(**kwargs, thinking_level=CHAT_THINKING_LEVEL)
+            except Exception:
+                pass
     return ChatGoogleGenerativeAI(**kwargs)
 
 
 # ==========================================================================
-# Pembuatan jawaban: balapan model (hedged) + lanjutan otomatis.
+# Pembuatan jawaban: balapan model + lanjutkan di model yang sama.
 # ==========================================================================
 class _Attempt:
-    """Satu percobaan memanggil satu model (berjalan di thread sendiri)."""
-
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
         self.cancel = threading.Event()
@@ -1335,17 +1456,32 @@ class _Attempt:
         self.failed = False
 
 
-class _WinnerFailed(Exception):
-    """Model pemenang gagal setelah jawaban mulai mengalir."""
+class _WinnerInterrupted(Exception):
+    """Model pemenang terputus setelah sebagian jawaban sempat mengalir."""
 
-    def __init__(self, model_name: str, error: BaseException) -> None:
+    def __init__(self, model_name: str, partial_text: str, error: BaseException) -> None:
         super().__init__(str(error))
         self.model_name = model_name
+        self.partial_text = partial_text
         self.error = error
 
 
+class _AllChatModelsFailedError(RuntimeError):
+    """Seluruh model Gemini gagal atau kehabisan kuota."""
+
+    def __init__(self, is_quota: bool, cause: BaseException | None = None) -> None:
+        message = (
+            "Gemini sedang membatasi permintaan (limit/kuota). "
+            "Tunggu sebentar lalu coba lagi."
+            if is_quota
+            else "Semua model Gemini sedang sibuk atau mengalami gangguan."
+        )
+        super().__init__(message)
+        self.is_quota = is_quota
+        self.cause = cause
+
+
 def _messages_size(messages: Sequence[object]) -> int:
-    """Perkiraan jumlah karakter prompt (teks saja; lampiran dihitung kecil)."""
     total = 0
     for message in messages:
         content = getattr(message, "content", "")
@@ -1363,13 +1499,12 @@ def _messages_size(messages: Sequence[object]) -> int:
 
 
 def _hedge_delay(model_name: str, prompt_chars: int) -> float:
-    """Berapa lama menunggu token pertama sebelum model cadangan ikut dijalankan."""
     expected = router.expected_ttft(model_name)
     if expected is None:
         base = CHAT_HEDGE_SECONDS
     else:
-        base = min(max(expected * 1.8, 3.0), 8.0)
-    return base + prompt_chars / 40_000
+        base = min(max(expected * 2.0, 5.0), 10.0)
+    return base + prompt_chars / 35_000
 
 
 def _stream_with_continuation(
@@ -1377,7 +1512,6 @@ def _stream_with_continuation(
     messages: Sequence[object],
     cancel: threading.Event,
 ):
-    """Stream teks jawaban; otomatis lanjut bila terpotong batas token."""
     conversation = list(messages)
     full_answer = ""
     for _ in range(CHAT_MAX_CONTINUATIONS + 1):
@@ -1424,13 +1558,12 @@ def _attempt_worker(
                 put("done")
                 return
             except Exception as error:
-                # Parameter "berpikir" ditolak model ini: ulangi TANPA parameter itu.
                 if use_thinking and not emitted and "thinking" in str(error).casefold():
                     router.mark_thinking_unsupported(attempt.model_name)
                     use_thinking = False
                     continue
                 raise
-    except Exception as error:  # diteruskan ke thread utama
+    except Exception as error:
         put("error", error)
 
 
@@ -1441,15 +1574,11 @@ def _hedged_generate(
     on_token: Callable[[str | None], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> tuple[str, str]:
-    """Jalankan model teratas; bila lambat, model cadangan ikut BERSAMAAN.
-    Pemenang = model pertama yang mengeluarkan token. Mengembalikan
-    (jawaban, nama_model). Dijalankan di thread pemanggil, sehingga callback
-    on_token/on_progress aman dipakai dari Streamlit.
-    """
     if not candidates:
         raise ValueError("Tidak ada model Gemini aktif yang mendukung generateContent.")
+
     prompt_chars = _messages_size(messages)
-    attempt_limit = max(CHAT_FIRST_TOKEN_TIMEOUT_SECONDS, 10.0 + prompt_chars / 5_000)
+    attempt_limit = max(CHAT_FIRST_TOKEN_TIMEOUT_SECONDS, 12.0 + prompt_chars / 5_000)
     events: queue.Queue = queue.Queue()
     attempts: list[_Attempt] = []
     next_candidate = 0
@@ -1508,17 +1637,21 @@ def _hedged_generate(
                 wait = 0.25
             else:
                 wait = CHAT_CHUNK_TIMEOUT_SECONDS
+
             try:
                 attempt, kind, payload = events.get(timeout=wait)
             except queue.Empty:
                 if winner is not None:
-                    raise _WinnerFailed(
+                    raise _WinnerInterrupted(
                         winner.model_name,
+                        "".join(parts),
                         TimeoutError("timed out: jawaban berhenti mengalir"),
                     )
                 continue
+
             if attempt.failed or (winner is not None and attempt is not winner):
                 continue
+
             if kind == "chunk":
                 if winner is None:
                     winner = attempt
@@ -1528,7 +1661,6 @@ def _hedged_generate(
                         if other is winner:
                             continue
                         if position < winner_position and not other.finished:
-                            # Model yang lebih diutamakan tetapi kalah balapan: catat lambat.
                             router.record_slow(other.model_name, (now - other.started) * 2.5)
                         other.cancel.set()
                     router.record_success(winner.model_name, now - winner.started)
@@ -1546,7 +1678,7 @@ def _hedged_generate(
                 )
             elif kind == "error":
                 if attempt is winner:
-                    raise _WinnerFailed(attempt.model_name, payload)
+                    raise _WinnerInterrupted(attempt.model_name, "".join(parts), payload)
                 attempt.finished = attempt.failed = True
                 if not _is_chat_model_fallback_error(payload):
                     raise payload
@@ -1562,7 +1694,56 @@ def _hedged_generate(
     finally:
         for item in attempts:
             item.cancel.set()
-    return "".join(parts).strip(), winner.model_name
+
+    return "".join(parts).lstrip("\r\n").rstrip(), winner.model_name
+
+
+def _continue_partial_answer(
+    messages: Sequence[object],
+    partial_text: str,
+    model_name: str,
+    api_key: str | None,
+    candidates: Sequence[str],
+    on_token: Callable[[str | None], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> tuple[str, str]:
+    """Lanjutkan jawaban yang terputus di tengah TANPA menghapus atau ganti model dulu."""
+    accumulated = partial_text
+    ordered_models = [model_name] * CHAT_SAME_MODEL_RESUME_RETRIES + [
+        name for name in candidates if name != model_name
+    ]
+    last_error: BaseException | None = None
+    for index, target_model in enumerate(ordered_models):
+        if index > 0 and target_model == model_name:
+            time.sleep(1.5)
+        elif target_model != model_name and on_progress:
+            on_progress(f"{model_name} terputus permanen; melanjutkan dengan {target_model}...")
+
+        continuation_messages = list(messages) + [
+            AIMessage(content=accumulated),
+            HumanMessage(content=CONTINUE_PROMPT),
+        ]
+        cancel = threading.Event()
+        try:
+            model = _create_chat_model(target_model, api_key, thinking=True)
+            for text in _stream_with_continuation(model, continuation_messages, cancel):
+                accumulated += text
+                if on_token:
+                    on_token(text)
+            return accumulated.lstrip("\r\n").rstrip(), target_model
+        except Exception as error:
+            last_error = error
+            if not _is_chat_model_fallback_error(error):
+                raise
+            if target_model != model_name:
+                router.record_failure(target_model, error)
+
+    if accumulated.strip():
+        return accumulated.lstrip("\r\n").rstrip(), model_name
+    raise _AllChatModelsFailedError(
+        is_quota=last_error is not None and _is_chat_quota_error(last_error),
+        cause=last_error,
+    ) from last_error
 
 
 def _generate_with_failover(
@@ -1572,24 +1753,34 @@ def _generate_with_failover(
     on_token: Callable[[str | None], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> tuple[str, str]:
-    """Balapan model + cadangan bila pemenang gagal di tengah jawaban."""
     candidates = list(model_names or get_available_chat_models(api_key))
     if not candidates:
-        raise ValueError("Tidak ada model Gemini aktif yang mendukung generateContent.")
+        raise _AllChatModelsFailedError(is_quota=False)
+
     last_error: BaseException | None = None
     for _ in range(2):
         try:
             return _hedged_generate(messages, api_key, candidates, on_token, on_progress)
-        except _WinnerFailed as failure:
-            if not _is_chat_model_fallback_error(failure.error):
-                raise failure.error
-            router.record_failure(failure.model_name, failure.error)
-            last_error = failure.error
-            candidates = [name for name in candidates if name != failure.model_name]
-            if on_token:
-                on_token(None)  # hapus jawaban setengah jadi sebelum mengulang
-            if on_progress:
-                on_progress(f"{failure.model_name} terputus; mengulang dengan model lain...")
+        except _WinnerInterrupted as interrupted:
+            if not _is_chat_model_fallback_error(interrupted.error):
+                raise interrupted.error
+            if interrupted.partial_text.strip():
+                if on_progress:
+                    on_progress(
+                        f"Koneksi {interrupted.model_name} terputus sebentar; melanjutkan jawaban..."
+                    )
+                return _continue_partial_answer(
+                    messages,
+                    interrupted.partial_text,
+                    interrupted.model_name,
+                    api_key,
+                    candidates,
+                    on_token=on_token,
+                    on_progress=on_progress,
+                )
+            router.record_failure(interrupted.model_name, interrupted.error)
+            last_error = interrupted.error
+            candidates = [name for name in candidates if name != interrupted.model_name]
             if not candidates:
                 break
         except Exception as error:
@@ -1597,7 +1788,10 @@ def _generate_with_failover(
                 last_error = error
                 break
             raise
-    raise _friendly_model_error(last_error) from last_error
+    raise _AllChatModelsFailedError(
+        is_quota=last_error is not None and _is_chat_quota_error(last_error),
+        cause=last_error,
+    ) from last_error
 
 
 def _invoke_chat_model_messages(
@@ -1606,12 +1800,14 @@ def _invoke_chat_model_messages(
     model_names: Sequence[str] | None = None,
     on_token: Callable[[str | None], None] | None = None,
 ) -> str:
-    answer, _ = _generate_with_failover(messages, api_key, model_names, on_token)
-    return answer
+    try:
+        answer, _ = _generate_with_failover(messages, api_key, model_names, on_token)
+        return answer
+    except _AllChatModelsFailedError as error:
+        raise ValueError(str(error)) from error
 
 
 def start_model_warmup(api_key: str | None = None) -> None:
-    """Ukur kecepatan model teratas di latar belakang (panggil sekali saat start)."""
     def probe(model_name: str) -> float:
         model = _create_chat_model(model_name, api_key, max_output_tokens=16)
         started = time.monotonic()
@@ -1633,11 +1829,11 @@ def transcribe_audio(
     mime_type: str,
     api_key: str | None = None,
 ) -> str:
-    """Transcribe a recorded voice message using an available Gemini model."""
     if not audio_bytes:
         raise ValueError("Rekaman suara kosong.")
     if not mime_type.startswith("audio/"):
         raise ValueError("Format rekaman suara tidak didukung.")
+
     model_names = [
         model_name
         for model_name in get_available_chat_models(api_key)
@@ -1645,6 +1841,7 @@ def transcribe_audio(
     ]
     if not model_names:
         raise ValueError("Tidak ada model Gemini yang tersedia untuk memproses suara.")
+
     audio_message = HumanMessage(
         content=[
             {
@@ -1666,35 +1863,231 @@ def transcribe_audio(
 
 
 # --------------------------------------------------------------------------
-# Tata letak jawaban = tata letak sumber.
+# Tata letak jawaban = tata letak sumber (tanpa kotak putih kode Markdown).
 # --------------------------------------------------------------------------
 _LEADING_WS_RE = re.compile(r"^[ \t]+")
+_MD_LIST_LINE_RE = re.compile(r"^[ \t]{0,3}(?:[-*+]|\d+\.)\s+")
+_MD_BLOCK_PREFIX_RE = re.compile(r"^(?:#{1,6}\s+|>\s*|```|~~~|[-*_]{3,}\s*|\|)")
+_FENCE_LINE_RE = re.compile(r"^\s*(?:```|~~~)[a-zA-Z0-9_-]*\s*$")
 
 
 def _line_key(line: str) -> str:
-    return " ".join(line.split()).casefold()
+    cleaned = line.strip()
+    cleaned = re.sub(r"^#{1,6}\s+", "", cleaned)
+    cleaned = re.sub(r"^\*\*(.+)\*\*$", r"\1", cleaned)
+    return " ".join(cleaned.split()).casefold()
+
+
+def _spaces_to_nbsp(whitespace: str) -> str:
+    return whitespace.expandtabs(4).replace(" ", "\u00a0")
+
+
+def _strip_accidental_markdown(line: str, source_lines: dict[str, str]) -> str:
+    key = _line_key(line)
+    source_line = source_lines.get(key)
+    if source_line is None:
+        return line
+    stripped = line.lstrip()
+    if stripped.startswith("#") and not source_line.lstrip().startswith("#"):
+        stripped = re.sub(r"^#{1,6}\s+", "", stripped)
+    if (
+        stripped.startswith("**")
+        and stripped.endswith("**")
+        and not source_line.lstrip().startswith("**")
+    ):
+        stripped = stripped[2:-2]
+    return stripped
+
+
+class _StreamingMarkdownLineSanitizer:
+    """Ubah spasi awal baris menjadi NBSP dan jaga line-break selama streaming."""
+
+    def __init__(self, target: Callable[[str | None], None]) -> None:
+        self._target = target
+        self._line_buf = ""
+        self._header_flushed = False
+        self._is_first_line = True
+
+    def __call__(self, token: str | None) -> None:
+        if token is None:
+            self._line_buf = ""
+            self._header_flushed = False
+            self._is_first_line = True
+            self._target(None)
+            return
+
+        out: list[str] = []
+        for ch in token:
+            if ch == "\n":
+                if not self._header_flushed:
+                    line = self._flush_prefix_with_guard(self._line_buf)
+                    self._line_buf = ""
+                else:
+                    line = ""
+                self._header_flushed = False
+                self._is_first_line = False
+                if line and not line.endswith("  "):
+                    out.append(line + "  \n")
+                else:
+                    out.append(line + "\n")
+                continue
+
+            if not self._header_flushed:
+                self._line_buf += ch
+                if len(self._line_buf) >= 12 or (
+                    self._line_buf.strip()
+                    and not self._line_buf.lstrip().startswith(("`", "~", "-", "*", "+"))
+                    and not re.match(r"^\s*\d+\.?$", self._line_buf)
+                ):
+                    out.append(self._flush_prefix_with_guard(self._line_buf))
+                    self._line_buf = ""
+                    self._header_flushed = True
+                    self._is_first_line = False
+            else:
+                out.append(ch)
+
+        if out:
+            self._target("".join(out))
+
+    def flush(self) -> None:
+        if self._line_buf:
+            self._target(self._flush_prefix_with_guard(self._line_buf))
+            self._line_buf = ""
+            self._header_flushed = True
+            self._is_first_line = False
+
+    def _flush_prefix_with_guard(self, prefix: str) -> str:
+        formatted = self._flush_line_prefix(prefix)
+        if self._is_first_line and formatted.startswith("\u00a0"):
+            return "\u200b" + formatted
+        return formatted
+
+    @staticmethod
+    def _flush_line_prefix(prefix: str) -> str:
+        if _FENCE_LINE_RE.match(prefix):
+            return ""
+        if _MD_LIST_LINE_RE.match(prefix):
+            return prefix
+        match = _LEADING_WS_RE.match(prefix)
+        if not match:
+            return prefix
+        return _spaces_to_nbsp(match.group(0)) + prefix[match.end():]
 
 
 def restore_source_indentation(answer: str, matches: list[Document]) -> str:
-    """Samakan indentasi baris jawaban dengan baris yang sama di dokumen sumber."""
+    """Samakan indentasi & baris jawaban dengan sumber tanpa memicu blok kode putih."""
     indents: dict[str, str] = {}
+    source_lines: dict[str, str] = {}
+    source_has_fences = False
     for document in matches:
+        if "```" in document.page_content or "~~~" in document.page_content:
+            source_has_fences = True
         for line in document.page_content.splitlines():
             if not line.strip():
                 continue
+            key = _line_key(line)
             found = _LEADING_WS_RE.match(line)
-            indents.setdefault(
-                _line_key(line), found.group(0).expandtabs(4) if found else ""
-            )
-    if not any(indents.values()):
-        return answer
-    restored = []
-    for line in answer.splitlines():
+            indents.setdefault(key, found.group(0).expandtabs(4) if found else "")
+            source_lines.setdefault(key, line)
+
+    lines = answer.splitlines()
+    if not source_has_fences:
+        lines = [line for line in lines if not _FENCE_LINE_RE.match(line)]
+
+    normalized: list[str] = []
+    for line in lines:
+        if not line.strip():
+            normalized.append("")
+            continue
         key = _line_key(line)
         if key in indents:
-            line = indents[key] + line.lstrip()
-        restored.append(line)
-    return "\n".join(restored)
+            body = _strip_accidental_markdown(line, source_lines).lstrip()
+            normalized.append(_spaces_to_nbsp(indents[key]) + body)
+            continue
+        if _MD_LIST_LINE_RE.match(line):
+            normalized.append(line)
+            continue
+        found = _LEADING_WS_RE.match(line)
+        if found:
+            normalized.append(_spaces_to_nbsp(found.group(0)) + line[found.end():])
+        else:
+            normalized.append(line)
+
+    result: list[str] = []
+    total = len(normalized)
+    for i, line in enumerate(normalized):
+        if (
+            line.strip()
+            and i + 1 < total
+            and normalized[i + 1].strip()
+            and not _MD_BLOCK_PREFIX_RE.match(line.lstrip())
+            and not _MD_LIST_LINE_RE.match(line)
+            and not _MD_BLOCK_PREFIX_RE.match(normalized[i + 1].lstrip())
+            and not _MD_LIST_LINE_RE.match(normalized[i + 1])
+            and not line.endswith("  ")
+        ):
+            result.append(line + "  ")
+        else:
+            result.append(line)
+
+    output = "\n".join(result)
+    # Lindungi spasi awal baris pertama dari pemotongan .strip() di pemanggil (app.py).
+    if output.startswith("\u00a0"):
+        output = "\u200b" + output
+    return output
+
+
+def _stitch_sequential_chunks(matches: list[Document]) -> str:
+    """Gabungkan potongan chunk berurutan dan hilangkan overlap baris di sambungan."""
+    if not matches:
+        return ""
+    merged_lines = matches[0].page_content.splitlines()
+    for document in matches[1:]:
+        next_lines = document.page_content.splitlines()
+        overlap = 0
+        max_check = min(len(merged_lines), len(next_lines), 20)
+        for size in range(max_check, 0, -1):
+            if merged_lines[-size:] == next_lines[:size]:
+                overlap = size
+                break
+        if overlap:
+            merged_lines.extend(next_lines[overlap:])
+        else:
+            if merged_lines and merged_lines[-1].strip():
+                merged_lines.append("")
+            merged_lines.extend(next_lines)
+    return "\n".join(merged_lines).rstrip()
+
+
+def _build_local_fallback_answer(
+    matches: list[Document],
+    full_context_mode: bool,
+    reason_note: str,
+) -> str:
+    """Susun jawaban langsung dari isi dokumen lokal ketika AI tidak dapat dipakai."""
+    if full_context_mode and len({str(d.metadata.get("file_id", "")) for d in matches}) == 1:
+        body = _stitch_sequential_chunks(matches)
+    else:
+        sections: list[str] = []
+        for idx, doc in enumerate(matches[:5], start=1):
+            source = str(doc.metadata.get("source", "Dokumen"))
+            page = doc.metadata.get("page_label")
+            section_idx = doc.metadata.get("section_index", doc.metadata.get("chunk_index"))
+            loc = (
+                f"Halaman {page}"
+                if page is not None
+                else (
+                    f"Bagian {int(section_idx) + (0 if 'section_index' in doc.metadata else 1)}"
+                    if section_idx is not None
+                    else ""
+                )
+            )
+            header = f"**[{idx}. {source}" + (f" — {loc}" if loc else "") + "]**"
+            sections.append(f"{header}\n{doc.page_content.strip()}")
+        body = "\n\n".join(sections)
+
+    body = restore_source_indentation(body, matches)
+    return f"Catatan: {reason_note}\n\n{body}".rstrip()
 
 
 def answer_question(
@@ -1710,13 +2103,20 @@ def answer_question(
     if not question.strip():
         raise ValueError("Pertanyaan tidak boleh kosong.")
     _check_api_key(api_key)
+
     media_parts = media_parts or ()
     full_context_mode = is_full_context_request(question)
-    retrieval_count = FULL_CONTEXT_RETRIEVAL_COUNT if full_context_mode else 8
+    discussion_mode = is_discussion_request(question)
+    if full_context_mode:
+        retrieval_count = FULL_CONTEXT_RETRIEVAL_COUNT
+    elif discussion_mode:
+        retrieval_count = DISCUSSION_RETRIEVAL_COUNT
+    else:
+        retrieval_count = 8
+
     keyword_fallback_reason: str | None = None
     anchor_vector_position: int | None = None
     matches: list[Document] = []
-
     if index is not None:
         if force_local_search:
             if on_progress:
@@ -1727,6 +2127,7 @@ def answer_question(
             try:
                 if on_progress:
                     on_progress("Menghubungi Gemini untuk embedding pertanyaan...")
+
                 embedding_function = index.embedding_function
                 if isinstance(embedding_function, _QuotaAwareEmbeddings):
                     query_vector = _get_chat_query_embeddings(api_key).embed_query(
@@ -1736,6 +2137,7 @@ def answer_question(
                     query_vector = embedding_function.embed_query(question)
                 else:
                     query_vector = index._embed_query(question)
+
                 if on_progress:
                     on_progress(f"Mencari {retrieval_count} bagian yang relevan...")
                 if full_context_mode:
@@ -1767,6 +2169,8 @@ def answer_question(
             matches,
             anchor_vector_position=anchor_vector_position,
         )
+    elif discussion_mode and index is not None and matches:
+        matches = _expand_discussion_neighbors(index, matches)
 
     if not matches and not media_parts:
         if keyword_fallback_reason:
@@ -1781,22 +2185,44 @@ def answer_question(
         f"[{document.metadata.get('source', 'Dokumen')}]\n{document.page_content}"
         for document in matches
     )
-    completeness_instruction = (
-        "Pengguna meminta isi lengkap. Konteks berisi beberapa bagian berurutan dari "
-        "satu dokumen dan mungkin memuat nadhom/teks lain di sekitarnya. Tampilkan HANYA "
-        "teks yang diminta, mulai dari judulnya sampai bait terakhirnya, tanpa terpotong, "
-        "tanpa ringkasan, dan tanpa komentar tambahan. Salin persis seperti aslinya, "
-        "termasuk urutan, ejaan, dan susunan barisnya."
-        if full_context_mode
-        else "Sesuaikan panjang jawaban dengan pertanyaan. Pertanyaan sederhana dijawab singkat; jika isi yang diminta panjang (misalnya teks, bait, daftar, atau penjelasan rinci), tulis sampai tuntas dan jangan berhenti di tengah atau memotong jawaban."
-    )
+
+    if full_context_mode and discussion_mode:
+        completeness_instruction = (
+            "Pengguna meminta teks sekaligus penjelasan/pembahasannya. Pertama, tampilkan teks "
+            "rujukan yang diminta secara utuh (tanpa terpotong dan sesuai susunan baris aslinya). "
+            "Setelah itu, berikan penjelasan/pembahasan yang mendalam dan terstruktur sedetail "
+            "mungkin mencakup maksud, poin-poin penting, dalil/dasar yang ada di dokumen, serta "
+            "hal penting lain yang perlu diketahui pengguna."
+        )
+    elif full_context_mode:
+        completeness_instruction = (
+            "Pengguna meminta isi lengkap. Konteks berisi beberapa bagian berurutan dari "
+            "satu dokumen dan mungkin memuat nadhom/teks lain di sekitarnya. Tampilkan HANYA "
+            "teks yang diminta, mulai dari judulnya sampai bait terakhirnya, tanpa terpotong, "
+            "tanpa ringkasan, dan tanpa komentar tambahan. Salin persis seperti aslinya, "
+            "termasuk urutan, ejaan, dan susunan barisnya."
+        )
+    elif discussion_mode:
+        completeness_instruction = (
+            "Pengguna menanyakan persoalan atau berdiskusi. Berikan jawaban yang mendalam, "
+            "terstruktur, dan sedetail mungkin berdasarkan dokumen rujukan agar semua hal "
+            "penting yang perlu diketahui tersampaikan dengan jelas: (1) jawaban/inti persoalan, "
+            "(2) rincian poin penting, syarat, sebab-akibat, atau tahapan dari sumber, "
+            "(3) kutipan, dalil, atau contoh yang tercantum di dokumen jika ada, dan "
+            "(4) batasan jika ada bagian yang tidak dibahas di dokumen. Jangan berhenti di tengah."
+        )
+    else:
+        completeness_instruction = (
+            "Sesuaikan panjang jawaban dengan pertanyaan. Pertanyaan sederhana dijawab jelas "
+            "dan tepat; jika pertanyaan menyangkut penjelasan, daftar, bait, atau persoalan "
+            "yang luas, jawab secara rinci sampai tuntas dan jangan memotong hal penting."
+        )
+
     source_line_instruction = (
-        "Selalu pertahankan struktur baris asli dari dokumen rujukan. Jika teks "
-        "rujukan tersusun dalam baris-baris pendek berurutan (seperti lirik lagu, "
-        "nadhom, syair, pantun, doa, atau daftar), tampilkan kembali persis per "
-        "baris sesuai aslinya dengan menambahkan dua spasi di akhir setiap baris "
-        "(hard line break), meskipun pengguna hanya mengetik judul atau kata "
-        "kunci singkat tanpa menyebut kata lagu/syair."
+        "Setiap kali menampilkan teks lirik lagu, nadhom, syair, pantun, doa, atau kutipan "
+        "berbaris pendek dari dokumen, selalu pertahankan struktur baris dan indentasi aslinya "
+        "persis per baris. JANGAN bungkus dengan blok kode (```), dan JANGAN tambahkan format "
+        "tebal (**) atau heading (#) yang tidak ada di teks sumber."
         if matches
         else ""
     )
@@ -1842,16 +2268,50 @@ def answer_question(
             question=question,
         )
 
-    answer, _answering_model = _generate_with_failover(
-        chat_messages,
-        api_key,
-        on_token=on_token,
-        on_progress=on_progress,
-    )
+    stream_sanitizer = _StreamingMarkdownLineSanitizer(on_token) if on_token else None
+    local_only_mode = False
+    try:
+        answer, _answering_model = _generate_with_failover(
+            chat_messages,
+            api_key,
+            on_token=stream_sanitizer,
+            on_progress=on_progress,
+        )
+        if stream_sanitizer is not None:
+            stream_sanitizer.flush()
+    except _AllChatModelsFailedError as chat_error:
+        if index is not None and not matches:
+            matches = _keyword_search(index, question, k=retrieval_count)
+            if full_context_mode and matches:
+                matches = _full_context_window(index, matches)
+        if not matches:
+            reason = (
+                "limit/kuota semua model Gemini sedang habis"
+                if chat_error.is_quota
+                else "semua model Gemini sedang mengalami error/gangguan"
+            )
+            return (
+                f"Maaf, {reason}, dan pencarian lokal tidak menemukan teks dokumen yang cocok.",
+                [],
+            )
+        local_only_mode = True
+        reason_note = (
+            "Limit/kuota semua model Gemini sedang habis, jadi hasil ini diambil langsung "
+            "dengan pencarian lokal dari dokumen (tanpa pemrosesan AI)."
+            if chat_error.is_quota
+            else "Semua model Gemini sedang mengalami error/gangguan, jadi hasil ini diambil "
+            "langsung dengan pencarian lokal dari dokumen (tanpa pemrosesan AI)."
+        )
+        if on_progress:
+            on_progress("Semua model Gemini tidak tersedia; menampilkan hasil pencarian lokal...")
+        answer = _build_local_fallback_answer(matches, full_context_mode, reason_note)
+        if on_token:
+            on_token(None)
+            on_token(answer)
 
-    if matches:
+    if matches and not local_only_mode:
         answer = restore_source_indentation(answer, matches)
-    if keyword_fallback_reason:
+    if keyword_fallback_reason and not local_only_mode:
         answer = (
             f"Catatan: {keyword_fallback_reason}, jadi dokumen dicari berdasarkan "
             f"kecocokan kata pada indeks lokal.\n\n{answer}"
