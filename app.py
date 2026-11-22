@@ -1696,6 +1696,15 @@ if chat_submission is not None:
             supports_answer_streaming = "on_token" in answer_parameters
             supports_local_search = "force_local_search" in answer_parameters
 
+            _prev = st.session_state.messages[:-1]
+            _prev_user = [m["content"] for m in _prev if m["role"] == "user"]
+            _prev_bot = [m["content"] for m in _prev if m["role"] == "assistant"]
+            if _prev_user and len(question.split()) <= 12:
+                _context = f"Pertanyaan sebelumnya: {_prev_user[-1][:300]}"
+                if _prev_bot:
+                    _bot = _prev_bot[-1].split("\n\nSumber Rujukan:")[0]
+                    _context += f"\nJawaban sebelumnya (ringkas): {_bot[:500]}"
+                question = f"{_context}\n\nPertanyaan lanjutan: {question}"
             answer_message = st.empty()
             streamed_answer: list[str] = []
 
