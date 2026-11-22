@@ -1324,7 +1324,7 @@ with st.sidebar:
     if not folder_id:
         st.warning("Atur GOOGLE_DRIVE_FOLDER_ID untuk menghubungkan folder Drive.")
     st.caption(
-        "KITAB NU TOS DISIAPKEUN: "
+        "KITAB NU SIAPKEUNEUN: "
         f"{st.session_state.get('document_count', 0)}"
     )
 
