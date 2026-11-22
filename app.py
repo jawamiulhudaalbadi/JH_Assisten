@@ -669,7 +669,7 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
     if st.session_state.pop("_quota_resume_start_failed", False):
         st.warning(
             "API key tersimpan, tetapi sinkronisasi otomatis belum dapat dimulai. "
-            "Tekan Sinkronkan Sekarang untuk melanjutkan indeks."
+            "Tekan LEBETKEUN KITAB untuk melanjutkan indeks."
         )
     snapshot = manager.snapshot()
     rpd_status = manager.get_rpd_status(api_key=api_key)
@@ -773,7 +773,7 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
     if snapshot["running"]:
         sync_label = "Teras Lebetkeun" if snapshot["paused"] else "Jeda muat"
     else:
-        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "Sinkronkan Sekarang"
+        sync_label = "Teras Lebetkeun" if snapshot["paused"] else ""
     if st.button(
         sync_label,
         key="drive_sync_pause_toggle",

@@ -85,7 +85,7 @@ class DriveSyncManager:
         self._future: Future[None] | None = None
         self._job_id = 0
         self._generation = 0
-        self._status = "Sinkronisasi belum dimulai. Tekan Sinkronkan Sekarang."
+        self._status = "Sinkronisasi belum dimulai. Tekan LEBETKEUN KITAB."
         self._phase = "idle"
         self._file_count = 0
         self._downloaded_count = 0
@@ -243,7 +243,7 @@ class DriveSyncManager:
                     self._error = None
                     self._phase = "idle"
                     self._status = (
-                        "Sinkronisasi belum dimulai. Tekan Sinkronkan Sekarang."
+                        "Sinkronisasi belum dimulai. Tekan LEBETKEUN KITAB."
                     )
             return None
         return active_status

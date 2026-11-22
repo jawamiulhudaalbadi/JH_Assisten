@@ -186,7 +186,7 @@ class DriveSyncManagerTests(unittest.TestCase):
         self.assertIsNone(snapshot["error"])
         self.assertEqual(
             snapshot["status"],
-            "Sinkronisasi belum dimulai. Tekan Sinkronkan Sekarang.",
+            "Sinkronisasi belum dimulai. Tekan LEBETKEUN KITAB.",
         )
 
     def test_daily_quota_status_remains_for_same_api_key(self) -> None:

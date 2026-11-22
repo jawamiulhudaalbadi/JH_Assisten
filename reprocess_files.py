@@ -46,7 +46,7 @@ def main() -> int:
         files[fid] = ""  # beda dari waktu ubah Drive -> dianggap berubah
         print(f"Akan diproses ulang: {names[fid]}")
     MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-    print("Selesai. Jalankan sinkronisasi (Sinkronkan Sekarang) di Codespaces.")
+    print("Selesai. Jalankan sinkronisasi (LEBETKEUN KITAB) di Codespaces.")
     return 0
 
 

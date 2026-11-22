@@ -48,7 +48,7 @@ streamlit run app.py
 
 Buka URL lokal yang ditampilkan Streamlit. Aplikasi memuat indeks FAISS lokal
 tanpa memulai sinkronisasi otomatis. Setelah izin Google Drive tersedia, tekan
-**Sinkronkan Sekarang** untuk memeriksa perubahan; setiap sesi memproses maksimal
+**LEBETKEUN KITAB** untuk memeriksa perubahan; setiap sesi memproses maksimal
 10 file dan menyimpan progres agar dapat dilanjutkan secara manual. Jika batas
 kuota Gemini sementara tercapai, aplikasi menunggu lalu mencoba ulang batch
 embedding yang gagal (maksimal dua kali). Setiap batch chunk yang berhasil
