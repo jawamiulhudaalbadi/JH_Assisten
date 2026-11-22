@@ -700,7 +700,7 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
                 st.rerun(scope="app")
             st.session_state.drive_sync_generation_seen = generation
 
-    st.caption(f"File Drive terpantau: {file_count}")
+    st.caption(f"Kitab nu disiapkeun: {file_count}")
     if snapshot["phase"] == "quota_error" and rpd_status is None:
         st.warning(str(snapshot["error"]))
     elif snapshot["error"] and rpd_status is None:
@@ -749,7 +749,7 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
     status_labels = {
         "ready": "Sadia",
         "downloaded": "Diunduh, Ngantosan dilebetkeun",
-        "queued": "Teuacan dilebetkeun",
+        "queued": "Teu acan dilebetkeun",
         "downloading": "nuju diunduh",
         "embedding": "nuju dilebetkeun",
         "failed": "Gagal",
@@ -763,17 +763,17 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
     )
     st.markdown(
         '<div class="jh-chips">'
-        f'<span class="jh-chip ok"><b>{counts["ready"]}</b> Tersedia</span>'
-        f'<span class="jh-chip run"><b>{in_progress_count}</b> Dimuat</span>'
-        f'<span class="jh-chip"><b>{counts["queued"]}</b> Belum dimuat</span>'
+        f'<span class="jh-chip ok"><b>{counts["ready"]}</b> Sadia</span>'
+        f'<span class="jh-chip run"><b>{in_progress_count}</b> nuju dilebetkeun</span>'
+        f'<span class="jh-chip"><b>{counts["queued"]}</b> Teu acan dilebetkeun</span>'
         f'<span class="jh-chip bad"><b>{counts["failed"]}</b> Gagal</span>'
         "</div>",
         unsafe_allow_html=True,
     )
     if snapshot["running"]:
-        sync_label = "Lanjutkan muat" if snapshot["paused"] else "Jeda muat"
+        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "Jeda muat"
     else:
-        sync_label = "Lanjutkan muat" if snapshot["paused"] else "Sinkronkan Sekarang"
+        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "Sinkronkan Sekarang"
     if st.button(
         sync_label,
         key="drive_sync_pause_toggle",
@@ -1324,7 +1324,7 @@ with st.sidebar:
     if not folder_id:
         st.warning("Atur GOOGLE_DRIVE_FOLDER_ID untuk menghubungkan folder Drive.")
     st.caption(
-        "kitab nu disiapkeun: "
+        "KITAB NU TOS DISIAPKEUN: "
         f"{st.session_state.get('document_count', 0)}"
     )
 
