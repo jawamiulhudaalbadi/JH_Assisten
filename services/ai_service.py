@@ -896,8 +896,51 @@ _JUDUL_MARKER_RE = re.compile(r"(?:^|\n)\s*JUDUL\s*:", re.IGNORECASE)
 
 FULL_CONTEXT_CHUNK_COUNT = 14
 FULL_CONTEXT_RETRIEVAL_COUNT = 10
-DISCUSSION_RETRIEVAL_COUNT = 10
-DISCUSSION_MAX_CHUNKS = 12
+DISCUSSION_RETRIEVAL_COUNT = 6
+DISCUSSION_MAX_CHUNKS = 10
+
+
+STRICT_READING_RULES = (
+    "ATURAN MEMBACA SUMBER (WAJIB UNTUK SEMUA TOPIK; jika pengguna meminta menyalin "
+    "teks, salin persis tanpa mengubahnya). "
+    "1) Jawab HANYA dari konteks. Jangan menambah fakta, angka, hukum, atau kesimpulan "
+    "yang tidak tertulis. Jika tidak ada di konteks, katakan tidak ditemukan. "
+    "2) Konteks disusun berurutan sesuai dokumen. Baca dari awal sampai akhir tanpa "
+    "melompati bagian. Teks asli beserta terjemahannya adalah satu kesatuan. "
+    "3) Jika sumber membagi sesuatu ke dalam kategori, jenis, bab, atau poin, setiap "
+    "bagian punya definisi, contoh, dan ketentuannya sendiri. Jangan memindahkan "
+    "ketentuan satu bagian ke bagian lain dan jangan menggabungkan dua bagian yang berbeda. "
+    "4) Pisahkan sifat/status suatu hal dari ketentuan penggunaannya atau keterangan "
+    "tambahannya. Keterangan tambahan tidak mengubah statusnya. "
+    "5) Sebelum menjawab, periksa tiap butir jawaban: bagian mana dari konteks yang "
+    "mendukungnya, dan apakah tidak tertukar dengan bagian lain. "
+    "6) Jika konteks saling bertentangan atau tidak lengkap, sebutkan apa adanya. "
+    "CONTOH POLA PENALARAN: "
+    "(a) Fikih: air musyammas (dipanaskan matahari dalam wadah logam selain emas dan "
+    "perak) berstatus suci menyucikan, hukum penggunaan di badan makruh. Ia TIDAK masuk "
+    "suci tidak menyucikan. Air musta'mal (bekas bersuci wajib) berstatus suci tidak "
+    "menyucikan, itu kategori lain. Status zat (suci menyucikan, suci tidak menyucikan, "
+    "najis) harus dipisah dari hukum penggunaan (mubah, makruh, haram). "
+    "(b) Umum: jika dokumen menyebut produk A berstatus aktif tetapi dibatasi, jawab "
+    "keduanya: A aktif, dengan pembatasannya. Jangan menulis A nonaktif. "
+    "Jika redaksi konteks berbeda dari contoh, ikuti konteks. "
+    "Untuk pertanyaan klasifikasi, gunakan urutan: kategori, status, ketentuan, rujukan."
+)
+
+
+def _order_matches_for_reading(matches: list[Document]) -> list[Document]:
+    file_order: dict[str, int] = {}
+    for document in matches:
+        file_order.setdefault(str(document.metadata.get("file_id", "")), len(file_order))
+
+    def key(document: Document) -> tuple[int, int]:
+        try:
+            chunk_index = int(document.metadata.get("chunk_index"))
+        except (TypeError, ValueError):
+            chunk_index = 10**9
+        return (file_order[str(document.metadata.get("file_id", ""))], chunk_index)
+
+    return sorted(matches, key=key)
 
 
 def is_full_context_request(question: str) -> bool:
@@ -1415,6 +1458,13 @@ def _is_max_tokens_finish(reason: object) -> bool:
     return "MAX_TOKENS" in text or text == "LENGTH"
 
 
+CHAT_TEMPERATURE = float(os.getenv("CHAT_TEMPERATURE", "0.0") or 0.0)
+
+
+def _chat_temperature(model_name: str) -> float:
+    return 1.0 if "gemini-3" in model_name.casefold() else CHAT_TEMPERATURE
+
+
 def _create_chat_model(
     model_name: str,
     api_key: str | None,
@@ -1423,7 +1473,7 @@ def _create_chat_model(
 ) -> ChatGoogleGenerativeAI:
     kwargs = dict(
         model=model_name,
-        temperature=0.2,
+        temperature=_chat_temperature(model_name),
         google_api_key=api_key or os.getenv("GOOGLE_API_KEY"),
         retries=0,
         request_timeout=CHAT_MODEL_REQUEST_TIMEOUT_SECONDS,
@@ -2112,7 +2162,7 @@ def answer_question(
     elif discussion_mode:
         retrieval_count = DISCUSSION_RETRIEVAL_COUNT
     else:
-        retrieval_count = 8
+        retrieval_count = 6
 
     keyword_fallback_reason: str | None = None
     anchor_vector_position: int | None = None
@@ -2171,6 +2221,8 @@ def answer_question(
         )
     elif discussion_mode and index is not None and matches:
         matches = _expand_discussion_neighbors(index, matches)
+    if not full_context_mode and matches:
+        matches = _order_matches_for_reading(matches)
 
     if not matches and not media_parts:
         if keyword_fallback_reason:
@@ -2239,6 +2291,7 @@ def answer_question(
         )
         + completeness_instruction
         + (" " + source_line_instruction if source_line_instruction else "")
+        + (" " + STRICT_READING_RULES if matches else "")
     )
 
     if on_progress:
