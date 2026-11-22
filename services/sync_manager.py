@@ -369,9 +369,9 @@ class DriveSyncManager:
                 self._persist_failed_file_statuses(folder_id)
                 if self._phase == "idle":
                     self._status = (
-                        "Indeks lokal siap; sinkronisasi Google Drive belum dimulai."
+                        "Kitab tos sayogi, pami aya  kitab enggal klik Lebetkeun Kitab."
                         if index is not None
-                        else "Belum ada indeks lokal. Tekan Sinkronkan Sekarang."
+                        else "kitab teu acan sayogi. klik Lebetkeun Kitab."
                     )
         return index
 
