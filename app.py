@@ -747,11 +747,11 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
 
     files = snapshot["files"]
     status_labels = {
-        "ready": "Tersedia",
-        "downloaded": "Diunduh, menunggu indeks",
-        "queued": "Belum dimuat",
-        "downloading": "Sedang diunduh",
-        "embedding": "Sedang diindeks",
+        "ready": "Sadia",
+        "downloaded": "Diunduh, Ngantosan dilebetkeun",
+        "queued": "Teuacan dilebetkeun",
+        "downloading": "nuju diunduh",
+        "embedding": "nuju dilebetkeun",
         "failed": "Gagal",
     }
     counts = {
@@ -787,7 +787,7 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
             manager.start_sync(folder_id, api_key)
             st.rerun(scope="app")
 
-    with st.expander(f"Daftar sumber ({len(files)})"):
+    with st.expander(f"Kitab nu tos sayogi ({len(files)})"):
         failed_files = [
             file_status for file_status in files if file_status["state"] == "failed"
         ]
@@ -834,16 +834,16 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
                     st.caption(file_status["error"])
 
     ready_files = [file_status for file_status in files if file_status["state"] == "ready"]
-    with st.expander(f"Pratinjau sumber tersedia ({len(ready_files)})"):
+    with st.expander(f"Ningalan eusi  kitab nu aya ({len(ready_files)})"):
         if not ready_files:
-            st.info("Belum ada sumber yang siap dipratinjau.")
+            st.info("teu acan aya Kitab nu tiasa di tingal.")
         else:
             source_names = {
                 file_status["id"]: file_status["name"]
                 for file_status in ready_files
             }
             selected_file_id = st.selectbox(
-                "Pilih file",
+                "Pilih kitab",
                 options=list(source_names),
                 format_func=source_names.get,
                 key="drive_source_preview_selection",
@@ -860,7 +860,7 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
                         indexed_chunks.append(document)
 
             if indexed_chunks:
-                st.success(f"Sudah masuk indeks pencarian · {len(indexed_chunks)} potongan")
+                st.success(f"Tos lebet Muthola'aheun· {len(indexed_chunks)} potongan")
                 extracted_text = manager.load_source_text(selected_file_id)
                 if extracted_text is None:
                     extracted_text = _reconstruct_source_text(indexed_chunks)
@@ -868,10 +868,10 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
                         "Teks lengkap asli belum tersimpan untuk sumber lama; "
                         "isi berikut dirangkai dari seluruh chunk indeks."
                     )
-                preview_tab, read_tab = st.tabs(["Cuplikan", "Baca Dokumen"])
+                preview_tab, read_tab = st.tabs(["Sakilas", "Baca Kitab"])
                 with preview_tab:
                     st.text_area(
-                        "Cuplikan teks hasil ekstraksi",
+                        "Sakilas kitab nu tos sadia",
                         value=extracted_text[:1800],
                         height=220,
                         disabled=True,
@@ -881,14 +881,14 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
                     section_size = 6000
                     section_count = max(1, (len(extracted_text) + section_size - 1) // section_size)
                     section_number = st.selectbox(
-                        "Bagian dokumen",
+                        "Bagian Kitab",
                         options=range(section_count),
                         format_func=lambda number: f"Bagian {number + 1} dari {section_count}",
                         key=f"drive_source_section_{selected_file_id}",
                     )
                     start = section_number * section_size
                     st.text_area(
-                        "Isi teks hasil ekstraksi",
+                        "Eusi Kitabb",
                         value=extracted_text[start : start + section_size],
                         height=500,
                         disabled=True,
@@ -1314,24 +1314,24 @@ theme = APP_THEMES[APP_THEME_ID]
 st.markdown(_build_app_css(theme, APP_FONTS[APP_FONT_ID]), unsafe_allow_html=True)
 
 with st.sidebar:
-    if st.button("Mulai Chat Baru", key="new_chat_button", use_container_width=True):
+    if st.button("Ngawitan Deui  Patarosan", key="new_chat_button", use_container_width=True):
         _start_new_chat()
         st.rerun()
 
     st.divider()
-    st.subheader("Sumber pengetahuan")
+    st.subheader("KITAB RUJUKAN")
     folder_id = st.session_state.google_drive_folder_id
     if not folder_id:
         st.warning("Atur GOOGLE_DRIVE_FOLDER_ID untuk menghubungkan folder Drive.")
     st.caption(
-        "File Drive terpantau: "
+        "kitab nu disiapkeun: "
         f"{st.session_state.get('document_count', 0)}"
     )
 
     st.divider()
-    st.subheader("Menu Pengaturan Instan")
+    st.subheader("Pangaturan JH")
     settings_password = st.text_input(
-        "Password pengaturan",
+        "Sandina 411779",
         type="password",
         key="settings_password",
     )
@@ -1340,7 +1340,7 @@ with st.sidebar:
             st.session_state.app_title_input = st.session_state.app_title
 
         edited_title = st.text_input(
-            "Judul Utama Aplikasi",
+            "Nami Aplikasi (teu kenging di robah)",
             key="app_title_input",
         )
         if edited_title != st.session_state.app_title:
@@ -1350,11 +1350,11 @@ with st.sidebar:
 
         with st.form("google_api_key_form", clear_on_submit=True):
             edited_api_key = st.text_input(
-                "API Key Google Gemini",
+                "API Key (nging di robah)",
                 type="password",
-                placeholder="Tempel API key baru",
+                placeholder="Tempel API key anyar",
             )
-            save_api_key = st.form_submit_button("Simpan API key")
+            save_api_key = st.form_submit_button("Simpen API key")
 
         if save_api_key:
             edited_api_key = edited_api_key.strip()
@@ -1391,22 +1391,22 @@ with st.sidebar:
 
         with st.form("appearance_settings_form", clear_on_submit=False):
             selected_theme = st.selectbox(
-                "Tema aplikasi",
+                "Warna aplikasi",
                 options=list(APP_THEMES),
                 index=list(APP_THEMES).index(APP_THEME_ID),
                 format_func=lambda theme_id: APP_THEMES[theme_id]["label"],
             )
             selected_font = st.selectbox(
-                "Jenis font",
+                "Gaya Tulisan",
                 options=list(APP_FONTS),
                 index=list(APP_FONTS).index(APP_FONT_ID),
                 format_func=lambda font_id: APP_FONTS[font_id]["label"],
             )
             uploaded_logo = st.file_uploader(
-                "Logo aplikasi (PNG, JPG, WEBP)",
+                "Logo aplikasi (Nging di gentos)",
                 type=["png", "jpg", "jpeg", "webp"],
             )
-            save_appearance = st.form_submit_button("Simpan tampilan")
+            save_appearance = st.form_submit_button("Simpen tampilan")
 
         if save_appearance:
             try:
