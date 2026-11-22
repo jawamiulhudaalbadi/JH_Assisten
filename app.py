@@ -1578,8 +1578,44 @@ for message in st.session_state.messages:
                 f"history_copy_{len(st.session_state.messages)}_{id(message)}",
             )
 
+def _santri_status(message: str) -> str:
+    """Ubah pesan status teknis menjadi gaya santri (Sunda)."""
+    m = message.strip()
+    name = re.search(r"(gemini[\w.\-]*)", m, re.IGNORECASE)
+    name = name.group(1) if name else "JH"
+
+    if m.startswith("Mencari di indeks lokal"):
+        return "Sakedap, urang muthola'ah kitab heula..."
+    if m.startswith("Menghubungi Gemini"):
+        return "Bismillah, urang nala'ah patarosan heula..."
+    found = re.match(r"Mencari (\d+) bagian", m)
+    if found:
+        return f"Urang milari {found.group(1)} ibarot nu patali dina kitab..."
+    if m.startswith("Menyusun jawaban"):
+        return "Urang nyusun jawaban tina kitab, mugi berkah..."
+    if m.startswith("Menyiapkan Gemini"):
+        return "Urang muthola'ah lampiran heula..."
+    if m.startswith("Menerima jawaban"):
+        return "Jawaban nuju diserat, mangga sakedap ngantosan..."
+    if m.startswith("Menunggu jawaban dari"):
+        return f"Sakedap, urang ngantosan jawaban ti {name}..."
+    if m.startswith("Menunggu"):
+        return "Sakedap, urang deres heula..."
+    if m.startswith("Dijawab oleh"):
+        return f"Alhamdulillah, jawaban parantos sumping tina {name}."
+    if "membatasi" in m or "bermasalah" in m:
+        return f"{name} nuju repot; antosan..."
+    if "terputus" in m:
+        return f"aduh {name} ngalenyep sakedap; urang neruskeun jawaban..."
+    if m.startswith("Semua model"):
+        return "Punten, JH nuju teu sayogi; urang buka kitab langsung..."
+    if m == "Selesai":
+        return "Alhamdulillah, tos réngsé."
+    if m == "Pencarian gagal":
+        return "Punten, KITABNA TEU KAPENDAK."
+    return message
 chat_submission = st.chat_input(
-    "Tulis, rekam suara, atau lampirkan gambar...",
+    "Taroskeun ku Seratan, rekam suanten, tanapi lampirkan gambar...",
     accept_file="multiple",
     file_type=["png", "jpg", "jpeg", "webp"],
     accept_audio=True,
@@ -1596,14 +1632,14 @@ if chat_submission is not None:
     processing_error: Exception | None = None
     try:
         if len(image_uploads) > MAX_CHAT_IMAGE_COUNT:
-            raise ValueError(f"Maksimal {MAX_CHAT_IMAGE_COUNT} gambar per pesan.")
+            raise ValueError(f"Maksimal {MAX_CHAT_IMAGE_COUNT} ukuran gambar .")
 
         total_image_bytes = 0
         for image_upload in image_uploads:
             image_bytes = image_upload.getvalue()
             total_image_bytes += len(image_bytes)
             if total_image_bytes > MAX_CHAT_IMAGE_TOTAL_BYTES:
-                raise ValueError("Total ukuran gambar per pesan maksimal 10 MB.")
+                raise ValueError("Total ukuran gambar maksimal 10 MB.")
             prepared_image, mime_type = _prepare_chat_image(image_bytes)
             encoded_image = base64.b64encode(prepared_image).decode("ascii")
             media_parts.append(
@@ -1633,10 +1669,10 @@ if chat_submission is not None:
         if not question and image_previews:
             question = "Jelaskan gambar yang saya lampirkan."
         if not question:
-            raise ValueError("Tulis pertanyaan, rekam suara, atau lampirkan gambar.")
+            raise ValueError("Taroskeun ku Seratan, rekam suanten, tanapi lampirkan gambar...")
     except (GoogleAPIError, GoogleGenerativeAIError, ValueError) as error:
         processing_error = error
-        question = typed_question or "Pesan suara atau gambar terlampir."
+        question = typed_question or "Pesan suanten tanapi gambar terlampir."
 
     displayed_question = question
     if transcript and typed_question:
@@ -1673,15 +1709,15 @@ if chat_submission is not None:
         elif is_source_link_request(question) and not media_parts:
             response_sources = find_source_link_matches(question, index)
             if response_sources:
-                response_text = "Berikut tautan sumber yang paling cocok:"
+                response_text = "ieu tautan sumber yang paling cocok:"
             else:
-                response_text = "Belum ditemukan nama sumber yang cocok di daftar Drive."
+                response_text = "hapunten teu kapendak kitabna."
             _render_message_content(response_text)
             _render_source_links(response_sources, "requested_source")
         elif index is None and not media_parts:
             response_text = (
-                "Indeks awal sedang disiapkan di latar belakang. "
-                "Coba kirim pertanyaan lagi setelah status memori siap."
+                "kitab nuju di bereskeun. "
+                "taroskeun deui kin pami kitab tos beres."
             )
             _render_message_content(response_text)
         else:
@@ -1696,27 +1732,27 @@ if chat_submission is not None:
             supports_answer_streaming = "on_token" in answer_parameters
             supports_local_search = "force_local_search" in answer_parameters
 
-            _prev = st.session_state.messages[:-1]
-            _prev_user = [m["content"] for m in _prev if m["role"] == "user"]
-            _prev_bot = [m["content"] for m in _prev if m["role"] == "assistant"]
+            _prev_user = [
+                m["content"]
+                for m in st.session_state.messages[:-1]
+                if m["role"] == "user"
+            ]
             if _prev_user and len(question.split()) <= 12:
-                _context = f"Pertanyaan sebelumnya: {_prev_user[-1][:300]}"
-                if _prev_bot:
-                    _bot = _prev_bot[-1].split("\n\nSumber Rujukan:")[0]
-                    _context += f"\nJawaban sebelumnya (ringkas): {_bot[:500]}"
-                question = f"{_context}\n\nPertanyaan lanjutan: {question}"
+                question = f"{_prev_user[-1][:300]} {question}"
             answer_message = st.empty()
             streamed_answer: list[str] = []
 
             search_status = st.status(
-                "Mencari di indeks lokal..."
-                if force_local_search
-                else "Menghubungi Gemini untuk embedding pertanyaan...",
+                _santri_status(
+                    "Mencari di indeks lokal..."
+                    if force_local_search
+                    else "Menghubungi Gemini untuk embedding pertanyaan..."
+                ),
                 expanded=False,
             )
 
             def update_search_progress(message: str) -> None:
-                search_status.update(label=message, state="running")
+                                search_status.update(label=_santri_status(message), state="running")
 
             def show_answer_token(token: str | None) -> None:
                 if token is None:
@@ -1765,11 +1801,11 @@ if chat_submission is not None:
             except (GoogleAPIError, GoogleGenerativeAIError, ValueError) as error:
                 answer_message.empty()
                 response_text = f"Pencarian gagal: {error}"
-                search_status.update(label="Pencarian gagal", state="error")
+                search_status.update(label=_santri_status("Pencarian gagal"), state="error")
                 st.error(response_text)
             else:
                 answer_message.empty()
-                search_status.update(label="Selesai", state="complete")
+                search_status.update(label=_santri_status("Selesai"), state="complete")
                 _render_message_content(response_text)
                 _render_source_links(response_sources, "answer_source")
         _render_copy_button(response_text, "current_answer_copy")
