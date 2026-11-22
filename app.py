@@ -771,9 +771,9 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
         unsafe_allow_html=True,
     )
     if snapshot["running"]:
-        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "Jeda muat"
+        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "Jeda lebetkeun"
     else:
-        sync_label = "Teras Lebetkeun" if snapshot["paused"] else ""
+        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "LEBETKEUN KITAB"
     if st.button(
         sync_label,
         key="drive_sync_pause_toggle",
