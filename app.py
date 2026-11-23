@@ -7,6 +7,7 @@ import base64
 import html
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from importlib import import_module
@@ -47,6 +48,7 @@ from services.gdrive_service import (
     save_oauth_callback,
 )
 from services.device_identity import get_device_uid
+from services.admin_logic import question_is_allowed, verify_admin_code
 from services.firestore_store import (
     HISTORY_WARNING_CHUNKS,
     HISTORY_WARNING_MESSAGES,
@@ -56,6 +58,7 @@ from services.firestore_store import (
     enqueue_question_answer,
     get_active_chat_id,
     get_firestore_client,
+    get_runtime_config,
     load_chat_history,
     mark_active,
 )
@@ -758,23 +761,6 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
         "</div>",
         unsafe_allow_html=True,
     )
-    if snapshot["running"]:
-        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "Jeda lebetkeun"
-    else:
-        sync_label = "Teras Lebetkeun" if snapshot["paused"] else "LEBETKEUN KITAB"
-    if st.button(
-        sync_label,
-        key="drive_sync_pause_toggle",
-        use_container_width=True,
-        disabled=rpd_status is not None,
-    ):
-        if snapshot["running"]:
-            manager.resume() if snapshot["paused"] else manager.pause()
-            st.rerun(scope="fragment")
-        else:
-            manager.start_sync(folder_id, api_key)
-            st.rerun(scope="app")
-
     with st.expander(f"Kitab nu tos sayogi ({len(files)})"):
         failed_files = [
             file_status for file_status in files if file_status["state"] == "failed"
@@ -782,23 +768,11 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
         if failed_files:
             st.markdown(f"**File gagal ({len(failed_files)})**")
             for file_status in failed_files:
-                file_id = file_status["id"]
-                columns = st.columns([4, 1])
-                with columns[0]:
-                    st.write(file_status["name"])
-                    st.caption(
-                        file_status.get("error")
-                        or "Teks kosong atau rusak, silakan konversi ke Google Docs"
-                    )
-                with columns[1]:
-                    if st.button(
-                        "Coba ulang",
-                        key=f"retry_source_{file_id}",
-                        disabled=rpd_status is not None,
-                    ):
-                        if manager.retry_file(file_id):
-                            manager.start_sync(folder_id, api_key)
-                        st.rerun(scope="app")
+                st.write(file_status["name"])
+                st.caption(
+                    file_status.get("error")
+                    or "Teks kosong atau rusak, silakan konversi ke Google Docs"
+                )
             st.divider()
         else:
             st.caption("Tidak ada file yang gagal.")
@@ -910,6 +884,59 @@ try:
 except StreamlitSecretNotFoundError:
     firestore_credentials_json = None
 FIRESTORE_CLIENT = get_firestore_client(firestore_credentials_json)
+try:
+    SETTINGS_PASSWORD = str(st.secrets.get("SETTINGS_PASSWORD", "") or "")
+    ADMIN_CODE_HASH = str(st.secrets.get("ADMIN_CODE_HASH", "") or "")
+except StreamlitSecretNotFoundError:
+    SETTINGS_PASSWORD = ""
+    ADMIN_CODE_HASH = ""
+
+def _process_admin_command(command: str) -> bool:
+    """Consume admin login commands before chat history, AI, or statistics."""
+    if not re.match(r"^/admin(?:\s|$)", command, flags=re.IGNORECASE):
+        return False
+
+    now = time.monotonic()
+    locked_until = float(st.session_state.get("admin_locked_until", 0))
+    if now < locked_until:
+        remaining = ceil(locked_until - now)
+        st.session_state["_admin_login_notice"] = (
+            f"Login admin terkunci. Coba lagi dalam {remaining} detik."
+        )
+        return True
+    if locked_until:
+        st.session_state["admin_failed_attempts"] = 0
+        st.session_state.pop("admin_locked_until", None)
+
+    code = command[len("/admin") :].strip()
+    if not code:
+        st.session_state["_admin_login_notice"] = "Gunakan format /admin <kode>."
+        return True
+    if not ADMIN_CODE_HASH:
+        st.session_state["_admin_login_notice"] = (
+            "Dashboard admin terkunci: secret ADMIN_CODE_HASH belum diatur."
+        )
+        return True
+    if verify_admin_code(code, ADMIN_CODE_HASH):
+        st.session_state["admin_failed_attempts"] = 0
+        st.session_state.pop("admin_locked_until", None)
+        st.session_state["admin_authenticated"] = True
+        st.session_state.pop("_admin_login_notice", None)
+        return True
+
+    attempts = int(st.session_state.get("admin_failed_attempts", 0)) + 1
+    if attempts >= 5:
+        st.session_state["admin_failed_attempts"] = 5
+        st.session_state["admin_locked_until"] = now + 15 * 60
+        st.session_state["_admin_login_notice"] = (
+            "Lima percobaan gagal. Login admin terkunci selama 15 menit."
+        )
+    else:
+        st.session_state["admin_failed_attempts"] = attempts
+        st.session_state["_admin_login_notice"] = (
+            f"Kode admin salah ({attempts}/5 percobaan)."
+        )
+    return True
 
 if "app_title" not in st.session_state:
     st.session_state.app_title = str(
@@ -1324,12 +1351,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Pangaturan JH")
-    settings_password = st.text_input(
-        "Sandina 411779",
-        type="password",
-        key="settings_password",
-    )
-    if settings_password == "411779":
+    if not SETTINGS_PASSWORD:
+        st.info(
+            "Menu Pengaturan terkunci. Atur secret SETTINGS_PASSWORD untuk membukanya."
+        )
+    else:
+        settings_password = st.text_input(
+            "Kata sandi pengaturan",
+            type="password",
+            key="settings_password",
+        )
+    if SETTINGS_PASSWORD and settings_password == SETTINGS_PASSWORD:
         if "app_title_input" not in st.session_state:
             st.session_state.app_title_input = st.session_state.app_title
 
@@ -1560,6 +1592,24 @@ if st.session_state.get("loaded_chat_id") != chat_id:
     st.session_state.history_stats = history_stats
     st.session_state.loaded_chat_id = chat_id
 mark_active(FIRESTORE_CLIENT, DEVICE_UID)
+runtime_config = get_runtime_config(FIRESTORE_CLIENT)
+if runtime_config["announcement"]:
+    st.info(runtime_config["announcement"])
+
+admin_login_notice = st.session_state.pop("_admin_login_notice", None)
+if admin_login_notice:
+    st.warning(admin_login_notice)
+
+if st.session_state.get("admin_authenticated"):
+    admin_dashboard = import_module("services.admin_dashboard")
+    admin_dashboard.render_dashboard(
+        FIRESTORE_CLIENT,
+        _get_drive_sync_manager(),
+        folder_id,
+        str(st.session_state.get("google_api_key", "")),
+        drive_authorized,
+    )
+    st.stop()
 
 history_stats = st.session_state.get("history_stats", {})
 if (
@@ -1666,6 +1716,23 @@ chat_submission = st.chat_input(
 )
 if chat_submission is not None:
     typed_question = chat_submission.text.strip()
+    if _process_admin_command(typed_question):
+        st.rerun()
+    if runtime_config["maintenance"]:
+        st.warning(
+            runtime_config["announcement"]
+            or "Aplikasi sedang dalam mode perawatan. Silakan coba kembali nanti."
+        )
+        st.stop()
+    allowed, policy_notice = question_is_allowed(
+        st.session_state.get("history_stats", {}),
+        int(runtime_config["daily_question_limit"]),
+        datetime.now(_WIB_TIMEZONE),
+    )
+    if not allowed:
+        st.warning(policy_notice)
+        st.stop()
+
     image_uploads = chat_submission.files
     audio_upload = chat_submission.audio
     media_parts: list[dict[str, str]] = []
@@ -1878,4 +1945,12 @@ if chat_submission is not None:
     updated_stats["total_messages"] = (
         int(updated_stats.get("total_messages", 0)) + 2
     )
+    today_wib = datetime.now(_WIB_TIMEZONE).strftime("%Y%m%d")
+    current_day_count = (
+        int(updated_stats.get("day_count", 0))
+        if updated_stats.get("day") == today_wib
+        else 0
+    )
+    updated_stats["day"] = today_wib
+    updated_stats["day_count"] = current_day_count + 1
     st.session_state.history_stats = updated_stats
