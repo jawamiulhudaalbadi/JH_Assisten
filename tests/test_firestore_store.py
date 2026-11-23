@@ -1,9 +1,18 @@
 import unittest
 
-from services.firestore_store import append_message_pair
+from services.firestore_store import _transaction_snapshot, append_message_pair
 
 
 class FirestoreStoreTests(unittest.TestCase):
+    def test_transaction_snapshot_reads_snapshot_from_generator(self) -> None:
+        snapshot = object()
+
+        class Transaction:
+            def get(self, document_ref: object):
+                return iter([snapshot])
+
+        self.assertIs(_transaction_snapshot(Transaction(), object()), snapshot)
+
     def test_pair_fits_exactly_in_chunk(self) -> None:
         messages = [{"role": "user"} for _ in range(18)]
 

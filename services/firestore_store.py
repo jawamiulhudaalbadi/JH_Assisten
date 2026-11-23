@@ -73,6 +73,14 @@ def _stats_uid(uid: str) -> str:
     return hashlib.sha256(uid.encode("utf-8")).hexdigest()[:12]
 
 
+def _transaction_snapshot(transaction: Any, document_ref: Any) -> Any:
+    """Ambil snapshot tunggal dari hasil iterator transaction.get()."""
+    snapshot = next(iter(transaction.get(document_ref)), None)
+    if snapshot is None:
+        raise RuntimeError("Pembacaan dokumen Firestore tidak mengembalikan snapshot.")
+    return snapshot
+
+
 def append_message_pair(
     current_messages: list[dict[str, Any]],
     question: dict[str, Any],
@@ -195,7 +203,7 @@ def _persist_question_answer(
 
         @firestore.transactional
         def save_pair(transaction: Any) -> None:
-            user_snapshot = transaction.get(user_ref)
+            user_snapshot = _transaction_snapshot(transaction, user_ref)
             query = chunks_ref.order_by(
                 "__name__", direction=firestore.Query.DESCENDING
             ).limit(1)
@@ -289,7 +297,7 @@ def _mark_active(client: Any, uid: str, now: datetime) -> None:
 
         @firestore.transactional
         def update_user(transaction: Any) -> None:
-            user_snapshot = transaction.get(user_ref)
+            user_snapshot = _transaction_snapshot(transaction, user_ref)
             fields: dict[str, Any] = {
                 "last_active": now,
             }
