@@ -18,4 +18,5 @@ venv/
 
 # Indeks (hanya file status, indeks utamanya tetap ikut repo)
 faiss_index/sync_failures.json
-faiss_index_backup_3072/
+faiss_index_backup_3072/*.bak*
+*.bak*

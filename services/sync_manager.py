@@ -13,7 +13,7 @@ import re
 import string
 from threading import Event, RLock
 from time import monotonic
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from zoneinfo import ZoneInfo
 
 from langchain_community.vectorstores import FAISS
@@ -36,6 +36,7 @@ from services.gdrive_service import (
     list_drive_files,
     read_drive_files,
 )
+from services.key_pool import redact_secrets
 
 SOURCE_TEXT_DIRECTORY = DEFAULT_INDEX_DIRECTORY / "source_texts"
 SYNC_STATUS_PATH = DEFAULT_INDEX_DIRECTORY / "sync_status.json"
@@ -81,7 +82,7 @@ class DriveSyncManager:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drive-sync")
         self._lock = RLock()
         self._index_lock = _INDEX_LOCK
-        self._config: tuple[str, str] | None = None
+        self._config: tuple[str, ...] | None = None
         self._future: Future[None] | None = None
         self._job_id = 0
         self._generation = 0
@@ -106,7 +107,13 @@ class DriveSyncManager:
         self._error: str | None = None
         self._result: dict[str, object] | None = None
 
-    def start_sync(self, folder_id: str, api_key: str) -> bool:
+    def start_sync(
+        self,
+        folder_id: str,
+        api_key: str,
+        key_candidates: Sequence[str] = (),
+        on_key_quota: Callable[[str, Exception], None] | None = None,
+    ) -> bool:
         """Start one manually requested Drive sync."""
         with self._lock:
             if self.get_rpd_status(api_key=api_key) is not None:
@@ -114,7 +121,7 @@ class DriveSyncManager:
             if self._future is not None and not self._future.done():
                 return False
 
-            config = (folder_id, api_key)
+            config = (folder_id, api_key, *key_candidates)
             if config != self._config:
                 config_changed = self._config is not None
                 self._config = config
@@ -143,6 +150,8 @@ class DriveSyncManager:
                 job_id,
                 folder_id,
                 api_key,
+                tuple(key_candidates),
+                on_key_quota,
             )
             return True
 
@@ -398,9 +407,17 @@ class DriveSyncManager:
         job_id: int,
         folder_id: str,
         api_key: str,
+        key_candidates: Sequence[str] = (),
+        on_key_quota: Callable[[str, Exception], None] | None = None,
     ) -> None:
         try:
-            result = self._sync(folder_id, api_key, job_id)
+            result = self._sync(
+                folder_id,
+                api_key,
+                job_id,
+                key_candidates,
+                on_key_quota,
+            )
         except _DailyEmbeddingQuotaExceededError:
             try:
                 self.record_daily_quota_limit(api_key=api_key)
@@ -445,7 +462,7 @@ class DriveSyncManager:
         except Exception as error:
             with self._lock:
                 if job_id == self._job_id:
-                    self._error = str(error)
+                    self._error = redact_secrets(error, (api_key, *key_candidates))
                     self._status = "Sinkronisasi Drive gagal."
                     self._phase = "error"
             return
@@ -489,6 +506,8 @@ class DriveSyncManager:
         folder_id: str,
         api_key: str,
         job_id: int,
+        key_candidates: Sequence[str] = (),
+        on_key_quota: Callable[[str, Exception], None] | None = None,
     ) -> dict[str, object]:
         self._set_status(job_id, "Memeriksa metadata Google Drive...")
         inventory = list_drive_files(folder_id)
@@ -638,7 +657,12 @@ class DriveSyncManager:
             if removed_file_ids:
                 self._set_phase(job_id, "embedding")
                 self._set_status(job_id, "Menghapus dokumen yang sudah dihapus dari Drive...")
-                index = update_search_index(index, [], removed_file_ids, api_key)
+                index = update_search_index(
+                    index,
+                    [],
+                    removed_file_ids,
+                    api_key,
+                )
                 for file_id in removed_file_ids:
                     source_path = SOURCE_TEXT_DIRECTORY / f"{file_id}.json"
                     source_path.unlink(missing_ok=True)
@@ -769,6 +793,8 @@ class DriveSyncManager:
                                     (len(changed_files) + batch_size - 1) // batch_size,
                                 )
                             ),
+                            api_key_candidates=key_candidates,
+                            on_key_quota=on_key_quota,
                         )
                     except Exception as error:
                         if is_embedding_quota_error(error):
@@ -782,8 +808,12 @@ class DriveSyncManager:
                             if is_embedding_daily_quota_error(error):
                                 raise _DailyEmbeddingQuotaExceededError from error
                             raise _EmbeddingQuotaExceededError from error
+                        safe_error = redact_secrets(
+                            error,
+                            (api_key, *key_candidates),
+                        )
                         for file_id in successful_file_ids:
-                            self._set_file_status(job_id, file_id, "failed", str(error))
+                            self._set_file_status(job_id, file_id, "failed", safe_error)
                         raise
                 updated_file_count += len(successful_file_ids)
                 committed_files.update(

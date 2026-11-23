@@ -17,6 +17,8 @@ from services.ai_service import (
     EMBEDDING_MAX_RETRIES,
     EMBEDDING_MAX_QUOTA_RETRIES,
     EMBEDDING_TARGET_BATCH_TOKENS,
+    ChatKeyQuotaExceeded,
+    _AllChatModelsFailedError,
     _EmbeddingRateLimiter,
     _QuotaAwareEmbeddings,
     _get_chat_query_embeddings,
@@ -42,6 +44,54 @@ class _DeterministicEmbeddings(Embeddings):
 
 
 class UpdateSearchIndexTests(unittest.TestCase):
+    def test_daily_embedding_quota_rotates_and_marks_each_exhausted_key(self) -> None:
+        document = DriveDocument(
+            file_id="file-1",
+            name="document.txt",
+            text="contents for embedding",
+            modified_time="2026-11-12T00:00:00Z",
+        )
+        quota_error = RuntimeError("429 requests per day exceeded")
+        marked_keys: list[str] = []
+
+        with (
+            patch("services.ai_service._get_embeddings", return_value=Mock()),
+            patch(
+                "services.ai_service.FAISS.from_documents",
+                side_effect=[quota_error, quota_error],
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                update_search_index(
+                    None,
+                    [document],
+                    {"file-1"},
+                    "first-key",
+                    api_key_candidates=["second-key"],
+                    on_key_quota=lambda key, _error: marked_keys.append(key),
+                )
+
+        self.assertEqual(marked_keys, ["first-key", "second-key"])
+
+    def test_session_override_transcription_quota_has_clear_error(self) -> None:
+        with (
+            patch(
+                "services.ai_service.get_available_chat_models",
+                return_value=["gemini-test"],
+            ),
+            patch(
+                "services.ai_service._invoke_chat_model_messages",
+                side_effect=_AllChatModelsFailedError(is_quota=True),
+            ),
+        ):
+            with self.assertRaises(ChatKeyQuotaExceeded):
+                transcribe_audio(
+                    b"audio",
+                    "audio/wav",
+                    api_key="session-only-key",
+                    session_key_override=True,
+                )
+
     def test_embedding_client_does_not_retry_api_requests(self) -> None:
         with (
             patch("services.ai_service.GoogleGenerativeAIEmbeddings") as make_embeddings,

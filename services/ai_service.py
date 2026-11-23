@@ -653,6 +653,8 @@ def update_search_index(
     on_wait: Callable[[float], None] | None = None,
     on_checkpoint: Callable[[FAISS], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    api_key_candidates: Sequence[str] | None = None,
+    on_key_quota: Callable[[str, Exception], None] | None = None,
 ) -> FAISS | None:
     """Ganti chunk file yang berubah; chunk dengan isi identik dipakai ulang (tanpa embedding)."""
     chunks = _to_langchain_documents(source_documents)
@@ -708,10 +710,9 @@ def update_search_index(
         if on_progress:
             on_progress(batch_offset + batch_done, total_pending)
 
-    embeddings = _get_embeddings(api_key, on_wait, report_embedding_progress)
+    api_keys = list(dict.fromkeys([api_key, *(api_key_candidates or ())]))
+    key_position = 0
     original_embedding_function = index.embedding_function if index is not None else None
-    if index is not None:
-        index.embedding_function = embeddings
     try:
         for batch_info in _make_embedding_batches(
             [chunk.page_content for chunk in pending_chunks]
@@ -721,11 +722,36 @@ def update_search_index(
             del pending_chunks[: len(batch)]
             batch_offset = completed
             batch_total = len(batch_chunks)
-            if index is None:
-                index = FAISS.from_documents(batch_chunks, embeddings)
-                original_embedding_function = index.embedding_function
-            else:
-                index.add_documents(batch_chunks)
+            while True:
+                embeddings = _get_embeddings(
+                    api_keys[key_position],
+                    on_wait,
+                    report_embedding_progress,
+                )
+                if index is not None:
+                    index.embedding_function = embeddings
+                try:
+                    if index is None:
+                        index = FAISS.from_documents(batch_chunks, embeddings)
+                    else:
+                        index.add_documents(batch_chunks)
+                except Exception as error:
+                    if is_embedding_daily_quota_error(error):
+                        if on_key_quota:
+                            try:
+                                on_key_quota(api_keys[key_position], error)
+                            except Exception as callback_error:
+                                import logging
+
+                                logging.getLogger(__name__).warning(
+                                    "Index key quota status update failed error_class=%s",
+                                    type(callback_error).__name__,
+                                )
+                        if key_position + 1 < len(api_keys):
+                            key_position += 1
+                            continue
+                    raise
+                break
             completed += len(batch_chunks)
             if on_checkpoint:
                 on_checkpoint(index)
@@ -1377,6 +1403,8 @@ def _is_chat_quota_error(error: BaseException) -> bool:
     visited: set[int] = set()
     while current is not None and id(current) not in visited:
         visited.add(id(current))
+        if getattr(current, "is_quota", False):
+            return True
         status = str(
             getattr(current, "status_code", None)
             or getattr(current, "status", None)
@@ -1531,6 +1559,45 @@ class _AllChatModelsFailedError(RuntimeError):
         self.cause = cause
 
 
+class ChatKeyQuotaExceeded(ValueError):
+    """Raised when a session-only chat key reaches a quota limit."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Punten, API key pribadi parantos ngahontal wates pamakean. "
+            "Mangga ganti key atanapi pilih “Kembali ke API key konfigurasi”."
+        )
+
+
+_ModelQuotaCallback = Callable[[str, str, BaseException], None]
+
+
+def _notify_model_quota(
+    callback: _ModelQuotaCallback | None,
+    api_key: str | None,
+    model_name: str,
+    error: BaseException,
+) -> None:
+    if callback is None or api_key is None or not _is_chat_quota_error(error):
+        return
+    try:
+        callback(api_key, model_name, error)
+    except Exception as callback_error:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Chat quota status update failed model=%s error_class=%s",
+            model_name,
+            type(callback_error).__name__,
+        )
+
+
+def _safe_error_text(error: BaseException, api_key: str | None) -> str:
+    if api_key:
+        return str(error).replace(api_key, "[redacted]")
+    return str(error)
+
+
 def _messages_size(messages: Sequence[object]) -> int:
     total = 0
     for message in messages:
@@ -1623,6 +1690,7 @@ def _hedged_generate(
     candidates: Sequence[str],
     on_token: Callable[[str | None], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_model_quota: _ModelQuotaCallback | None = None,
 ) -> tuple[str, str]:
     if not candidates:
         raise ValueError("Tidak ada model Gemini aktif yang mendukung generateContent.")
@@ -1633,6 +1701,7 @@ def _hedged_generate(
     attempts: list[_Attempt] = []
     next_candidate = 0
     last_error: BaseException | None = None
+    saw_quota_error = False
     winner: _Attempt | None = None
     parts: list[str] = []
 
@@ -1670,10 +1739,18 @@ def _hedged_generate(
                             f"timed out: {item.model_name} tidak merespons dalam "
                             f"{attempt_limit:.0f} detik"
                         )
-                        router.record_failure(item.model_name, last_error)
+                        router.record_failure(
+                            item.model_name,
+                            _safe_error_text(last_error, api_key),
+                        )
                 active = [item for item in attempts if not item.finished]
                 if not active:
                     if not launch():
+                        if saw_quota_error:
+                            raise _AllChatModelsFailedError(
+                                is_quota=True,
+                                cause=last_error,
+                            ) from last_error
                         raise last_error or ValueError(
                             "Semua model Gemini tidak menghasilkan jawaban."
                         )
@@ -1732,7 +1809,18 @@ def _hedged_generate(
                 attempt.finished = attempt.failed = True
                 if not _is_chat_model_fallback_error(payload):
                     raise payload
-                router.record_failure(attempt.model_name, payload)
+                if _is_chat_quota_error(payload):
+                    saw_quota_error = True
+                    _notify_model_quota(
+                        on_model_quota,
+                        api_key,
+                        attempt.model_name,
+                        payload,
+                    )
+                router.record_failure(
+                    attempt.model_name,
+                    _safe_error_text(payload, api_key),
+                )
                 last_error = payload
                 if on_progress:
                     if _is_chat_quota_error(payload):
@@ -1756,6 +1844,7 @@ def _continue_partial_answer(
     candidates: Sequence[str],
     on_token: Callable[[str | None], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_model_quota: _ModelQuotaCallback | None = None,
 ) -> tuple[str, str]:
     """Lanjutkan jawaban yang terputus di tengah TANPA menghapus atau ganti model dulu."""
     accumulated = partial_text
@@ -1785,8 +1874,17 @@ def _continue_partial_answer(
             last_error = error
             if not _is_chat_model_fallback_error(error):
                 raise
+            _notify_model_quota(
+                on_model_quota,
+                api_key,
+                target_model,
+                error,
+            )
             if target_model != model_name:
-                router.record_failure(target_model, error)
+                router.record_failure(
+                    target_model,
+                    _safe_error_text(error, api_key),
+                )
 
     if accumulated.strip():
         return accumulated.lstrip("\r\n").rstrip(), model_name
@@ -1802,6 +1900,7 @@ def _generate_with_failover(
     model_names: Sequence[str] | None = None,
     on_token: Callable[[str | None], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_model_quota: _ModelQuotaCallback | None = None,
 ) -> tuple[str, str]:
     candidates = list(model_names or get_available_chat_models(api_key))
     if not candidates:
@@ -1810,7 +1909,14 @@ def _generate_with_failover(
     last_error: BaseException | None = None
     for _ in range(2):
         try:
-            return _hedged_generate(messages, api_key, candidates, on_token, on_progress)
+            return _hedged_generate(
+                messages,
+                api_key,
+                candidates,
+                on_token,
+                on_progress,
+                on_model_quota,
+            )
         except _WinnerInterrupted as interrupted:
             if not _is_chat_model_fallback_error(interrupted.error):
                 raise interrupted.error
@@ -1827,8 +1933,18 @@ def _generate_with_failover(
                     candidates,
                     on_token=on_token,
                     on_progress=on_progress,
+                    on_model_quota=on_model_quota,
                 )
-            router.record_failure(interrupted.model_name, interrupted.error)
+            _notify_model_quota(
+                on_model_quota,
+                api_key,
+                interrupted.model_name,
+                interrupted.error,
+            )
+            router.record_failure(
+                interrupted.model_name,
+                _safe_error_text(interrupted.error, api_key),
+            )
             last_error = interrupted.error
             candidates = [name for name in candidates if name != interrupted.model_name]
             if not candidates:
@@ -1859,10 +1975,13 @@ def _invoke_chat_model_messages(
 
 def start_model_warmup(api_key: str | None = None) -> None:
     def probe(model_name: str) -> float:
-        model = _create_chat_model(model_name, api_key, max_output_tokens=16)
-        started = time.monotonic()
-        for _ in model.stream([HumanMessage(content="Balas: ok")]):
-            return time.monotonic() - started
+        try:
+            model = _create_chat_model(model_name, api_key, max_output_tokens=16)
+            started = time.monotonic()
+            for _ in model.stream([HumanMessage(content="Balas: ok")]):
+                return time.monotonic() - started
+        except Exception as error:
+            raise ValueError(_safe_error_text(error, api_key)) from None
         raise ValueError("tidak ada respons")
 
     def run() -> None:
@@ -1878,6 +1997,7 @@ def transcribe_audio(
     audio_bytes: bytes,
     mime_type: str,
     api_key: str | None = None,
+    session_key_override: bool = False,
 ) -> str:
     if not audio_bytes:
         raise ValueError("Rekaman suara kosong.")
@@ -1909,7 +2029,12 @@ def transcribe_audio(
             },
         ]
     )
-    return _invoke_chat_model_messages([audio_message], api_key, model_names)
+    try:
+        return _invoke_chat_model_messages([audio_message], api_key, model_names)
+    except Exception as error:
+        if session_key_override and _is_chat_quota_error(error):
+            raise ChatKeyQuotaExceeded from None
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -2148,6 +2273,11 @@ def answer_question(
     on_progress: Callable[[str], None] | None = None,
     on_token: Callable[[str | None], None] | None = None,
     force_local_search: bool = False,
+    api_key_candidates: Sequence[str] | None = None,
+    model_names: Sequence[str] | None = None,
+    model_filter: Callable[[str, Sequence[str]], Sequence[str]] | None = None,
+    on_model_quota: _ModelQuotaCallback | None = None,
+    session_key_override: bool = False,
 ) -> tuple[str, list[dict[str, str]]]:
     """Answer from retrieved passages and any supplied image attachments."""
     if not question.strip():
@@ -2327,12 +2457,41 @@ def answer_question(
     stream_sanitizer = _StreamingMarkdownLineSanitizer(on_token) if on_token else None
     local_only_mode = False
     try:
-        answer, _answering_model = _generate_with_failover(
-            chat_messages,
-            api_key,
-            on_token=stream_sanitizer,
-            on_progress=on_progress,
+        key_candidates = list(
+            dict.fromkeys(
+                [key for key in (api_key, *(api_key_candidates or ())) if key]
+            )
         )
+        last_key_quota_error: _AllChatModelsFailedError | None = None
+        for candidate_key in key_candidates:
+            candidate_models = list(
+                model_names or get_available_chat_models(candidate_key)
+            )
+            if model_filter is not None:
+                candidate_models = list(model_filter(candidate_key, candidate_models))
+            if not candidate_models:
+                last_key_quota_error = _AllChatModelsFailedError(is_quota=True)
+                continue
+            try:
+                answer, _answering_model = _generate_with_failover(
+                    chat_messages,
+                    candidate_key,
+                    model_names=candidate_models,
+                    on_token=stream_sanitizer,
+                    on_progress=on_progress,
+                    on_model_quota=on_model_quota,
+                )
+                break
+            except _AllChatModelsFailedError as error:
+                if not error.is_quota:
+                    raise
+                last_key_quota_error = error
+                if session_key_override:
+                    raise ChatKeyQuotaExceeded from None
+        else:
+            if last_key_quota_error is not None:
+                raise last_key_quota_error
+            raise _AllChatModelsFailedError(is_quota=False)
         if stream_sanitizer is not None:
             stream_sanitizer.flush()
     except _AllChatModelsFailedError as chat_error:
@@ -2408,3 +2567,58 @@ def answer_question(
         }
     sources = list(sources_by_id.values())
     return answer, sources
+
+
+def summarize_faq_questions(
+    faq_rows: Sequence[dict[str, object]],
+    api_keys: Sequence[str],
+    *,
+    model_names: Sequence[str] | None = None,
+    on_key_quota: Callable[[str, Exception], None] | None = None,
+) -> str:
+    """Summarize the FAQ list on demand, rotating only among admin keys."""
+    prompt_rows = [
+        f"- {str(row.get('question', ''))[:300]} ({int(row.get('count', 0))})"
+        for row in faq_rows[:60]
+    ]
+    if not prompt_rows:
+        return "Can aya patarosan anu cekap kanggo dirangkum."
+    prompt = (
+        "Ringkeskeun patarosan anu pangseringna diajukeun. "
+        "Kelompokkeun dumasar jejer, ulah ngajawab patarosanana, sareng "
+        "tulis ringkes dina basa Indonesia.\n\n"
+        + "\n".join(prompt_rows)
+    )
+    last_quota_error = False
+    for api_key in dict.fromkeys(key for key in api_keys if key):
+        try:
+            answer, _model = _generate_with_failover(
+                [
+                    SystemMessage(
+                        content="Anda membantu admin memahami tema pertanyaan FAQ."
+                    ),
+                    HumanMessage(content=prompt),
+                ],
+                api_key,
+                model_names=model_names,
+            )
+            return answer
+        except _AllChatModelsFailedError as error:
+            if not error.is_quota:
+                raise ValueError(
+                    "Ringkesan FAQ teu tiasa didamel ayeuna."
+                ) from None
+            last_quota_error = True
+            if on_key_quota and error.cause is not None:
+                try:
+                    on_key_quota(api_key, Exception(str(error.cause)))
+                except Exception as callback_error:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "Admin key quota status update failed error_class=%s",
+                        type(callback_error).__name__,
+                    )
+    if last_quota_error:
+        raise ValueError("Sadaya API key admin nu sayogi parantos ngahontal limit.")
+    raise ValueError("Kelompok API key admin teu gaduh key aktif.")

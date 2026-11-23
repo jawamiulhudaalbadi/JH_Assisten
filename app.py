@@ -17,10 +17,6 @@ from math import ceil
 import re
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    tomllib = import_module("tomli")
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -36,8 +32,10 @@ from oauthlib.oauth2.rfc6749.errors import OAuth2Error
 from requests.exceptions import RequestException
 
 from services.ai_service import (
+    ChatKeyQuotaExceeded,
     answer_question,
     find_source_link_matches,
+    get_available_chat_models,
     is_source_link_request,
     start_model_warmup,
     transcribe_audio,
@@ -72,6 +70,18 @@ from services.firestore_store import (
     load_chat_history,
     mark_active,
     save_named_chat,
+)
+from services.key_pool import (
+    KeyPoolError,
+    add_key,
+    clear_session_chat_override,
+    get_available_keys,
+    get_model_order,
+    models_for_key,
+    ordered_models,
+    record_quota,
+    redact_secrets,
+    set_session_chat_override,
 )
 from services.sync_manager import DriveSyncManager
 
@@ -315,34 +325,44 @@ if PRIVATE_CONFIG_PATH.is_file():
     PRIVATE_CONFIG = json.loads(PRIVATE_CONFIG_PATH.read_text(encoding="utf-8"))
 else:
     PRIVATE_CONFIG = {}
+_PRIVATE_CONFIG_CONTAINS_API_KEYS = any(
+    name in PRIVATE_CONFIG
+    for name in (
+        "google_api_key",
+        "google_api_key_override",
+        "GOOGLE_API_KEY",
+        "GOOGLE_API_KEY_INDEX",
+        "GOOGLE_API_KEY_ADMIN",
+        "ENCRYPTION_KEY",
+    )
+)
 
 try:
     for _k, _v in st.secrets.items():
-        if _k not in PRIVATE_CONFIG and isinstance(_v, (str, int, float, bool)):
+        if (
+            _k not in {
+                "GOOGLE_API_KEY",
+                "GOOGLE_API_KEY_INDEX",
+                "GOOGLE_API_KEY_ADMIN",
+                "ENCRYPTION_KEY",
+            }
+            and _k not in PRIVATE_CONFIG
+            and isinstance(_v, (str, int, float, bool))
+        ):
             PRIVATE_CONFIG[_k] = _v
 except Exception:
     pass
+for _secret_key in (
+    "google_api_key",
+    "google_api_key_override",
+    "GOOGLE_API_KEY",
+    "GOOGLE_API_KEY_INDEX",
+    "GOOGLE_API_KEY_ADMIN",
+    "ENCRYPTION_KEY",
+):
+    PRIVATE_CONFIG.pop(_secret_key, None)
 
 
-def _load_google_api_key() -> str:
-    if PRIVATE_CONFIG.get("google_api_key_override") is True:
-        return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
-
-    environment_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if environment_api_key:
-        return environment_api_key
-
-    secrets_path = PRIVATE_CONFIG_PATH.parent / "secrets.toml"
-    if secrets_path.is_file():
-        secrets_config = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
-        secrets_api_key = str(secrets_config.get("google_api_key", "")).strip()
-        if secrets_api_key:
-            return secrets_api_key
-
-    return str(PRIVATE_CONFIG.get("google_api_key", "")).strip()
-
-
-DEFAULT_API_KEY = _load_google_api_key()
 DEFAULT_FOLDER_ID = (
     os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
     or str(PRIVATE_CONFIG.get("google_drive_folder_id", "")).strip()
@@ -401,6 +421,16 @@ def _save_private_config(config: dict[str, object]) -> None:
         encoding="utf-8",
     )
     PRIVATE_CONFIG_PATH.chmod(0o600)
+
+
+if _PRIVATE_CONFIG_CONTAINS_API_KEYS:
+    try:
+        _save_private_config(PRIVATE_CONFIG)
+    except OSError:
+        st.error(
+            "Kredensial API lama tidak dapat dihapus otomatis dari private_config.json. "
+            "Hapus entri API key secara manual."
+        )
 
 
 def _prepare_custom_logo(image_bytes: bytes) -> bytes:
@@ -672,7 +702,11 @@ def _render_rpd_limit_notice(api_key: str) -> None:
         _render_rpd_limit_notice_live(api_key)
 
 
-def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
+def _render_drive_sync_status_body(
+    folder_id: str,
+    api_keys: list[str],
+) -> None:
+    api_key = api_keys[0] if api_keys else ""
     manager = _get_drive_sync_manager()
     if st.session_state.pop("_quota_resume_start_failed", False):
         st.warning(
@@ -882,18 +916,18 @@ def _render_drive_sync_status_body(folder_id: str, api_key: str) -> None:
 
 
 @st.fragment(run_every="3s")
-def _render_drive_sync_status_live(folder_id: str, api_key: str) -> None:
-    _render_drive_sync_status_body(folder_id, api_key)
+def _render_drive_sync_status_live(folder_id: str, api_keys: list[str]) -> None:
+    _render_drive_sync_status_body(folder_id, api_keys)
 
 
-def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
+def _render_drive_sync_status(folder_id: str, api_keys: list[str]) -> None:
     if _get_drive_sync_manager().snapshot()["running"]:
-        _render_drive_sync_status_live(folder_id, api_key)
+        _render_drive_sync_status_live(folder_id, api_keys)
     else:
-        _render_drive_sync_status_body(folder_id, api_key)
+        _render_drive_sync_status_body(folder_id, api_keys)
 
 
-st.session_state["google_api_key"] = DEFAULT_API_KEY
+st.session_state.setdefault("chat_api_key_override", "")
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
 DEVICE_UID = get_device_uid()
 try:
@@ -901,6 +935,10 @@ try:
 except StreamlitSecretNotFoundError:
     firestore_credentials_json = None
 FIRESTORE_CLIENT = get_firestore_client(firestore_credentials_json)
+try:
+    KEY_SECRETS = dict(st.secrets)
+except StreamlitSecretNotFoundError:
+    KEY_SECRETS = {}
 try:
     SETTINGS_PASSWORD = str(st.secrets.get("SETTINGS_PASSWORD", "") or "")
     ADMIN_CODE_HASH = str(st.secrets.get("ADMIN_CODE_HASH", "") or "")
@@ -1365,45 +1403,32 @@ with st.sidebar:
             PRIVATE_CONFIG["app_title"] = edited_title
             _save_private_config(PRIVATE_CONFIG)
 
-        with st.form("google_api_key_form", clear_on_submit=True):
+        with st.form("chat_api_key_override_form", clear_on_submit=True):
             edited_api_key = st.text_input(
-                "API Key (nging di robah)",
+                "API key chat khusus sesi",
                 type="password",
-                placeholder="Tempel API key anyar",
+                placeholder="Tempel API key pikeun sesi ieu",
             )
-            save_api_key = st.form_submit_button("Simpen API key")
+            save_api_key = st.form_submit_button("Gunakan API key sesi")
 
         if save_api_key:
-            edited_api_key = edited_api_key.strip()
-            if not edited_api_key:
-                st.error("API key tidak boleh kosong.")
+            try:
+                set_session_chat_override(st.session_state, edited_api_key)
+            except KeyPoolError as error:
+                st.error(str(error))
             else:
-                previous_api_key = str(st.session_state.google_api_key)
-                manager = _get_drive_sync_manager()
-                resume_quota_sync = (
-                    edited_api_key != previous_api_key
-                    and (
-                        manager.snapshot()["phase"] == "quota_error"
-                        or manager.get_rpd_status(api_key=previous_api_key) is not None
-                    )
-                )
-                PRIVATE_CONFIG["google_api_key"] = edited_api_key
-                PRIVATE_CONFIG["google_api_key_override"] = True
-                _save_private_config(PRIVATE_CONFIG)
-                if resume_quota_sync and folder_id:
-                    if not manager.start_sync(folder_id, edited_api_key):
-                        st.session_state["_quota_resume_start_failed"] = True
                 st.rerun()
 
-        if PRIVATE_CONFIG.get("google_api_key_override") is True:
-            st.caption("Aplikasi memakai API key yang disimpan dari menu ini.")
+        if st.session_state.get("chat_api_key_override"):
+            st.caption(
+                "API key chat khusus ngan ukur aktip dina sesi ieu; "
+                "teu dipaké pikeun indexing atanapi admin."
+            )
             if st.button(
-                "Gunakan key dari konfigurasi server",
-                key="use_server_google_api_key",
+                "Kembali ke API key konfigurasi",
+                key="clear_chat_api_key_override",
             ):
-                PRIVATE_CONFIG.pop("google_api_key", None)
-                PRIVATE_CONFIG.pop("google_api_key_override", None)
-                _save_private_config(PRIVATE_CONFIG)
+                clear_session_chat_override(st.session_state)
                 st.rerun()
 
         with st.form("appearance_settings_form", clear_on_submit=False):
@@ -1518,31 +1543,73 @@ if (
 ):
     _render_admin_login_prompt()
 
-api_key = st.session_state.google_api_key
+CHAT_KEY_RECORDS = get_available_keys("chat", FIRESTORE_CLIENT, KEY_SECRETS)
+INDEX_KEY_RECORDS = get_available_keys("indexing", FIRESTORE_CLIENT, KEY_SECRETS)
+chat_api_key_override = str(
+    st.session_state.get("chat_api_key_override", "")
+).strip()
+chat_api_keys = (
+    [chat_api_key_override]
+    if chat_api_key_override
+    else [item.key for item in CHAT_KEY_RECORDS]
+)
+index_api_keys = [item.key for item in INDEX_KEY_RECORDS]
+api_key = chat_api_keys[0] if chat_api_keys else ""
+index_api_key = index_api_keys[0] if index_api_keys else ""
+index_cache_key = index_api_key or "indexing-key-unavailable"
+model_order_settings = get_model_order(FIRESTORE_CLIENT, KEY_SECRETS)
+chat_model_names = (
+    ordered_models(get_available_chat_models(api_key), model_order_settings)
+    if api_key
+    else []
+)
+_chat_key_by_value = {item.key: item for item in CHAT_KEY_RECORDS}
+
+
+def _chat_model_filter(key: str, models: list[str] | tuple[str, ...]) -> list[str]:
+    record = _chat_key_by_value.get(key)
+    return models_for_key(record, models) if record is not None else list(models)
+
+
+def _record_chat_model_quota(
+    key: str,
+    model: str,
+    error: BaseException,
+) -> None:
+    record_quota(
+        "chat",
+        FIRESTORE_CLIENT,
+        KEY_SECRETS,
+        key,
+        error,
+        model=model,
+    )
+
+
 if not api_key:
-    st.info("Atur GOOGLE_API_KEY sebelum menggunakan fitur pencarian AI.")
+    st.info("Kelompok API key chat belum memiliki key aktif.")
 else:
     _warm_up_models_once(api_key)
 if not folder_id:
     st.info("Atur GOOGLE_DRIVE_FOLDER_ID untuk menghubungkan memori Google Drive.")
 
 drive_authorized = False
-if api_key and folder_id:
+if folder_id:
     try:
         manager = _get_drive_sync_manager()
         current_generation = int(manager.snapshot()["generation"])
         if (
             st.session_state.get("index_folder_id") != folder_id
-            or st.session_state.get("index_api_key") != api_key
+            or st.session_state.get("index_api_key") != index_cache_key
             or st.session_state.get("search_index") is None
         ):
             st.session_state.search_index = _load_cached_local_index(
                 folder_id,
-                api_key,
+                index_cache_key,
                 current_generation,
             )
             st.session_state.index_folder_id = folder_id
-            st.session_state.index_api_key = api_key
+            st.session_state.index_api_key = index_cache_key
     except EOFError:
         st.warning(
             "Indeks FAISS belum terbaca karena berkasnya belum lengkap. "
@@ -1603,11 +1670,11 @@ if api_key and folder_id:
         except (GoogleAuthError, OSError, ValueError) as error:
             st.error(f"Tidak dapat memulai izin Google Drive: {error}")
 
-if api_key and folder_id and drive_authorized:
+if index_api_keys and folder_id and drive_authorized:
     try:
         with st.sidebar:
-            _render_rpd_limit_notice(api_key)
-            _render_drive_sync_status(folder_id, api_key)
+            _render_rpd_limit_notice(index_api_key)
+            _render_drive_sync_status(folder_id, index_api_keys)
     except (GoogleAPIError, GoogleAuthError, HttpError, OSError, ValueError) as error:
         st.warning(f"Sinkronisasi Drive berjalan di latar belakang; indeks lokal tetap digunakan bila tersedia. {error}")
 
@@ -1642,8 +1709,9 @@ if st.session_state.get("admin_authenticated"):
         FIRESTORE_CLIENT,
         _get_drive_sync_manager(),
         folder_id,
-        str(st.session_state.get("google_api_key", "")),
+        index_api_keys,
         drive_authorized,
+        KEY_SECRETS,
     )
     st.stop()
 
@@ -1878,10 +1946,14 @@ if chat_submission is not None:
             or "Aplikasi sedang dalam mode perawatan. Silakan coba kembali nanti."
         )
         st.stop()
-    allowed, policy_notice = question_is_allowed(
-        st.session_state.get("history_stats", {}),
-        int(runtime_config["daily_question_limit"]),
-        datetime.now(_WIB_TIMEZONE),
+    allowed, policy_notice = (
+        (True, "")
+        if chat_api_key_override
+        else question_is_allowed(
+            st.session_state.get("history_stats", {}),
+            int(runtime_config["daily_question_limit"]),
+            datetime.now(_WIB_TIMEZONE),
+        )
     )
     if not allowed:
         st.warning(policy_notice)
@@ -1922,6 +1994,7 @@ if chat_submission is not None:
                 audio_bytes,
                 audio_upload.type or "audio/wav",
                 api_key=api_key,
+                session_key_override=bool(chat_api_key_override),
             )
             audio_preview = {
                 "data": base64.b64encode(audio_bytes).decode("ascii"),
@@ -1967,7 +2040,10 @@ if chat_submission is not None:
         index: FAISS | None = st.session_state.get("search_index")
         response_sources: list[dict[str, str]] = []
         if processing_error is not None:
-            response_text = f"Pesan tidak dapat diproses: {processing_error}"
+            response_text = (
+                "Pesan tidak dapat diproses: "
+                f"{redact_secrets(processing_error, chat_api_keys)}"
+            )
             _render_message_content(response_text)
         elif is_source_link_request(question) and not media_parts:
             response_sources = find_source_link_matches(question, index)
@@ -2033,6 +2109,19 @@ if chat_submission is not None:
                 if supports_local_search
                 else {}
             )
+            key_rotation_options = {}
+            if "api_key_candidates" in answer_parameters:
+                key_rotation_options["api_key_candidates"] = chat_api_keys[1:]
+            if "model_names" in answer_parameters:
+                key_rotation_options["model_names"] = chat_model_names
+            if "model_filter" in answer_parameters:
+                key_rotation_options["model_filter"] = _chat_model_filter
+            if "on_model_quota" in answer_parameters:
+                key_rotation_options["on_model_quota"] = _record_chat_model_quota
+            if "session_key_override" in answer_parameters:
+                key_rotation_options["session_key_override"] = bool(
+                    chat_api_key_override
+                )
             try:
                 if supports_search_progress and supports_answer_streaming:
                     response_text, response_sources = answer_question(
@@ -2042,6 +2131,7 @@ if chat_submission is not None:
                         media_parts=media_parts,
                         on_progress=update_search_progress,
                         on_token=show_answer_token,
+                        **key_rotation_options,
                         **local_search_options,
                     )
                 elif supports_search_progress:
@@ -2051,6 +2141,7 @@ if chat_submission is not None:
                         api_key=api_key,
                         media_parts=media_parts,
                         on_progress=update_search_progress,
+                        **key_rotation_options,
                         **local_search_options,
                     )
                 else:
@@ -2059,11 +2150,18 @@ if chat_submission is not None:
                         question,
                         api_key=api_key,
                         media_parts=media_parts,
+                        **key_rotation_options,
                         **local_search_options,
                     )
+            except ChatKeyQuotaExceeded as error:
+                answer_message.empty()
+                response_text = str(error)
+                search_status.update(label=_santri_status("Pencarian gagal"), state="error")
+                st.warning(response_text)
             except (GoogleAPIError, GoogleGenerativeAIError, ValueError) as error:
                 answer_message.empty()
-                response_text = f"Pencarian gagal: {error}"
+                safe_error = redact_secrets(error, chat_api_keys)
+                response_text = f"Pencarian gagal: {safe_error}"
                 search_status.update(label=_santri_status("Pencarian gagal"), state="error")
                 st.error(response_text)
             else:
@@ -2087,6 +2185,7 @@ if chat_submission is not None:
         displayed_question,
         response_text,
         response_sources,
+        count_for_daily_limit=not bool(chat_api_key_override),
     )
     updated_stats = dict(st.session_state.get("history_stats", {}))
     active_chunk_count = int(updated_stats.get("active_chunk_count", 0))
@@ -2099,12 +2198,13 @@ if chat_submission is not None:
     updated_stats["total_messages"] = (
         int(updated_stats.get("total_messages", 0)) + 2
     )
-    today_wib = datetime.now(_WIB_TIMEZONE).strftime("%Y%m%d")
-    current_day_count = (
-        int(updated_stats.get("day_count", 0))
-        if updated_stats.get("day") == today_wib
-        else 0
-    )
-    updated_stats["day"] = today_wib
-    updated_stats["day_count"] = current_day_count + 1
+    if not chat_api_key_override:
+        today_wib = datetime.now(_WIB_TIMEZONE).strftime("%Y%m%d")
+        current_day_count = (
+            int(updated_stats.get("day_count", 0))
+            if updated_stats.get("day") == today_wib
+            else 0
+        )
+        updated_stats["day"] = today_wib
+        updated_stats["day_count"] = current_day_count + 1
     st.session_state.history_stats = updated_stats

@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 import re
 import time
+from collections.abc import Sequence
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import streamlit as st
 
 from services.admin_logic import hash_settings_password
+from services.ai_service import get_available_chat_models, summarize_faq_questions
 from services.firestore_store import (
     export_admin_users_csv,
     firestore_status,
+    firestore_write_health,
     flush_recent_errors,
     get_admin_chat_history,
     get_admin_faq,
@@ -22,9 +27,25 @@ from services.firestore_store import (
     get_admin_user_chats,
     get_admin_users,
     get_runtime_config,
+    _trip_circuit,
     save_settings_password_hash,
     set_user_blocked,
     update_runtime_config,
+)
+from services.key_pool import (
+    KEY_GROUPS,
+    KeyPoolError,
+    add_key,
+    get_available_keys,
+    get_key_status,
+    get_keys,
+    get_model_order,
+    mask_key,
+    ordered_models,
+    record_quota,
+    remove_key,
+    save_model_order,
+    set_key_enabled,
 )
 from services.model_router import router
 
@@ -139,8 +160,57 @@ def _render_history(client: Any | None) -> None:
             )
 
 
-def _render_faq(client: Any | None) -> None:
+def _read_faq_summary(client: Any | None, fingerprint: str) -> str:
+    if client is None or not firestore_status()["connected"]:
+        return ""
+    try:
+        data = (
+            client.collection("admin_cache")
+            .document("faq_summary")
+            .get(timeout=2.0, retry=None)
+            .to_dict()
+            or {}
+        )
+    except Exception as error:
+        _trip_circuit(RuntimeError(type(error).__name__), "pembacaan ringkesan FAQ")
+        return ""
+    if data.get("fingerprint") == fingerprint:
+        return str(data.get("summary", ""))
+    return ""
+
+
+def _write_faq_summary(
+    client: Any | None,
+    fingerprint: str,
+    summary: str,
+) -> bool:
+    if client is None or not firestore_status()["connected"]:
+        return False
+    try:
+        client.collection("admin_cache").document("faq_summary").set(
+            {
+                "fingerprint": fingerprint,
+                "summary": summary,
+                "updated_at": datetime.now(_WIB),
+            },
+            timeout=2.0,
+        )
+    except Exception as error:
+        _trip_circuit(RuntimeError(type(error).__name__), "penyimpanan ringkesan FAQ")
+        return False
+    return True
+
+
+def _render_faq(
+    client: Any | None,
+    secrets: dict[str, Any],
+    admin_keys: Sequence[str],
+    model_names: Sequence[str],
+) -> None:
     st.subheader("Pertanyaan sering")
+    summary_error = st.session_state.pop("_admin_faq_summary_error", None)
+    if summary_error:
+        st.warning(summary_error)
     faq = _cached("faq", lambda: get_admin_faq(client))
     if faq:
         st.dataframe(
@@ -150,19 +220,176 @@ def _render_faq(client: Any | None) -> None:
         )
     else:
         st.info("Belum ada pertanyaan yang terkumpul.")
-    st.button(
-        "Rangkum dengan AI",
-        disabled=True,
-        help="Fitur ini tersedia setelah kelompok key admin pada Fase 3.",
-        key="admin_ai_summary_disabled",
+    fingerprint = hashlib.sha256(
+        json.dumps(faq, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cached_summary = _cached(
+        f"faq_summary_{fingerprint}",
+        lambda: _read_faq_summary(client, fingerprint),
     )
+    if cached_summary:
+        st.markdown("**Ringkasan tersimpan**")
+        st.write(cached_summary)
+    if not admin_keys:
+        st.caption("Kelompok key admin kosong atanapi sadayana nuju kena limit.")
+    if st.button(
+        "Rangkum dengan AI",
+        disabled=not admin_keys or not faq,
+        key="admin_ai_summary",
+    ):
+        try:
+            summary = summarize_faq_questions(
+                faq,
+                admin_keys,
+                model_names=model_names,
+                on_key_quota=lambda key, error: record_quota(
+                    "admin",
+                    client,
+                    secrets,
+                    key,
+                    error,
+                ),
+            )
+        except ValueError as error:
+            if not get_available_keys("admin", client, secrets):
+                st.session_state["_admin_faq_summary_error"] = str(error)
+                st.rerun()
+            st.warning(str(error))
+        else:
+            st.markdown("**Ringkasan**")
+            st.write(summary)
+            if not _write_faq_summary(client, fingerprint, summary):
+                st.caption("Ringkesan ngan disimpen dina sesi ieu; Firestore teu sayogi.")
+            st.session_state[f"_admin_cache_faq_summary_{fingerprint}"] = {
+                "at": time.monotonic(),
+                "value": summary,
+            }
+
+
+def _render_api_keys(
+    client: Any | None,
+    secrets: dict[str, Any],
+    chat_models: Sequence[str],
+) -> None:
+    st.subheader("Kelompok API key")
+    group_labels = {
+        "chat": "Chat",
+        "indexing": "Indexing",
+        "admin": "Admin",
+    }
+    tabs = st.tabs([group_labels[group] for group in KEY_GROUPS])
+    for tab, group in zip(tabs, KEY_GROUPS):
+        with tab:
+            records = get_keys(group, client, secrets)
+            for record in records:
+                columns = st.columns([2, 1, 2, 1, 1])
+                columns[0].write(record.label)
+                columns[1].code(mask_key(record.key))
+                columns[2].write(
+                    get_key_status(
+                        record,
+                        chat_models if group == "chat" else (),
+                    )
+                )
+                columns[3].write(record.last_error or "—")
+                button_label = "Nonaktifkan" if record.enabled else "Aktifkan"
+                if columns[4].button(
+                    button_label,
+                    key=f"key_toggle_{group}_{record.sid}",
+                ):
+                    try:
+                        set_key_enabled(
+                            group,
+                            client,
+                            secrets,
+                            record.sid,
+                            not record.enabled,
+                        )
+                    except KeyPoolError as error:
+                        st.error(str(error))
+                    else:
+                        st.rerun()
+                if st.button(
+                    "Hapus",
+                    key=f"key_remove_{group}_{record.sid}",
+                ):
+                    try:
+                        remove_key(group, client, secrets, record.sid)
+                    except KeyPoolError as error:
+                        st.error(str(error))
+                    else:
+                        st.rerun()
+            with st.form(f"add_key_form_{group}", clear_on_submit=True):
+                label = st.text_input("Label", key=f"key_label_{group}")
+                secret_key = st.text_input(
+                    "API key anyar",
+                    type="password",
+                    key=f"key_value_{group}",
+                )
+                add = st.form_submit_button("Tambah API key")
+            if add:
+                try:
+                    add_key(group, client, secrets, secret_key, label)
+                except KeyPoolError as error:
+                    st.error(str(error))
+                else:
+                    st.success("API key berhasil ditambahkan sacara terenkripsi.")
+                    st.rerun()
+
+
+def _render_model_order(
+    client: Any | None,
+    secrets: dict[str, Any],
+    chat_keys: Sequence[str],
+) -> None:
+    st.subheader("Urutan model chat")
+    settings = get_model_order(client, secrets)
+    available = (
+        _cached(
+            "available_chat_models",
+            lambda: get_available_chat_models(chat_keys[0]),
+            ttl=600,
+        )
+        if chat_keys
+        else []
+    )
+    mode = st.radio(
+        "Mode",
+        ("Otomatis", "Manual"),
+        index=0 if settings["mode"] == "automatic" else 1,
+        horizontal=True,
+        key="admin_model_order_mode",
+    )
+    selected_models = st.multiselect(
+        "Daftar berurutan",
+        options=available,
+        default=[
+            model for model in settings["models"] if model in available
+        ],
+        disabled=mode != "Manual",
+        key="admin_model_order_models",
+    )
+    if st.button("Simpan urutan model", key="admin_save_model_order"):
+        try:
+            save_model_order(
+                client,
+                "manual" if mode == "Manual" else "automatic",
+                selected_models,
+            )
+        except KeyPoolError as error:
+            st.error(str(error))
+        else:
+            st.success("Urutan model berhasil disimpan.")
+            st.rerun()
 
 
 def _render_drive_sync(
     manager: Any,
     folder_id: str,
-    api_key: str,
+    api_keys: Sequence[str],
     drive_authorized: bool,
+    client: Any | None,
+    secrets: dict[str, Any],
 ) -> None:
     st.subheader("Sinkron Drive")
     snapshot = manager.snapshot()
@@ -179,15 +406,29 @@ def _render_drive_sync(
     elif snapshot["paused"]:
         if st.button("Lanjutkan", key="admin_drive_resume"):
             manager.resume()
-            if not snapshot["running"] and folder_id and api_key:
-                manager.start_sync(folder_id, api_key)
+            if not snapshot["running"] and folder_id and api_keys:
+                manager.start_sync(
+                    folder_id,
+                    api_keys[0],
+                    key_candidates=api_keys[1:],
+                    on_key_quota=lambda key, error: record_quota(
+                        "indexing", client, secrets, key, error, daily=True
+                    ),
+                )
             st.rerun()
     elif st.button(
         "Mulai sinkronisasi",
         key="admin_drive_start",
-        disabled=not (folder_id and api_key and drive_authorized),
+        disabled=not (folder_id and api_keys and drive_authorized),
     ):
-        manager.start_sync(folder_id, api_key)
+        manager.start_sync(
+            folder_id,
+            api_keys[0],
+            key_candidates=api_keys[1:],
+            on_key_quota=lambda key, error: record_quota(
+                "indexing", client, secrets, key, error, daily=True
+            ),
+        )
         st.rerun()
 
     failed_files = [item for item in snapshot["files"] if item["state"] == "failed"]
@@ -199,7 +440,15 @@ def _render_drive_sync(
             left.caption(item.get("error", ""))
             if right.button("Coba ulang", key=f"admin_retry_{item['id']}"):
                 if manager.retry_file(item["id"]):
-                    manager.start_sync(folder_id, api_key)
+                    if api_keys:
+                        manager.start_sync(
+                            folder_id,
+                            api_keys[0],
+                            key_candidates=api_keys[1:],
+                            on_key_quota=lambda key, error: record_quota(
+                                "indexing", client, secrets, key, error, daily=True
+                            ),
+                        )
                 st.rerun()
 
 
@@ -263,10 +512,23 @@ def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
 def _render_health(client: Any | None) -> None:
     st.subheader("Kesehatan sistem")
     status = firestore_status()
+    write_health = firestore_write_health()
     connected = client is not None and status["connected"]
     st.metric("Firestore", "Terkonfigurasi / siap" if connected else "Tidak tersedia")
     if not status["connected"]:
         st.caption(f"Sirkuit terbuka selama sekitar {status['circuit_open_seconds']} detik.")
+    metric_columns = st.columns(4)
+    for column, label, key in zip(
+        metric_columns,
+        ("Tulis berhasil", "Tulis gagal", "Percobaan ulang", "Tulis dibuang"),
+        ("writes_ok", "writes_failed", "writes_retried", "writes_dropped"),
+    ):
+        column.metric(label, write_health[key])
+    st.caption(f"Antrean tulis: {write_health['writes_queued']} dari 200")
+    if write_health["last_error"]:
+        st.caption(f"Kesalahan tulis terakhir: {write_health['last_error']}")
+    if write_health["breaker_open_until"]:
+        st.caption(f"Sirkuit dibuka hingga: {write_health['breaker_open_until']}")
     st.markdown("**Snapshot model**")
     model_snapshot = router.snapshot()
     st.dataframe(model_snapshot, use_container_width=True, hide_index=True)
@@ -314,13 +576,25 @@ def render_dashboard(
     client: Any | None,
     manager: Any,
     folder_id: str,
-    api_key: str,
+    index_keys: Sequence[str],
     drive_authorized: bool,
+    secrets: dict[str, Any],
 ) -> None:
     st.title("Dashboard Admin")
     if st.button("Keluar", key="admin_dashboard_exit"):
         st.session_state["admin_authenticated"] = False
         st.rerun()
+    chat_keys = [
+        item.key for item in get_available_keys("chat", client, secrets)
+    ]
+    admin_keys = [
+        item.key for item in get_available_keys("admin", client, secrets)
+    ]
+    model_settings = get_model_order(client, secrets)
+    available_models = (
+        get_available_chat_models(chat_keys[0]) if chat_keys else []
+    )
+    model_names = ordered_models(available_models, model_settings)
 
     section = st.radio(
         "Menu dashboard",
@@ -330,6 +604,8 @@ def render_dashboard(
             "Pertanyaan sering",
             "Sinkron Drive",
             "Sandi Pengaturan",
+            "API Key",
+            "Urutan model",
             "Kontrol lain",
             "Kesehatan sistem",
         ),
@@ -341,11 +617,22 @@ def render_dashboard(
     elif section == "Riwayat chat":
         _render_history(client)
     elif section == "Pertanyaan sering":
-        _render_faq(client)
+        _render_faq(client, secrets, admin_keys, model_names)
     elif section == "Sinkron Drive":
-        _render_drive_sync(manager, folder_id, api_key, drive_authorized)
+        _render_drive_sync(
+            manager,
+            folder_id,
+            index_keys,
+            drive_authorized,
+            client,
+            secrets,
+        )
     elif section == "Sandi Pengaturan":
         _render_settings_password(client)
+    elif section == "API Key":
+        _render_api_keys(client, secrets, model_names)
+    elif section == "Urutan model":
+        _render_model_order(client, secrets, chat_keys)
     elif section == "Kontrol lain":
         users = _cached("users", lambda: get_admin_users(client))
         _render_controls(client, users)

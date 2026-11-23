@@ -12,6 +12,42 @@
   menggunakan `ADMIN_CODE_HASH` dari Secrets, dan menerapkan perlindungan
   percobaan gagal yang sama.
   Ringkasan AI untuk FAQ sengaja belum diaktifkan sampai Fase 3.
+- **Fase 3 — selesai:** key chat, indexing, dan admin terpisah; key dashboard
+  dienkripsi dengan Fernet; rotasi kuota dan override chat khusus sesi
+  diterapkan; dashboard dapat mengelola key dan urutan model; ringkasan FAQ AI
+  berjalan hanya saat diminta admin.
+- **Perbaikan tulis Firestore:** pasangan riwayat disimpan atomik bersama
+  dokumen pengguna. Statistik harian, FAQ, dan aktivitas per jam dikirim
+  terpisah; antrean tulis memori mempertahankan pekerjaan saat sirkuit terbuka
+  dan menjadwalkan ulang error sementara.
+
+## Cara tes manual Fase 3
+
+1. Atur `ENCRYPTION_KEY` di Streamlit Secrets dengan key Fernet baru yang dibuat
+   secara lokal. Tambahkan `GOOGLE_API_KEY` untuk chat; isi `GOOGLE_API_KEY_INDEX`
+   dan `GOOGLE_API_KEY_ADMIN` hanya bila ingin mengaktifkan indexing dan fitur AI
+   dashboard. Jangan salin key ke log, tiket, atau repositori.
+2. Dari dashboard admin, buka **API Key**. Tambahkan, nonaktifkan, aktifkan, dan
+   hapus key pada masing-masing kelompok. Pastikan tampilan hanya menunjukkan
+   label, sidik jari pendek, dan key tersamar; tiap kelompok hanya memakai key
+   miliknya.
+3. Buka **Urutan model**, pilih **Manual**, atur urutan dari daftar model yang
+   tersedia, lalu simpan. Ubah ke **Otomatis** untuk kembali mengikuti daftar
+   otomatis atau prioritas `GEMINI_CHAT_MODELS`.
+4. Di menu Pengaturan, aktifkan key chat khusus sesi. Kirim pertanyaan dan
+   pastikan kuota harian pengguna tidak bertambah. Jika key sesi mencapai limit,
+   aplikasi menampilkan pesan yang meminta penggantian key dan tidak pindah
+   diam-diam ke key konfigurasi. Tekan **Kembali ke API key konfigurasi** untuk
+   menghapus override sesi.
+5. Untuk menguji rotasi, gunakan key uji dengan kuota rendah pada model teratas.
+   Pastikan aplikasi mencoba model lain di key yang sama sebelum beralih ke key
+   chat lain. Uji indexing dan ringkasan FAQ secara terpisah dengan kelompok
+   masing-masing. Ringkasan FAQ hanya dibuat setelah tombol **Rangkum dengan AI**
+   ditekan dan digunakan ulang bila daftar FAQ tidak berubah.
+6. Jalankan `pytest -q tests/test_key_pool.py tests/test_ai_service.py
+   tests/test_sync_manager.py`, `python -m py_compile app.py services/*.py`, lalu
+   buka aplikasi dengan Streamlit AppTest. Tes tidak memerlukan kredensial
+   layanan produksi; tes integrasi manual sebaiknya memakai proyek uji.
 
 ## Cara tes manual Fase 2
 
@@ -45,15 +81,16 @@ tidak disimpan di Firestore.
 - `app.py` — login admin sebelum jalur percakapan, penerapan kebijakan sesi,
   tampilan pengumuman, dan pemindahan kontrol mulai/jeda/lanjut/coba ulang Drive.
 - `services/firestore_store.py` — batas waktu dan circuit breaker Firestore,
-  penulisan latar, ringkasan statistik WIB, FAQ, konfigurasi admin, riwayat,
-  dan status kesehatan.
+  antrean tulis latar, ringkasan statistik WIB, FAQ, konfigurasi admin,
+  riwayat, dan status kesehatan.
 - `services/admin_logic.py` — verifikasi hash admin, pengelolaan autentikasi
   dan penguncian login, serta pemeriksaan blokir dan batas harian.
 - `services/admin_dashboard.py` — dasbor statistik, riwayat, FAQ, sinkron
   Drive, kontrol, dan kesehatan sistem; modul dimuat setelah login berhasil.
 - `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin.
 - `tests/test_firestore_store.py` — uji kegagalan dan batas waktu riwayat
-  Firestore, serta batas waktu operasi.
+  Firestore, retry tulis, ketahanan saat circuit breaker terbuka, serta
+  isolasi kegagalan statistik dari riwayat.
 - `tests/test_admin_logic.py` — uji normalisasi FAQ, blokir, batas WIB,
   verifikasi PBKDF2, dan penguncian login.
 - `CATATAN_PROYEK.md` — catatan fase, struktur data, keputusan, dan pekerjaan
@@ -72,6 +109,11 @@ tidak disimpan di Firestore.
   aktivitas per jam.
 - `faq/{sha256_pertanyaan_normalisasi}` — pertanyaan yang dinormalisasi,
   tampilan pertanyaan, hitungan, dan waktu terakhir; tidak menyimpan UID.
+- `config/keys_chat`, `config/keys_index`, `config/keys_admin` — daftar key per
+  kelompok. Key disimpan terenkripsi Fernet, bersama ID sidik jari pendek,
+  label, status aktif, cooldown, dan penanda error aman.
+- `config/model_order` — mode dan daftar urutan model yang dipilih admin.
+- `admin_cache/faq_summary` — ringkasan FAQ terakhir beserta fingerprint FAQ.
 - `settings/runtime` — mode pemeliharaan, pengumuman, batas pertanyaan harian,
   serta hash sandi menu Pengaturan yang diatur admin.
 - `system_health/errors` — maksimal 20 catatan kesalahan terakhir dalam satu
@@ -85,6 +127,17 @@ tidak disimpan di Firestore.
 - `ADMIN_CODE_HASH` — hash kode admin, dengan format
   `pbkdf2_sha256$iterasi$salt$hex_digest` atau `scrypt$salt$hex_digest`.
   Jangan menyimpan kode admin dalam teks biasa di kode sumber atau repositori.
+- `GOOGLE_API_KEY`, `GOOGLE_API_KEY_INDEX`, `GOOGLE_API_KEY_ADMIN` — seed key
+  untuk kelompok chat, indexing, dan admin secara terpisah. Key dari satu
+  kelompok tidak pernah dipinjam kelompok lain.
+- `ENCRYPTION_KEY` — key Fernet yang dibutuhkan untuk menambah dan membaca key
+  terenkripsi dari Firestore. Buat secara lokal dengan
+  `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`
+  dan simpan hanya di Secrets. Bila Firestore tidak tersedia, chat tetap
+  memakai seed `GOOGLE_API_KEY` dari Secrets.
+- `GEMINI_CHAT_MODELS` — daftar model opsional dipisahkan koma. Urutan model
+  admin di Firestore mengungguli daftar ini; tanpa keduanya aplikasi memilih
+  urutan otomatis dari model yang tersedia.
 - `FIREBASE_SERVICE_ACCOUNT` — kredensial Firestore yang sudah digunakan.
 
 Untuk membuat hash PBKDF2 secara lokal, jalankan perintah berikut di terminal,
@@ -101,12 +154,21 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
 - Riwayat dan semua pembacaan admin memakai batas waktu maksimum 5 detik tanpa
   percobaan ulang otomatis. Pemuatan riwayat memiliki batas waktu total 5 detik
   dan mengembalikan sesi kosong bila gagal.
-- Kegagalan Firestore mengaktifkan mekanisme pemutus sementara selama 2 menit;
-  pesan kesalahan dicatat sekali per periode. Operasi tulis dikirim ke satu
-  tugas latar dengan batas waktu RPC 10 detik agar urutan potongan tetap terjaga.
-- Satu pertanyaan membuat paling banyak empat penulisan ringkasan: potongan,
-  pengguna, statistik harian, dan FAQ. Ringkasan per jam ditulis terpisah paling
-  banyak sekali per jam per sesi.
+- Pembacaan Firestore yang gagal mengaktifkan mekanisme pemutus sementara
+  selama 2 menit. Antrean tulis dibatasi 200 pekerjaan; saat penuh, pekerjaan
+  tertua dibuang dan penghitung `writes_dropped` bertambah. Error sementara
+  `UNAVAILABLE`, `DEADLINE_EXCEEDED`, dan `ABORTED` dijadwalkan ulang paling
+  banyak tiga kali dengan jeda 1, 3, dan 8 detik. Setelah seluruh retry gagal,
+  pekerjaan tetap di antrean sampai sirkuit tertutup. Error permanen dicatat
+  tanpa retry. Setiap upaya tulis memiliki tenggat 10 detik dan tidak menahan
+  pekerja antrean saat operasi melampaui tenggat.
+- Setiap pertanyaan mengantrekan satu transaksi untuk chunk dan dokumen
+  pengguna, lalu penulisan terpisah untuk `stats/daily.questions` dan FAQ
+  (hanya jika pertanyaan hasil normalisasi tidak kosong). Aktivitas per jam
+  ditulis sebagai operasi tersendiri, paling banyak sekali per jam per sesi.
+  Menu Kesehatan sistem menampilkan `writes_ok`, `writes_failed`,
+  `writes_retried`, `writes_dropped`, error terakhir, dan waktu penutupan
+  circuit breaker.
 - Hash UID dipakai pada ringkasan pengguna unik. FAQ menggunakan hash SHA-256
   dari pertanyaan, sehingga tidak menyimpan UID. Pemeriksaan blokir dan batas
   membaca data pengguna yang sudah dimuat, tanpa membaca Firestore lagi di
@@ -123,6 +185,19 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   hash PBKDF2 sebelum menyimpannya. Hash konfigurasi aktif diprioritaskan
   daripada `SETTINGS_PASSWORD` lama. Pengguna biasa tetap harus memasukkan
   sandi untuk membuka menu.
+- Key chat, indexing, dan admin tidak saling meminjam. Daftar status key di-cache
+  selama 60 detik; kegagalan Firestore tidak menghentikan seed chat dari Secrets.
+  Cooldown kuota harian memakai tengah malam waktu Pasifik, sedangkan 429 per
+  menit memakai cooldown pendek. Chat mencoba model teratas lain pada key yang
+  sama sebelum pindah ke key berikutnya.
+- Override chat hanya disimpan di `st.session_state` dan tidak masuk konfigurasi
+  privat, dashboard, indexing, atau admin. Pemakaian lewat override tidak
+  menaikkan hitungan batas harian pengguna.
+- Daftar key dan perubahan status hanya disimpan saat berubah. Error yang
+  disimpan hanya berupa penanda aman, dan key disamarkan pada pesan kegagalan
+  sinkronisasi serta respons pengguna. Ringkasan FAQ tidak berjalan otomatis;
+  cache hasil di `admin_cache/faq_summary` digunakan hanya untuk fingerprint FAQ
+  yang sama.
 - Daftar percakapan tersimpan di `users/{uid}.saved_chats`, maksimal lima.
   Daftar dan kontrol riwayat ada di sidebar. Tombol untuk menghapus percakapan
   aktif ada di halaman utama, di bawah percakapan; penghapusan semua percakapan
@@ -145,6 +220,5 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   aplikasi berbeda yang menulis ke percakapan yang sama secara bersamaan masih
   dapat berkompetisi; penerapan banyak pekerja latar memerlukan strategi
   transaksi dengan batas waktu RPC yang terkontrol.
-- Fitur ringkasan FAQ dengan AI menunggu kelompok key admin pada Fase 3.
 - Verifikasi belum memakai proyek Firestore produksi; hasil bergantung pada
   aturan IAM dan ketersediaan akun layanan saat penerapan.

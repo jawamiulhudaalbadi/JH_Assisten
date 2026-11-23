@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -23,6 +25,8 @@ HISTORY_WARNING_MESSAGES = 200
 HISTORY_WARNING_CHUNKS = 10
 FIRESTORE_READ_TIMEOUT_SECONDS = 5.0
 FIRESTORE_WRITE_TIMEOUT_SECONDS = 10.0
+FIRESTORE_WRITE_QUEUE_LIMIT = 200
+FIRESTORE_WRITE_RETRY_DELAYS = (1.0, 3.0, 8.0)
 HISTORY_LOAD_TIMEOUT_SECONDS = 5.0
 FIRESTORE_CIRCUIT_SECONDS = 120.0
 RUNTIME_CONFIG_CACHE_SECONDS = 300.0
@@ -47,6 +51,30 @@ _RUNTIME_CONFIG_LOADED_AT = 0.0
 _RECENT_ERRORS: list[dict[str, str]] = []
 _RECENT_ERRORS_LOCK = threading.Lock()
 _ERRORS_FLUSHED_AT = 0.0
+
+
+@dataclass
+class _QueuedWrite:
+    client: Any | None
+    kind: str
+    operation: Any
+    args: tuple[Any, ...]
+    retries: int = 0
+    ready_at: float = 0.0
+
+
+_WRITE_QUEUE: deque[_QueuedWrite] = deque()
+_WRITE_CONDITION = threading.Condition()
+_WRITE_THREAD: threading.Thread | None = None
+_LATEST_WRITE_CLIENT: Any | None = None
+_WRITE_HEALTH_LOCK = threading.Lock()
+_WRITE_HEALTH: dict[str, Any] = {
+    "writes_ok": 0,
+    "writes_failed": 0,
+    "writes_retried": 0,
+    "writes_dropped": 0,
+    "last_error": "",
+}
 
 
 def credentials_json_from_secrets(secrets: Mapping[str, Any]) -> str | None:
@@ -111,6 +139,22 @@ def firestore_status() -> dict[str, Any]:
         "connected": remaining == 0,
         "circuit_open_seconds": round(remaining),
     }
+
+
+def firestore_write_health() -> dict[str, Any]:
+    """Return bounded write-queue and delivery health counters."""
+    with _WRITE_HEALTH_LOCK:
+        health = dict(_WRITE_HEALTH)
+    with _WRITE_CONDITION:
+        health["writes_queued"] = len(_WRITE_QUEUE)
+    with _CIRCUIT_LOCK:
+        remaining = max(0.0, _CIRCUIT_OPEN_UNTIL - time.monotonic())
+    health["breaker_open_until"] = (
+        (_now() + timedelta(seconds=remaining)).isoformat()
+        if remaining
+        else None
+    )
+    return health
 
 
 def _record_recent_error(error: BaseException, context: str) -> None:
@@ -184,14 +228,205 @@ def reset_firestore_circuit() -> None:
     """Reset process-local state for isolated tests."""
     global _CIRCUIT_OPEN_UNTIL, _CIRCUIT_FAILURE_LOGGED
     global _RUNTIME_CONFIG_LOADED_AT, _ERRORS_FLUSHED_AT
+    global _LATEST_WRITE_CLIENT
     with _CIRCUIT_LOCK:
         _CIRCUIT_OPEN_UNTIL = 0.0
         _CIRCUIT_FAILURE_LOGGED = False
+    with _WRITE_CONDITION:
+        _WRITE_QUEUE.clear()
+        _LATEST_WRITE_CLIENT = None
+        _WRITE_CONDITION.notify_all()
+    with _WRITE_HEALTH_LOCK:
+        _WRITE_HEALTH.update(
+            writes_ok=0,
+            writes_failed=0,
+            writes_retried=0,
+            writes_dropped=0,
+            last_error="",
+        )
     with _RUNTIME_CONFIG_LOCK:
         _RUNTIME_CONFIG_LOADED_AT = 0.0
     with _RECENT_ERRORS_LOCK:
         _RECENT_ERRORS.clear()
         _ERRORS_FLUSHED_AT = 0.0
+
+
+def _enqueue_write(
+    client: Any | None,
+    kind: str,
+    operation: Any,
+    *args: Any,
+) -> None:
+    """Queue a bounded write; retries are scheduled without blocking the worker."""
+    global _LATEST_WRITE_CLIENT, _WRITE_THREAD
+    with _WRITE_CONDITION:
+        if client is not None:
+            _LATEST_WRITE_CLIENT = client
+        _append_write_locked(
+            _QueuedWrite(client=client, kind=kind, operation=operation, args=args)
+        )
+        if _WRITE_THREAD is None or not _WRITE_THREAD.is_alive():
+            _WRITE_THREAD = threading.Thread(
+                target=_write_queue_worker,
+                name="firestore-write-queue",
+                daemon=True,
+            )
+            _WRITE_THREAD.start()
+        _WRITE_CONDITION.notify_all()
+
+
+def _append_write_locked(job: _QueuedWrite) -> None:
+    if len(_WRITE_QUEUE) >= FIRESTORE_WRITE_QUEUE_LIMIT:
+        dropped = _WRITE_QUEUE.popleft()
+        with _WRITE_HEALTH_LOCK:
+            _WRITE_HEALTH["writes_dropped"] += 1
+        logger.warning(
+            "Firestore write dropped kind=%s reason=queue_full",
+            dropped.kind,
+        )
+    _WRITE_QUEUE.append(job)
+
+
+def _write_queue_worker() -> None:
+    while True:
+        with _WRITE_CONDITION:
+            while True:
+                now = time.monotonic()
+                client_available = _LATEST_WRITE_CLIENT is not None
+                circuit_wait = _circuit_remaining()
+                ready_index = next(
+                    (
+                        index
+                        for index, item in enumerate(_WRITE_QUEUE)
+                        if item.ready_at <= now
+                    ),
+                    None,
+                )
+                if (
+                    ready_index is not None
+                    and client_available
+                    and circuit_wait <= 0
+                ):
+                    job = _WRITE_QUEUE[ready_index]
+                    del _WRITE_QUEUE[ready_index]
+                    client = (
+                        _LATEST_WRITE_CLIENT
+                        if _LATEST_WRITE_CLIENT is not None
+                        else job.client
+                    )
+                    break
+
+                waits = [
+                    item.ready_at - now
+                    for item in _WRITE_QUEUE
+                    if item.ready_at > now
+                ]
+                if circuit_wait > 0:
+                    waits.append(circuit_wait)
+                _WRITE_CONDITION.wait(timeout=max(0.01, min(waits)) if waits else None)
+
+        try:
+            _run_write_with_timeout(job, client)
+        except Exception as error:
+            _record_write_failure(job, error)
+            if _is_retryable_write_error(error):
+                if job.retries < len(FIRESTORE_WRITE_RETRY_DELAYS):
+                    delay = FIRESTORE_WRITE_RETRY_DELAYS[job.retries]
+                    job.retries += 1
+                    job.ready_at = time.monotonic() + delay
+                    with _WRITE_HEALTH_LOCK:
+                        _WRITE_HEALTH["writes_retried"] += 1
+                    with _WRITE_CONDITION:
+                        _append_write_locked(job)
+                        _WRITE_CONDITION.notify_all()
+                else:
+                    _open_write_circuit()
+                    job.retries = 0
+                    job.ready_at = time.monotonic() + FIRESTORE_CIRCUIT_SECONDS
+                    with _WRITE_CONDITION:
+                        _append_write_locked(job)
+                        _WRITE_CONDITION.notify_all()
+        else:
+            with _WRITE_HEALTH_LOCK:
+                _WRITE_HEALTH["writes_ok"] += 1
+
+
+def _circuit_remaining() -> float:
+    with _CIRCUIT_LOCK:
+        return max(0.0, _CIRCUIT_OPEN_UNTIL - time.monotonic())
+
+
+def _run_write_with_timeout(job: _QueuedWrite, client: Any) -> None:
+    finished = threading.Event()
+    outcome: list[Exception | None] = []
+    deadline = time.monotonic() + FIRESTORE_WRITE_TIMEOUT_SECONDS
+
+    def run() -> None:
+        try:
+            job.operation(client, deadline, *job.args)
+        except Exception as error:
+            outcome.append(error)
+        else:
+            outcome.append(None)
+        finally:
+            finished.set()
+
+    threading.Thread(
+        target=run,
+        name=f"firestore-write-{job.kind}",
+        daemon=True,
+    ).start()
+    if not finished.wait(FIRESTORE_WRITE_TIMEOUT_SECONDS):
+        raise TimeoutError("Firestore write deadline exceeded.")
+    if outcome[0] is not None:
+        raise outcome[0]
+
+
+def _write_error_class(error: BaseException) -> str:
+    return type(error).__name__
+
+
+def _record_write_failure(job: _QueuedWrite, error: BaseException) -> None:
+    error_class = _write_error_class(error)
+    with _WRITE_HEALTH_LOCK:
+        _WRITE_HEALTH["writes_failed"] += 1
+        _WRITE_HEALTH["last_error"] = f"{job.kind}: {error_class}"
+    _record_recent_error(RuntimeError(error_class), f"Firestore write {job.kind}")
+    logger.error(
+        "Firestore write failed kind=%s error_class=%s",
+        job.kind,
+        error_class,
+    )
+
+
+def _is_retryable_write_error(error: BaseException) -> bool:
+    retryable = {
+        "UNAVAILABLE",
+        "SERVICEUNAVAILABLE",
+        "DEADLINE_EXCEEDED",
+        "DEADLINEEXCEEDED",
+        "ABORTED",
+    }
+    error_name = type(error).__name__.upper().replace("_", "")
+    if error_name in {name.replace("_", "") for name in retryable} or isinstance(
+        error, TimeoutError
+    ):
+        return True
+    code = getattr(error, "code", None)
+    if callable(code):
+        code = code()
+    code_name = getattr(code, "name", None) or str(code)
+    return any(name in code_name.upper() for name in retryable)
+
+
+def _open_write_circuit() -> None:
+    global _CIRCUIT_OPEN_UNTIL, _CIRCUIT_FAILURE_LOGGED
+    with _CIRCUIT_LOCK:
+        _CIRCUIT_OPEN_UNTIL = max(
+            _CIRCUIT_OPEN_UNTIL,
+            time.monotonic() + FIRESTORE_CIRCUIT_SECONDS,
+        )
+        _CIRCUIT_FAILURE_LOGGED = True
 
 
 def normalize_question(question: str) -> str:
@@ -1122,136 +1357,196 @@ def enqueue_question_answer(
     question_text: str,
     answer_text: str,
     sources: list[dict[str, Any]],
+    *,
+    count_for_daily_limit: bool = True,
 ) -> None:
-    """Jadwalkan satu penulisan pasangan pesan di thread latar."""
-    if client is None or _circuit_is_open():
-        return
-    _WRITE_EXECUTOR.submit(
-        _persist_question_answer,
+    """Queue history and each independent question summary write."""
+    now = _now()
+    _enqueue_write(
         client,
+        "question_pair",
+        _write_question_pair,
         uid,
         chat_id,
         question_text,
         answer_text,
         sources,
+        now,
+        count_for_daily_limit,
     )
+    _enqueue_write(
+        client,
+        "daily_questions",
+        _write_daily_questions,
+        question_text,
+        _stats_uid(uid),
+        now,
+    )
+    normalized_question = normalize_question(question_text)
+    if normalized_question:
+        _enqueue_write(
+            client,
+            "faq",
+            _write_faq_question,
+            normalized_question,
+            question_text[:500],
+            now,
+        )
 
 
-def _persist_question_answer(
+def _write_question_pair(
     client: Any,
+    deadline: float,
     uid: str,
     chat_id: str,
     question_text: str,
     answer_text: str,
     sources: list[dict[str, Any]],
+    now: datetime,
+    count_for_daily_limit: bool,
 ) -> None:
-    try:
-        from google.cloud import firestore
+    from google.cloud import firestore
 
-        user_ref = client.collection("users").document(uid)
-        chunks_ref = (
-            user_ref.collection("chats").document(chat_id).collection("chunks")
-        )
-        now = _now()
-        stats_uid = _stats_uid(uid)
-        question = {
-            "role": "user",
-            "content": question_text,
-            "timestamp": now,
-            "model_used": None,
-            "sources": [],
-        }
-        answer = {
-            "role": "assistant",
-            "content": answer_text,
-            "timestamp": now,
-            "model_used": None,
-            "sources": sources,
-        }
-        user_snapshot = user_ref.get(
-            timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
-            retry=None,
-        )
-        user_data = user_snapshot.to_dict() or {}
-        latest_chunks = list(
+    user_ref = client.collection("users").document(uid)
+    chunks_ref = user_ref.collection("chats").document(chat_id).collection("chunks")
+    transaction = client.transaction()
+    user_snapshot = _transaction_snapshot(
+        transaction,
+        user_ref,
+        timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
+    )
+    latest_chunks = list(
+        transaction.get(
             chunks_ref.order_by(
                 "__name__", direction=firestore.Query.DESCENDING
-            )
-            .limit(1)
-            .stream(timeout=FIRESTORE_READ_TIMEOUT_SECONDS, retry=None)
+            ).limit(1),
+            timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
+            retry=None,
         )
-        current_chunk = latest_chunks[0] if latest_chunks else None
-        chunk_number = (
-            _chunk_number(current_chunk.id) if current_chunk is not None else 0
-        )
-        current_messages = (
-            (current_chunk.to_dict() or {}).get("messages", [])
-            if current_chunk is not None
-            else []
-        )
-        if not isinstance(current_messages, list):
-            current_messages = []
-        next_messages, needs_new_chunk = append_message_pair(
-            current_messages, question, answer
-        )
-        if needs_new_chunk or current_chunk is None:
-            chunk_number += 1
-        chunk_ref = chunks_ref.document(f"{chunk_number:06d}")
-        day = now.strftime("%Y%m%d")
-        user_fields: dict[str, Any] = {
-            "last_active": now,
-            "active_chat_id": chat_id,
-            "chat_ids": firestore.ArrayUnion([chat_id]),
-            "active_chunk_number": chunk_number,
-            "active_chunk_count": len(next_messages),
-            "total_questions": firestore.Increment(1),
-            "total_messages": firestore.Increment(2),
-            "total_chunks": firestore.Increment(
-                1 if needs_new_chunk or current_chunk is None else 0
-            ),
-            "day": day,
-            "day_count": (
-                int(user_data.get("day_count", 0)) + 1
-                if user_data.get("day") == day
-                else 1
-            ),
-        }
-        if not user_snapshot.exists:
-            user_fields.update({"first_seen": now, "blocked": False})
-
-        normalized_question = normalize_question(question_text)
-        batch = client.batch()
-        batch.set(chunk_ref, {"messages": next_messages, "count": len(next_messages)})
-        batch.set(user_ref, user_fields, merge=True)
-        batch.set(
-            client.collection("stats").document(f"daily_{day}"),
+    )
+    current_chunk = latest_chunks[0] if latest_chunks else None
+    chunk_number = (
+        _chunk_number(current_chunk.id) if current_chunk is not None else 0
+    )
+    current_messages = (
+        (current_chunk.to_dict() or {}).get("messages", [])
+        if current_chunk is not None
+        else []
+    )
+    if not isinstance(current_messages, list):
+        current_messages = []
+    question = {
+        "role": "user",
+        "content": question_text,
+        "timestamp": now,
+        "model_used": None,
+        "sources": [],
+    }
+    answer = {
+        "role": "assistant",
+        "content": answer_text,
+        "timestamp": now,
+        "model_used": None,
+        "sources": sources,
+    }
+    next_messages, needs_new_chunk = append_message_pair(
+        current_messages, question, answer
+    )
+    if needs_new_chunk or current_chunk is None:
+        chunk_number += 1
+    chunk_ref = chunks_ref.document(f"{chunk_number:06d}")
+    day = now.strftime("%Y%m%d")
+    user_data = user_snapshot.to_dict() or {}
+    user_fields: dict[str, Any] = {
+        "last_active": now,
+        "active_chat_id": chat_id,
+        "chat_ids": firestore.ArrayUnion([chat_id]),
+        "active_chunk_number": chunk_number,
+        "active_chunk_count": len(next_messages),
+        "total_questions": firestore.Increment(1),
+        "total_messages": firestore.Increment(2),
+        "total_chunks": firestore.Increment(
+            1 if needs_new_chunk or current_chunk is None else 0
+        ),
+    }
+    if count_for_daily_limit:
+        user_fields.update(
             {
-                "questions": firestore.Increment(1),
-                "uids": firestore.ArrayUnion([stats_uid]),
-            },
-            merge=True,
+                "day": day,
+                "day_count": (
+                    int(user_data.get("day_count", 0)) + 1
+                    if user_data.get("day") == day
+                    else 1
+                ),
+            }
         )
-        if normalized_question:
-            faq_id = hashlib.sha256(normalized_question.encode("utf-8")).hexdigest()
-            batch.set(
-                client.collection("faq").document(faq_id),
-                {
-                    "question": normalized_question,
-                    "display_question": question_text[:500],
-                    "count": firestore.Increment(1),
-                    "last_seen": now,
-                },
-                merge=True,
-            )
-        batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
-    except Exception as error:
-        _trip_circuit(error, f"penyimpanan riwayat perangkat {uid[:6]}")
+    if not user_snapshot.exists:
+        user_fields.update({"first_seen": now, "blocked": False})
+
+    transaction.set(
+        chunk_ref,
+        {"messages": next_messages, "count": len(next_messages)},
+    )
+    transaction.set(user_ref, user_fields, merge=True)
+    transaction.commit(
+        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+        retry=None,
+    )
+
+
+def _write_daily_questions(
+    client: Any,
+    deadline: float,
+    question_text: str,
+    stats_uid: str,
+    now: datetime,
+) -> None:
+    from google.cloud import firestore
+
+    batch = client.batch()
+    batch.set(
+        client.collection("stats").document(f"daily_{now:%Y%m%d}"),
+        {
+            "questions": firestore.Increment(1),
+            "uids": firestore.ArrayUnion([stats_uid]),
+        },
+        merge=True,
+    )
+    batch.commit(
+        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+        retry=None,
+    )
+
+
+def _write_faq_question(
+    client: Any,
+    deadline: float,
+    normalized_question: str,
+    display_question: str,
+    now: datetime,
+) -> None:
+    from google.cloud import firestore
+
+    faq_id = hashlib.sha256(normalized_question.encode("utf-8")).hexdigest()
+    batch = client.batch()
+    batch.set(
+        client.collection("faq").document(faq_id),
+        {
+            "question": normalized_question,
+            "display_question": display_question,
+            "count": firestore.Increment(1),
+            "last_seen": now,
+        },
+        merge=True,
+    )
+    batch.commit(
+        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+        retry=None,
+    )
 
 
 def mark_active(client: Any | None, uid: str) -> None:
     """Catat aktivitas paling banyak sekali per jam per sesi."""
-    if client is None or _circuit_is_open():
-        return
     now = _now()
     previous = st.session_state.get("last_active_written_at")
     hour_key = now.strftime("%Y%m%d%H")
@@ -1261,56 +1556,95 @@ def mark_active(client: Any | None, uid: str) -> None:
     ):
         return
     st.session_state.last_active_written_at = now
-    _WRITE_EXECUTOR.submit(_mark_active, client, uid, now, hour_key)
+    _enqueue_write(client, "active_user", _write_active_user, uid, now)
+    _enqueue_write(
+        client,
+        "hourly_activity",
+        _write_hourly_activity,
+        uid,
+        now,
+        hour_key,
+    )
+    _enqueue_write(client, "daily_activity", _write_daily_activity, uid, now)
 
 
-def _mark_active(client: Any, uid: str, now: datetime, hour_key: str) -> None:
-    try:
-        from google.cloud import firestore
+def _write_active_user(
+    client: Any, deadline: float, uid: str, now: datetime
+) -> None:
+    from google.cloud import firestore
 
-        user_ref = client.collection("users").document(uid)
-        user_snapshot = user_ref.get(
-            timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
-            retry=None,
-        )
-        fields: dict[str, Any] = {"last_active": now}
-        if not user_snapshot.exists:
-            fields.update(
-                {
-                    "first_seen": now,
-                    "total_questions": 0,
-                    "total_messages": 0,
-                    "total_chunks": 0,
-                    "blocked": False,
-                    "day": now.strftime("%Y%m%d"),
-                    "day_count": 0,
-                }
-            )
-
-        batch = client.batch()
-        batch.set(user_ref, fields, merge=True)
-        batch.set(
-            client.collection("stats").document(f"hourly_{hour_key}"),
+    user_ref = client.collection("users").document(uid)
+    transaction = client.transaction()
+    snapshot = _transaction_snapshot(
+        transaction,
+        user_ref,
+        timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
+    )
+    fields: dict[str, Any] = {"last_active": now}
+    if not snapshot.exists:
+        fields.update(
             {
-                "uids": firestore.ArrayUnion([_stats_uid(uid)]),
-                "active_at": {_stats_uid(uid): now},
-            },
+                "first_seen": now,
+                "total_questions": 0,
+                "total_messages": 0,
+                "total_chunks": 0,
+                "blocked": False,
+                "day": now.strftime("%Y%m%d"),
+                "day_count": 0,
+            }
+        )
+        transaction.set(
+            client.collection("stats").document("global"),
+            {"total_devices": firestore.Increment(1)},
             merge=True,
         )
-        batch.set(
-            client.collection("stats").document(f"daily_{now:%Y%m%d}"),
-            {"uids": firestore.ArrayUnion([_stats_uid(uid)])},
-            merge=True,
-        )
-        if not user_snapshot.exists:
-            batch.set(
-                client.collection("stats").document("global"),
-                {"total_devices": firestore.Increment(1)},
-                merge=True,
-            )
-        batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
-    except Exception as error:
-        _trip_circuit(error, f"pencatatan aktivitas perangkat {uid[:6]}")
+    transaction.set(user_ref, fields, merge=True)
+    transaction.commit(
+        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+        retry=None,
+    )
+
+
+def _write_hourly_activity(
+    client: Any,
+    deadline: float,
+    uid: str,
+    now: datetime,
+    hour_key: str,
+) -> None:
+    from google.cloud import firestore
+
+    hashed_uid = _stats_uid(uid)
+    batch = client.batch()
+    batch.set(
+        client.collection("stats").document(f"hourly_{hour_key}"),
+        {
+            "uids": firestore.ArrayUnion([hashed_uid]),
+            "active_at": {hashed_uid: now},
+        },
+        merge=True,
+    )
+    batch.commit(
+        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+        retry=None,
+    )
+
+
+def _write_daily_activity(
+    client: Any, deadline: float, uid: str, now: datetime
+) -> None:
+    from google.cloud import firestore
+
+    batch = client.batch()
+    batch.set(
+        client.collection("stats").document(f"daily_{now:%Y%m%d}"),
+        {"uids": firestore.ArrayUnion([_stats_uid(uid)])},
+        merge=True,
+    )
+    batch.commit(
+        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+        retry=None,
+    )
 
 
 def clear_user_history(client: Any | None, uid: str) -> None:
