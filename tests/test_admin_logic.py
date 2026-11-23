@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from services.admin_logic import (
     process_admin_login,
     question_is_allowed,
+    register_admin_button_click,
     verify_admin_code,
 )
 from services.firestore_store import normalize_question
@@ -61,6 +62,8 @@ class AdminLogicTests(unittest.TestCase):
         )
         self.assertTrue(state["admin_authenticated"])
         self.assertEqual(state["admin_failed_attempts"], 0)
+        self.assertFalse(state["_admin_login_prompt_open"])
+        self.assertEqual(state["_admin_button_clicks"], 0)
 
     def test_admin_login_locks_after_five_wrong_codes(self) -> None:
         salt = b"unit-test-salt"
@@ -79,6 +82,17 @@ class AdminLogicTests(unittest.TestCase):
         )
         self.assertNotIn("admin_authenticated", state)
         self.assertIn("terkunci", str(state["_admin_login_notice"]))
+
+    def test_sidebar_admin_prompt_opens_after_three_button_clicks(self) -> None:
+        state: dict[str, object] = {}
+
+        self.assertFalse(register_admin_button_click(state))
+        self.assertEqual(state["_admin_button_clicks"], 1)
+        self.assertFalse(register_admin_button_click(state))
+        self.assertEqual(state["_admin_button_clicks"], 2)
+        self.assertTrue(register_admin_button_click(state))
+        self.assertTrue(state["_admin_login_prompt_open"])
+        self.assertEqual(state["_admin_button_clicks"], 0)
 
 
 if __name__ == "__main__":

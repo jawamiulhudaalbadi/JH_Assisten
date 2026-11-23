@@ -77,6 +77,8 @@ def process_admin_login(
     if verify_admin_code(code, encoded_hash):
         session_state["admin_failed_attempts"] = 0
         session_state.pop("admin_locked_until", None)
+        session_state["_admin_login_prompt_open"] = False
+        session_state["_admin_button_clicks"] = 0
         session_state["admin_authenticated"] = True
         session_state.pop("_admin_login_notice", None)
         return True
@@ -93,6 +95,20 @@ def process_admin_login(
         session_state["_admin_login_notice"] = (
             f"Kode admin salah ({attempts}/5 percobaan)."
         )
+    return False
+
+
+def register_admin_button_click(
+    session_state: MutableMapping[str, object],
+) -> bool:
+    """Open the login prompt after three sidebar button clicks."""
+    clicks = int(session_state.get("_admin_button_clicks", 0)) + 1
+    if clicks >= 3:
+        session_state["_admin_button_clicks"] = 0
+        session_state["_admin_login_prompt_open"] = True
+        return True
+
+    session_state["_admin_button_clicks"] = clicks
     return False
 
 

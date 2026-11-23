@@ -25,7 +25,6 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
-from streamlit_javascript import st_javascript
 from PIL import Image
 from google.api_core.exceptions import GoogleAPIError
 from google.auth.exceptions import GoogleAuthError
@@ -49,7 +48,11 @@ from services.gdrive_service import (
     save_oauth_callback,
 )
 from services.device_identity import get_device_uid
-from services.admin_logic import process_admin_login, question_is_allowed
+from services.admin_logic import (
+    process_admin_login,
+    question_is_allowed,
+    register_admin_button_click,
+)
 from services.firestore_store import (
     HISTORY_WARNING_CHUNKS,
     HISTORY_WARNING_MESSAGES,
@@ -908,43 +911,6 @@ def _process_admin_command(command: str) -> bool:
     return True
 
 
-_ADMIN_TITLE_CLICK_SCRIPT = """
-new Promise(resolve => {
-  const document = window.parent.document;
-  let clicks = 0;
-  let resetTimer;
-  const onClick = event => {
-    if (!event.target.closest(".app-brand-title")) return;
-    if (clicks === 0) {
-      resetTimer = window.setTimeout(() => { clicks = 0; }, 3000);
-    }
-    clicks += 1;
-    if (clicks === 7) {
-      window.clearTimeout(resetTimer);
-      document.removeEventListener("click", onClick);
-      resolve("admin-title-clicked");
-    }
-  };
-  document.addEventListener("click", onClick);
-})
-"""
-
-
-def _render_admin_title_click_listener() -> None:
-    if st.session_state.get("admin_authenticated"):
-        return
-
-    generation = int(st.session_state.get("_admin_title_watch_generation", 0))
-    result = st_javascript(
-        _ADMIN_TITLE_CLICK_SCRIPT,
-        key=f"admin_title_click_listener_{generation}",
-    )
-    if result == "admin-title-clicked":
-        st.session_state["_admin_title_watch_generation"] = generation + 1
-        st.session_state["_admin_login_prompt_open"] = True
-        st.rerun()
-
-
 if "app_title" not in st.session_state:
     st.session_state.app_title = str(
         PRIVATE_CONFIG.get("app_title", "JH Asisten AI ")
@@ -1066,7 +1032,6 @@ footer { display: none !important; }
     font-weight: 700;
     letter-spacing: -0.02em;
     color: __TEXT__;
-    cursor: pointer;
 }
 .app-brand-title::after {
     content: "";
@@ -1471,6 +1436,19 @@ with st.sidebar:
             else:
                 st.rerun()
 
+    st.divider()
+    if st.button("Admin", key="admin_access_trigger", use_container_width=True):
+        register_admin_button_click(st.session_state)
+    remaining_admin_clicks = 3 - int(
+        st.session_state.get("_admin_button_clicks", 0)
+    )
+    if remaining_admin_clicks < 3 and not st.session_state.get(
+        "_admin_login_prompt_open"
+    ):
+        st.caption(
+            f"Klik Admin {remaining_admin_clicks} kali lagi untuk membuka login."
+        )
+
 
 def _render_header() -> None:
     title_html = (
@@ -1488,34 +1466,37 @@ def _render_header() -> None:
 
 
 def _render_admin_login_prompt() -> None:
-    st.subheader("Login dashboard admin")
-    with st.form("admin_title_login_form", clear_on_submit=True):
-        code = st.text_input("Kode admin", type="password")
-        submitted = st.form_submit_button("Masuk")
+    with st.sidebar:
+        st.subheader("Login dashboard admin")
+        with st.form("admin_sidebar_login_form", clear_on_submit=True):
+            code = st.text_input("Kode admin", type="password")
+            submitted = st.form_submit_button("Masuk")
 
-    if submitted:
-        authenticated = process_admin_login(
-            code.strip(),
-            ADMIN_CODE_HASH,
-            st.session_state,
-            time.monotonic(),
-        )
-        if authenticated:
+        if submitted:
+            authenticated = process_admin_login(
+                code.strip(),
+                ADMIN_CODE_HASH,
+                st.session_state,
+                time.monotonic(),
+            )
+            if authenticated:
+                st.rerun()
+
+            notice = st.session_state.pop("_admin_login_notice", None)
+            if notice:
+                st.error(notice)
+
+        if st.button("Tutup login admin", key="close_admin_sidebar_login"):
             st.session_state["_admin_login_prompt_open"] = False
+            st.session_state["_admin_button_clicks"] = 0
             st.rerun()
-
-        notice = st.session_state.pop("_admin_login_notice", None)
-        if notice:
-            st.error(notice)
-
-    if st.button("Tutup login admin", key="close_admin_title_login"):
-        st.session_state["_admin_login_prompt_open"] = False
-        st.rerun()
 
 
 _render_header()
-_render_admin_title_click_listener()
-if st.session_state.get("_admin_login_prompt_open"):
+if (
+    st.session_state.get("_admin_login_prompt_open")
+    and not st.session_state.get("admin_authenticated")
+):
     _render_admin_login_prompt()
 
 api_key = st.session_state.google_api_key

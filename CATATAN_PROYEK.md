@@ -5,10 +5,11 @@
 - **Fase 1 — selesai:** operasi Firestore dibatasi, chat tetap berjalan saat
   Firestore gagal, statistik memakai WIB, pertanyaan FAQ dihitung tanpa UID, dan
   sandi Pengaturan dipindahkan ke Secrets.
-- **Fase 2 — selesai:** login admin melalui `/admin` atau klik judul aplikasi
-  7 kali dalam 3 detik, dashboard, kebijakan pemeliharaan, pengumuman, blokir
-  dan batas harian, serta kontrol sinkronisasi tersedia. Keduanya memakai
-  `ADMIN_CODE_HASH` dari Secrets dan perlindungan percobaan login yang sama.
+- **Fase 2 — selesai:** login admin melalui `/admin` atau tombol **Admin**
+  pada sidebar (klik 3 kali), dashboard, kebijakan pemeliharaan, pengumuman,
+  blokir dan batas harian, serta kontrol sinkronisasi tersedia. Keduanya
+  memakai `ADMIN_CODE_HASH` dari Secrets dan perlindungan percobaan login yang
+  sama.
   Ringkasan AI untuk FAQ sengaja belum diaktifkan sampai Fase 3.
 
 ## Berkas yang diubah atau ditambahkan
@@ -52,6 +53,15 @@
   `pbkdf2_sha256$iterasi$salt$hex_digest` atau `scrypt$salt$hex_digest`.
   Jangan menyimpan kode admin teks biasa di source code atau repositori.
 - `FIREBASE_SERVICE_ACCOUNT` — kredensial Firestore yang sudah digunakan.
+
+Untuk membuat hash PBKDF2 secara lokal, jalankan perintah berikut di terminal,
+lalu salin hasilnya ke `ADMIN_CODE_HASH` pada Streamlit Cloud Secrets:
+
+```sh
+python -c 'import getpass, hashlib, secrets; p=getpass.getpass("Kode admin: ").encode(); s=secrets.token_hex(16); d=hashlib.pbkdf2_hmac("sha256", p, s.encode(), 200000).hex(); print(f"pbkdf2_sha256$200000${s}${d}")'
+```
+
+Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
 
 ## Keputusan desain
 
