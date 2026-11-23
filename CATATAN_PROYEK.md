@@ -90,8 +90,10 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   `SETTINGS_PASSWORD` heubeul. Pamaké biasa tetep kudu asupkeun sandi pikeun
   muka menu.
 - Daptar chat simpan disimpen dina `users/{uid}.saved_chats`, maksimal lima.
-  Nyimpen chat ngaranana tuluy muka chat anyar; ngahapus chat aktif jeung
-  ngahapus sakabéh chat mangrupa dua aksi misah anu duanana menta konfirmasi.
+  Daptar jeung kontrol riwayat aya dina sidebar. Tombol ngahapus chat aktif
+  aya dina halaman utama di handapeun paguneman; ngahapus sakabéh chat tetap
+  jadi aksi misah dina sidebar. Duanana menta konfirmasi. Nyimpen chat
+  ngaranana tuluy muka chat anyar.
 - Data aktif baru memakai timestamp untuk hitungan satu jam. Dokumen lama yang
   hanya berisi daftar UID ditampilkan sebagai perkiraan karena tidak memiliki
   waktu aktivitas.

@@ -1659,8 +1659,111 @@ if (
 ):
     st.sidebar.warning(TEKS["history_warning"])
 
-if st.session_state.pop("_history_cleared_notice", False):
-    st.success(TEKS["clear_history_done"])
+with st.sidebar:
+    st.divider()
+    st.subheader("Riwayat Paguneman")
+    if saved_chats_error:
+        st.warning(saved_chats_error)
+    if st.session_state.pop("_history_cleared_notice", False):
+        st.success(TEKS["clear_history_done"])
+    if st.session_state.pop("_chat_saved_notice", False):
+        st.success("Paguneman disimpen. Paguneman anyar parantos dibuka.")
+    if st.session_state.pop("_all_chats_deleted_notice", False):
+        st.success(TEKS["delete_all_history_done"])
+
+    current_chat_is_saved = any(
+        item["chat_id"] == chat_id for item in saved_chats
+    )
+    save_disabled = (
+        not st.session_state.messages
+        or (len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved)
+    )
+    with st.form("save_named_chat_form", clear_on_submit=True):
+        saved_chat_name = st.text_input(
+            "Ngaran riwayat",
+            max_chars=60,
+            placeholder="Conto: Patarosan fikih",
+        )
+        st.caption("Simpen paguneman ieu kalayan nami, tuluy muka obrolan anyar.")
+        save_chat = st.form_submit_button(
+            "Simpan Paguneman",
+            disabled=save_disabled,
+            use_container_width=True,
+        )
+    if save_disabled:
+        if not st.session_state.messages:
+            st.caption("Ajukan patarosan heula saméméh nyimpen paguneman.")
+        elif len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved:
+            st.caption(
+                f"Maksimal {SAVED_CHAT_LIMIT} paguneman. Pupus heula salah sahiji "
+                "paguneman simpen."
+            )
+    if save_chat:
+        try:
+            save_named_chat(
+                FIRESTORE_CLIENT,
+                DEVICE_UID,
+                chat_id,
+                saved_chat_name,
+            )
+        except SavedChatLimitError as error:
+            st.warning(str(error))
+        except (ChatStoreError, ValueError) as error:
+            st.error(f"Paguneman teu tiasa disimpen: {error}")
+        else:
+            st.session_state._chat_saved_notice = True
+            _start_new_chat()
+            st.rerun()
+
+    st.markdown(f"**Paguneman disimpen ({len(saved_chats)}/{SAVED_CHAT_LIMIT})**")
+    st.caption("Pencét ngaran pikeun muka deui.")
+    for saved_chat in saved_chats:
+        saved_chat_id = saved_chat["chat_id"]
+        label = saved_chat["name"]
+        if saved_chat_id == chat_id:
+            label = f"✓ {label}"
+        if st.button(
+            label,
+            key=f"open_saved_chat_{saved_chat_id}",
+            use_container_width=True,
+        ):
+            st.query_params["chat"] = saved_chat_id
+            st.rerun()
+
+    if st.button(TEKS["delete_all_history"], key="delete_all_chats"):
+        st.session_state.delete_all_chats_confirmation = True
+    if st.session_state.get("delete_all_chats_confirmation"):
+        st.warning(TEKS["delete_all_history_confirm"])
+        confirm_columns = st.columns(2)
+        if confirm_columns[0].button(
+            TEKS["clear_history_confirm_button"],
+            key="confirm_delete_all_chats",
+        ):
+            try:
+                delete_all_user_chats(FIRESTORE_CLIENT, DEVICE_UID)
+            except ChatStoreError as error:
+                st.error(f"Sadaya paguneman teu tiasa dipupus: {error}")
+            else:
+                history_stats = dict(st.session_state.get("history_stats", {}))
+                history_stats.update(
+                    {
+                        "total_messages": 0,
+                        "total_chunks": 0,
+                        "active_chunk_count": 0,
+                        "active_chunk_number": 0,
+                    }
+                )
+                st.session_state.history_stats = history_stats
+                st.session_state.delete_all_chats_confirmation = False
+                st.session_state._all_chats_deleted_notice = True
+                _start_new_chat()
+                st.rerun()
+        if confirm_columns[1].button(
+            TEKS["clear_history_cancel"],
+            key="cancel_delete_all_chats",
+        ):
+            st.session_state.delete_all_chats_confirmation = False
+            st.rerun()
 
 for message in st.session_state.messages:
     if message["role"] == "assistant":
@@ -1685,77 +1788,8 @@ for message in st.session_state.messages:
                 f"history_copy_{len(st.session_state.messages)}_{id(message)}",
             )
 
-if st.session_state.pop("_chat_saved_notice", False):
-    st.success("Paguneman disimpen. Paguneman anyar parantos dibuka.")
 if st.session_state.pop("_chat_deleted_notice", False):
     st.success(TEKS["clear_history_done"])
-if st.session_state.pop("_all_chats_deleted_notice", False):
-    st.success(TEKS["delete_all_history_done"])
-
-st.divider()
-st.subheader("Riwayat Paguneman")
-if saved_chats_error:
-    st.warning(saved_chats_error)
-current_chat_is_saved = any(
-    item["chat_id"] == chat_id for item in saved_chats
-)
-save_disabled = (
-    not st.session_state.messages
-    or (len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved)
-)
-with st.form("save_named_chat_form", clear_on_submit=True):
-    saved_chat_name = st.text_input(
-        "Ngaran riwayat",
-        max_chars=60,
-        placeholder="Conto: Patarosan fikih",
-    )
-    st.caption("Simpen paguneman ieu kalayan nami, tuluy muka obrolan anyar.")
-    save_chat = st.form_submit_button(
-        "Simpan Paguneman",
-        disabled=save_disabled,
-        use_container_width=True,
-    )
-if save_disabled:
-    if not st.session_state.messages:
-        st.caption("Ajukan patarosan heula saméméh nyimpen paguneman.")
-    elif len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved:
-        st.caption(
-            f"Maksimal {SAVED_CHAT_LIMIT} paguneman. Pupus heula salah sahiji "
-            "paguneman simpen."
-        )
-if save_chat:
-    try:
-        save_named_chat(
-            FIRESTORE_CLIENT,
-            DEVICE_UID,
-            chat_id,
-            saved_chat_name,
-        )
-    except SavedChatLimitError as error:
-        st.warning(str(error))
-    except (ChatStoreError, ValueError) as error:
-        st.error(f"Paguneman teu tiasa disimpen: {error}")
-    else:
-        st.session_state._chat_saved_notice = True
-        _start_new_chat()
-        st.rerun()
-
-st.markdown(f"**Paguneman disimpen ({len(saved_chats)}/{SAVED_CHAT_LIMIT})**")
-st.caption(
-    "Pencét ngaran pikeun muka deui. Bersihkan riwayat ngahapus chat aktif wungkul."
-)
-for saved_chat in saved_chats:
-    saved_chat_id = saved_chat["chat_id"]
-    label = saved_chat["name"]
-    if saved_chat_id == chat_id:
-        label = f"✓ {label}"
-    if st.button(
-        label,
-        key=f"open_saved_chat_{saved_chat_id}",
-        use_container_width=True,
-    ):
-        st.query_params["chat"] = saved_chat_id
-        st.rerun()
 
 if st.button(TEKS["clear_history"], key="clear_active_chat"):
     st.session_state.clear_active_chat_confirmation = True
@@ -1767,7 +1801,11 @@ if st.session_state.get("clear_active_chat_confirmation"):
         key="confirm_clear_active_chat",
     ):
         try:
-            deleted_stats = delete_user_chat(FIRESTORE_CLIENT, DEVICE_UID, chat_id)
+            deleted_stats = delete_user_chat(
+                FIRESTORE_CLIENT,
+                DEVICE_UID,
+                chat_id,
+            )
         except (ChatStoreError, ValueError) as error:
             st.error(f"Paguneman teu tiasa dipupus: {error}")
         else:
@@ -1783,41 +1821,6 @@ if st.session_state.get("clear_active_chat_confirmation"):
         key="cancel_clear_active_chat",
     ):
         st.session_state.clear_active_chat_confirmation = False
-        st.rerun()
-
-if st.button(TEKS["delete_all_history"], key="delete_all_chats"):
-    st.session_state.delete_all_chats_confirmation = True
-if st.session_state.get("delete_all_chats_confirmation"):
-    st.warning(TEKS["delete_all_history_confirm"])
-    confirm_columns = st.columns(2)
-    if confirm_columns[0].button(
-        TEKS["clear_history_confirm_button"],
-        key="confirm_delete_all_chats",
-    ):
-        try:
-            delete_all_user_chats(FIRESTORE_CLIENT, DEVICE_UID)
-        except ChatStoreError as error:
-            st.error(f"Sadaya paguneman teu tiasa dipupus: {error}")
-        else:
-            history_stats = dict(st.session_state.get("history_stats", {}))
-            history_stats.update(
-                {
-                    "total_messages": 0,
-                    "total_chunks": 0,
-                    "active_chunk_count": 0,
-                    "active_chunk_number": 0,
-                }
-            )
-            st.session_state.history_stats = history_stats
-            st.session_state.delete_all_chats_confirmation = False
-            st.session_state._all_chats_deleted_notice = True
-            _start_new_chat()
-            st.rerun()
-    if confirm_columns[1].button(
-        TEKS["clear_history_cancel"],
-        key="cancel_delete_all_chats",
-    ):
-        st.session_state.delete_all_chats_confirmation = False
         st.rerun()
 
 def _santri_status(message: str) -> str:
