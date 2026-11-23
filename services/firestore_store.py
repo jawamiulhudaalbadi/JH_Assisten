@@ -1350,25 +1350,23 @@ def _save_named_chat(
     from google.cloud import firestore
 
     user_ref = client.collection("users").document(uid)
-    transaction = client.transaction()
-
-    @firestore.transactional
-    def save(transaction: Any) -> list[dict[str, str]]:
-        snapshot = _transaction_snapshot(transaction, user_ref)
-        user_data = snapshot.to_dict() or {}
-        saved = _valid_saved_chats(user_data.get("saved_chats", []))
-        saved = _upsert_saved_chat(saved, chat_id, name)
-        transaction.set(
-            user_ref,
-            {
-                "saved_chats": saved,
-                "chat_ids": firestore.ArrayUnion([chat_id]),
-            },
-            merge=True,
-        )
-        return saved
-
-    return save(transaction)
+    snapshot = user_ref.get(
+        timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+        retry=None,
+    )
+    user_data = snapshot.to_dict() or {}
+    saved = _valid_saved_chats(user_data.get("saved_chats", []))
+    saved = _upsert_saved_chat(saved, chat_id, name)
+    user_ref.set(
+        {
+            "saved_chats": saved,
+            "chat_ids": firestore.ArrayUnion([chat_id]),
+        },
+        merge=True,
+        timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS,
+        retry=None,
+    )
+    return saved
 
 
 def delete_user_chat(
@@ -1581,89 +1579,89 @@ def _write_question_pair(
 
     user_ref = client.collection("users").document(uid)
     chunks_ref = user_ref.collection("chats").document(chat_id).collection("chunks")
-    transaction = client.transaction()
-    user_snapshot = _transaction_snapshot(
-        transaction,
-        user_ref,
-        timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
-    )
-    latest_chunks = list(
-        transaction.get(
-            chunks_ref.order_by(
-                "__name__", direction=firestore.Query.DESCENDING
-            ).limit(1),
-            timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
-            retry=None,
-        )
-    )
-    current_chunk = latest_chunks[0] if latest_chunks else None
-    chunk_number = (
-        _chunk_number(current_chunk.id) if current_chunk is not None else 0
-    )
-    current_messages = (
-        (current_chunk.to_dict() or {}).get("messages", [])
-        if current_chunk is not None
-        else []
-    )
-    if not isinstance(current_messages, list):
-        current_messages = []
-    question = {
-        "role": "user",
-        "content": question_text,
-        "timestamp": now,
-        "model_used": None,
-        "sources": [],
-    }
-    answer = {
-        "role": "assistant",
-        "content": answer_text,
-        "timestamp": now,
-        "model_used": None,
-        "sources": sources,
-    }
-    next_messages, needs_new_chunk = append_message_pair(
-        current_messages, question, answer
-    )
-    if needs_new_chunk or current_chunk is None:
-        chunk_number += 1
-    chunk_ref = chunks_ref.document(f"{chunk_number:06d}")
-    day = now.strftime("%Y%m%d")
-    user_data = user_snapshot.to_dict() or {}
-    user_fields: dict[str, Any] = {
-        "last_active": now,
-        "active_chat_id": chat_id,
-        "chat_ids": firestore.ArrayUnion([chat_id]),
-        "active_chunk_number": chunk_number,
-        "active_chunk_count": len(next_messages),
-        "total_questions": firestore.Increment(1),
-        "total_messages": firestore.Increment(2),
-        "total_chunks": firestore.Increment(
-            1 if needs_new_chunk or current_chunk is None else 0
-        ),
-    }
-    if count_for_daily_limit:
-        user_fields.update(
-            {
-                "day": day,
-                "day_count": (
-                    int(user_data.get("day_count", 0)) + 1
-                    if user_data.get("day") == day
-                    else 1
-                ),
-            }
-        )
-    if not user_snapshot.exists:
-        user_fields.update({"first_seen": now, "blocked": False})
 
-    transaction.set(
-        chunk_ref,
-        {"messages": next_messages, "count": len(next_messages)},
-    )
-    transaction.set(user_ref, user_fields, merge=True)
-    transaction.commit(
-        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
-        retry=None,
-    )
+    @firestore.transactional
+    def write_pair(transaction: Any) -> None:
+        user_snapshot = _transaction_snapshot(
+            transaction,
+            user_ref,
+            timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
+        )
+        latest_chunks = list(
+            transaction.get(
+                chunks_ref.order_by(
+                    "__name__", direction=firestore.Query.DESCENDING
+                ).limit(1),
+                timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
+                retry=None,
+            )
+        )
+        current_chunk = latest_chunks[0] if latest_chunks else None
+        chunk_number = (
+            _chunk_number(current_chunk.id) if current_chunk is not None else 0
+        )
+        current_messages = (
+            (current_chunk.to_dict() or {}).get("messages", [])
+            if current_chunk is not None
+            else []
+        )
+        if not isinstance(current_messages, list):
+            current_messages = []
+        question = {
+            "role": "user",
+            "content": question_text,
+            "timestamp": now,
+            "model_used": None,
+            "sources": [],
+        }
+        answer = {
+            "role": "assistant",
+            "content": answer_text,
+            "timestamp": now,
+            "model_used": None,
+            "sources": sources,
+        }
+        next_messages, needs_new_chunk = append_message_pair(
+            current_messages, question, answer
+        )
+        if needs_new_chunk or current_chunk is None:
+            chunk_number += 1
+        chunk_ref = chunks_ref.document(f"{chunk_number:06d}")
+        day = now.strftime("%Y%m%d")
+        user_data = user_snapshot.to_dict() or {}
+        user_fields: dict[str, Any] = {
+            "last_active": now,
+            "active_chat_id": chat_id,
+            "chat_ids": firestore.ArrayUnion([chat_id]),
+            "active_chunk_number": chunk_number,
+            "active_chunk_count": len(next_messages),
+            "total_questions": firestore.Increment(1),
+            "total_messages": firestore.Increment(2),
+            "total_chunks": firestore.Increment(
+                1 if needs_new_chunk or current_chunk is None else 0
+            ),
+        }
+        if count_for_daily_limit:
+            user_fields.update(
+                {
+                    "day": day,
+                    "day_count": (
+                        int(user_data.get("day_count", 0)) + 1
+                        if user_data.get("day") == day
+                        else 1
+                    ),
+                }
+            )
+        if not user_snapshot.exists:
+            user_fields.update({"first_seen": now, "blocked": False})
+
+        transaction.set(
+            chunk_ref,
+            {"messages": next_messages, "count": len(next_messages)},
+        )
+        transaction.set(user_ref, user_fields, merge=True)
+
+    write_pair(client.transaction())
 
 
 def _write_daily_questions(
@@ -1758,6 +1756,7 @@ def _write_active_user(
             field_name="uid",
         )
     from google.cloud import firestore
+    from google.api_core.exceptions import AlreadyExists
 
     try:
         user_ref = client.collection("users").document(uid)
@@ -1766,44 +1765,37 @@ def _write_active_user(
             _safe_error_message(error, uid),
             field_name="uid",
         ) from error
-    transaction = client.transaction()
-    snapshot = _transaction_snapshot(
-        transaction,
-        user_ref,
-        timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
-    )
-    fields: dict[str, Any] = {"last_active": now}
-    if not snapshot.exists:
-        fields.update(
-            {
-                "first_seen": now,
-                "total_questions": 0,
-                "total_messages": 0,
-                "total_chunks": 0,
-                "blocked": False,
-                "day": now.strftime("%Y%m%d"),
-                "day_count": 0,
-            }
+    initial_fields: dict[str, Any] = {
+        "last_active": now,
+        "first_seen": now,
+        "total_questions": 0,
+        "total_messages": 0,
+        "total_chunks": 0,
+        "blocked": False,
+        "day": now.strftime("%Y%m%d"),
+        "day_count": 0,
+    }
+    try:
+        user_ref.create(
+            initial_fields,
+            timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+            retry=None,
         )
-        transaction.set(
+        created = True
+    except AlreadyExists:
+        created = False
+
+    batch = client.batch()
+    fields = {"last_active": now}
+    batch.set(user_ref, fields, merge=True)
+    if created:
+        batch.set(
             client.collection("stats").document("global"),
             {"total_devices": firestore.Increment(1)},
             merge=True,
         )
     try:
-        transaction.set(user_ref, fields, merge=True)
-    except ValueError as error:
-        message = str(error)
-        field_name = next(
-            (name for name in fields if name in message),
-            "user_document_fields",
-        )
-        raise _FirestoreFieldValueError(
-            _safe_error_message(error, uid),
-            field_name=field_name,
-        ) from error
-    try:
-        transaction.commit(
+        batch.commit(
             timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
             retry=None,
         )
@@ -1861,7 +1853,10 @@ def _write_daily_activity(
     batch = client.batch()
     batch.set(
         client.collection("stats").document(f"daily_{now:%Y%m%d}"),
-        {"uids": firestore.ArrayUnion([_stats_uid(uid)])},
+        {
+            "uids": firestore.ArrayUnion([_stats_uid(uid)]),
+            "active_count": firestore.Increment(1),
+        },
         merge=True,
     )
     batch.commit(

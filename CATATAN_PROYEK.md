@@ -27,6 +27,11 @@
   dokumen pengguna. Statistik harian, FAQ, dan aktivitas per jam dikirim
   terpisah; antrean tulis memori mempertahankan pekerjaan saat sirkuit terbuka
   dan menjadwalkan ulang error sementara.
+- **Perbaikan transaksi aktivitas Firestore:** `active_user` tidak membaca atau
+  memakai transaksi. Dokumen pengguna dibuat dengan `create` untuk mendeteksi
+  perangkat baru, lalu diperbarui melalui batch; statistik global hanya
+  bertambah setelah pembuatan berhasil. Transaksi hanya digunakan saat membaca
+  dan menulis pasangan pesan ke chunk.
 
 ## Cara tes manual Fase 3
 
@@ -100,7 +105,8 @@ tidak disimpan di Firestore.
 - `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin.
 - `tests/test_firestore_store.py` — uji kegagalan dan batas waktu riwayat
   Firestore, konfigurasi runtime asinkron, penolakan UID perangkat invalid,
-  retry tulis, serta operasi admin saat breaker chat terbuka.
+  transaksi chunk dengan retry, penulisan aktivitas tanpa transaksi, serta
+  operasi admin saat breaker chat terbuka.
 - `tests/test_admin_logic.py` — uji normalisasi FAQ, blokir, batas WIB,
   verifikasi PBKDF2, dan penguncian login.
 - `CATATAN_PROYEK.md` — catatan fase, struktur data, keputusan, dan pekerjaan
@@ -114,7 +120,8 @@ tidak disimpan di Firestore.
 - `users/{uid}/chats/{chat_id}/chunks/{chunk_id}` — pesan per potongan.
 - `stats/global` — jumlah perangkat.
 - `stats/daily_YYYYMMDD` — jumlah pertanyaan dan UID perangkat aktif yang
-  di-hash untuk hari WIB.
+  di-hash untuk hari WIB; `active_count` menghitung pencatatan aktivitas per
+  jam dengan operasi `Increment`.
 - `stats/hourly_YYYYMMDDHH` — UID yang di-hash dan peta `active_at` untuk
   aktivitas per jam.
 - `faq/{sha256_pertanyaan_normalisasi}` — pertanyaan yang dinormalisasi,
@@ -176,10 +183,15 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   tertutup. Error permanen dicatat tanpa retry. Setiap upaya tulis chat memiliki
   tenggat 10 detik dan tidak menahan pekerja antrean saat operasi melampaui
   tenggat.
-- Setiap pertanyaan mengantrekan satu transaksi untuk chunk dan dokumen
-  pengguna, lalu penulisan terpisah untuk `stats/daily.questions` dan FAQ
-  (hanya jika pertanyaan hasil normalisasi tidak kosong). Aktivitas per jam
-  ditulis sebagai operasi tersendiri, paling banyak sekali per jam per sesi.
+- Setiap pertanyaan mengantrekan satu transaksi `@firestore.transactional`
+  untuk membaca dan memperbarui chunk serta dokumen pengguna. Retry antrean
+  membuat objek transaksi baru; transaksi tidak dibagikan antar-thread.
+  Penulisan `stats/daily.questions` dan FAQ terpisah (FAQ hanya jika pertanyaan
+  hasil normalisasi tidak kosong). Penulisan aktivitas pengguna tidak memakai
+  transaksi: dokumen baru dideteksi dengan `users/{uid}.create`, lalu
+  `users/{uid}` dan `stats/global` diperbarui lewat batch; ringkasan aktivitas
+  jam memakai `ArrayUnion`, sedangkan `stats/daily.active_count` memakai
+  `Increment`. Aktivitas ditulis paling banyak sekali per jam per sesi.
   Menu Kesehatan sistem menampilkan `writes_ok`, `writes_failed`,
   `writes_retried`, `writes_dropped`, error terakhir, dan waktu penutupan
   circuit breaker.

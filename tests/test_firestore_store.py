@@ -16,6 +16,7 @@ from services.firestore_store import (
     _transaction_snapshot,
     _upsert_saved_chat,
     _write_active_user,
+    _write_daily_activity,
     append_message_pair,
     firestore_status,
     firestore_write_health,
@@ -62,13 +63,50 @@ class _FakeReference:
     def limit(self, _count: int):
         return self
 
+    def get(self, *, timeout: float, retry: object):
+        assert timeout > 0
+        assert retry is None
+        self.client.read_paths.append(self.path)
+        return _FakeSnapshot(
+            self.path,
+            exists=self.path in self.client.created_documents,
+        )
+
+    def create(self, data, *, timeout: float, retry: object):
+        from google.api_core.exceptions import AlreadyExists
+
+        assert timeout > 0
+        assert retry is None
+        if self.path in self.client.created_documents:
+            raise AlreadyExists("already exists")
+        self.client.created_documents.add(self.path)
+        self.client.persisted.append((self.path, data, False))
+
 
 class _FakeTransaction:
     def __init__(self, client):
         self.client = client
         self.writes = []
+        self.active = False
+        self.completed = False
+        self.owner_thread_id = None
+
+    def begin(self):
+        if self.active or self.completed:
+            raise ValueError("Transaction not in progress, cannot be used in API requests.")
+        self.active = True
+        self.owner_thread_id = threading.get_ident()
+
+    def _ensure_active(self):
+        if (
+            not self.active
+            or self.completed
+            or self.owner_thread_id != threading.get_ident()
+        ):
+            raise ValueError("Transaction not in progress, cannot be used in API requests.")
 
     def get(self, reference, *, timeout: float, retry: object):
+        self._ensure_active()
         assert timeout > 0
         assert retry is None
         if reference.is_query:
@@ -76,18 +114,25 @@ class _FakeTransaction:
         return iter([_FakeSnapshot(reference.path, exists=False)])
 
     def set(self, reference, data, merge: bool = False):
+        self._ensure_active()
         self.writes.append((reference.path, data, merge))
 
     def commit(self, *, timeout: float, retry: object):
+        self._ensure_active()
         assert timeout > 0
         assert retry is None
-        if (
-            self.client.fail_pair_once
-            and any("/chunks/" in path for path, _data, _merge in self.writes)
+        self.active = False
+        self.completed = True
+        if self.client.fail_pair_once and any(
+            "/chunks/" in path for path, _data, _merge in self.writes
         ):
             self.client.fail_pair_once = False
             raise _UnavailableError("transient failure")
         self.client.persisted.extend(self.writes)
+
+    def abort(self):
+        self.active = False
+        self.completed = True
 
 
 class _FakeBatch:
@@ -116,17 +161,36 @@ class _FakeClient:
         self.fail_pair_once = False
         self.fail_daily = False
         self.batches = []
+        self.transactions = []
+        self.created_documents = set()
+        self.read_paths = []
 
     def collection(self, name: str):
         return _FakeReference(self, name)
 
     def transaction(self):
-        return _FakeTransaction(self)
+        transaction = _FakeTransaction(self)
+        self.transactions.append(transaction)
+        return transaction
 
     def batch(self):
         batch = _FakeBatch(self)
         self.batches.append(batch)
         return batch
+
+
+def _fake_transactional(callback):
+    def run(transaction):
+        transaction.begin()
+        try:
+            result = callback(transaction)
+            transaction.commit(timeout=10.0, retry=None)
+            return result
+        except Exception:
+            transaction.abort()
+            raise
+
+    return run
 
 
 class FirestoreStoreTests(unittest.TestCase):
@@ -209,21 +273,15 @@ class FirestoreStoreTests(unittest.TestCase):
         self.assertEqual(len(renamed), SAVED_CHAT_LIMIT)
         self.assertEqual(renamed[0], {"chat_id": "chat-0", "name": "Renamed"})
 
-    def test_save_named_chat_persists_name_with_transaction(self) -> None:
+    def test_save_named_chat_persists_name_without_transaction(self) -> None:
         snapshot = Mock()
         snapshot.to_dict.return_value = {
             "saved_chats": [{"chat_id": "old-chat", "name": "Old"}]
         }
-        transaction = Mock()
-        transaction.get.return_value = iter([snapshot])
         client = Mock()
-        client.collection.return_value.document.return_value = object()
-        client.transaction.return_value = transaction
-        with patch(
-            "google.cloud.firestore.transactional",
-            side_effect=lambda callback: lambda transaction: callback(transaction),
-        ):
-            saved = _save_named_chat(client, "uid", "new-chat", "New")
+        user_ref = client.collection.return_value.document.return_value
+        user_ref.get.return_value = snapshot
+        saved = _save_named_chat(client, "uid", "new-chat", "New")
 
         self.assertEqual(
             saved,
@@ -232,9 +290,34 @@ class FirestoreStoreTests(unittest.TestCase):
                 {"chat_id": "old-chat", "name": "Old"},
             ],
         )
-        persisted = transaction.set.call_args.args[1]
+        persisted = user_ref.set.call_args.args[0]
         self.assertEqual(persisted["saved_chats"], saved)
         self.assertIn("chat_ids", persisted)
+        client.transaction.assert_not_called()
+
+    def test_fake_transaction_rejects_use_outside_callback_and_after_commit(self) -> None:
+        transaction = _FakeTransaction(_FakeClient())
+        with self.assertRaisesRegex(ValueError, "Transaction not in progress"):
+            transaction.get(
+                _FakeReference(transaction.client, "users/uid"),
+                timeout=1,
+                retry=None,
+            )
+
+        transaction.begin()
+        transaction.commit(timeout=1, retry=None)
+        with self.assertRaisesRegex(ValueError, "Transaction not in progress"):
+            transaction.set(_FakeReference(transaction.client, "users/uid"), {})
+
+    def test_daily_activity_batches_unique_uids_and_increments_active_count(self) -> None:
+        from google.cloud import firestore
+
+        client = _FakeClient()
+        _write_daily_activity(client, time.monotonic() + 10, "0123456789abcdef", _now())
+
+        data = client.batches[-1].writes[0][1]
+        self.assertIsInstance(data["active_count"], firestore.Increment)
+        self.assertEqual(len(data["uids"].values), 1)
 
     def test_delete_single_chat_clears_its_metadata_and_updates_counts(self) -> None:
         chunk = Mock()
@@ -525,12 +608,45 @@ class FirestoreStoreTests(unittest.TestCase):
         )
         self.assertTrue(firestore_status()["connected"])
 
+    def test_active_user_uses_create_and_batch_without_transaction(self) -> None:
+        client = _FakeClient()
+        uid = "0123456789abcdef"
+
+        _write_active_user(client, time.monotonic() + 10, uid, _now())
+
+        self.assertEqual(client.transactions, [])
+        self.assertEqual(client.read_paths, [])
+        self.assertIn(f"users/{uid}", client.created_documents)
+        self.assertEqual(client.persisted[0][1]["total_questions"], 0)
+        writes = client.batches[-1].writes
+        self.assertEqual(
+            [path for path, _data, _merge in writes],
+            [f"users/{uid}", "stats/global"],
+        )
+        self.assertTrue(all(merge for _path, _data, merge in writes))
+
+    def test_existing_active_user_does_not_increment_total_devices(self) -> None:
+        client = _FakeClient()
+        uid = "0123456789abcdef"
+        client.created_documents.add(f"users/{uid}")
+
+        _write_active_user(client, time.monotonic() + 10, uid, _now())
+
+        self.assertEqual(client.transactions, [])
+        self.assertEqual(
+            [path for path, _data, _merge in client.batches[-1].writes],
+            [f"users/{uid}"],
+        )
+
     def test_question_write_retries_once_and_persists_all_domains(self) -> None:
         client = _FakeClient()
         client.fail_pair_once = True
-        with patch(
-            "services.firestore_store.FIRESTORE_WRITE_RETRY_DELAYS",
-            (0.0, 0.0, 0.0),
+        with (
+            patch(
+                "services.firestore_store.FIRESTORE_WRITE_RETRY_DELAYS",
+                (0.0, 0.0, 0.0),
+            ),
+            patch("google.cloud.firestore.transactional", side_effect=_fake_transactional),
         ):
             enqueue_question_answer(
                 client,
@@ -554,6 +670,8 @@ class FirestoreStoreTests(unittest.TestCase):
         health = firestore_write_health()
         self.assertEqual(health["writes_retried"], 1)
         self.assertEqual(health["writes_failed"], 1)
+        self.assertEqual(len(client.transactions), 2)
+        self.assertIsNot(client.transactions[0], client.transactions[1])
 
     def test_open_breaker_keeps_write_queued_until_available(self) -> None:
         client = _FakeClient()
@@ -592,9 +710,12 @@ class FirestoreStoreTests(unittest.TestCase):
     def test_daily_stats_failure_does_not_cancel_chunk_write(self) -> None:
         client = _FakeClient()
         client.fail_daily = True
-        with patch(
-            "services.firestore_store.FIRESTORE_WRITE_RETRY_DELAYS",
-            (0.0, 0.0, 0.0),
+        with (
+            patch(
+                "services.firestore_store.FIRESTORE_WRITE_RETRY_DELAYS",
+                (0.0, 0.0, 0.0),
+            ),
+            patch("google.cloud.firestore.transactional", side_effect=_fake_transactional),
         ):
             enqueue_question_answer(
                 client,
