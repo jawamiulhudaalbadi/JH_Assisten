@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from datetime import datetime
 import hashlib
 import hmac
+from math import ceil
 import re
 from zoneinfo import ZoneInfo
 
@@ -43,6 +45,55 @@ def verify_admin_code(code: str, encoded_hash: str) -> bool:
         return len(expected) > 0 and hmac.compare_digest(actual, expected)
     except (ValueError, OverflowError):
         return False
+
+
+def process_admin_login(
+    code: str,
+    encoded_hash: str,
+    session_state: MutableMapping[str, object],
+    now: float,
+    empty_code_notice: str = "Kode admin belum diisi.",
+) -> bool:
+    """Validate an admin login and update its session lockout state."""
+    locked_until = float(session_state.get("admin_locked_until", 0))
+    if now < locked_until:
+        remaining = ceil(locked_until - now)
+        session_state["_admin_login_notice"] = (
+            f"Login admin terkunci. Coba lagi dalam {remaining} detik."
+        )
+        return False
+    if locked_until:
+        session_state["admin_failed_attempts"] = 0
+        session_state.pop("admin_locked_until", None)
+
+    if not code:
+        session_state["_admin_login_notice"] = empty_code_notice
+        return False
+    if not encoded_hash:
+        session_state["_admin_login_notice"] = (
+            "Dashboard admin terkunci: secret ADMIN_CODE_HASH belum diatur."
+        )
+        return False
+    if verify_admin_code(code, encoded_hash):
+        session_state["admin_failed_attempts"] = 0
+        session_state.pop("admin_locked_until", None)
+        session_state["admin_authenticated"] = True
+        session_state.pop("_admin_login_notice", None)
+        return True
+
+    attempts = int(session_state.get("admin_failed_attempts", 0)) + 1
+    if attempts >= 5:
+        session_state["admin_failed_attempts"] = 5
+        session_state["admin_locked_until"] = now + 15 * 60
+        session_state["_admin_login_notice"] = (
+            "Lima percobaan gagal. Login admin terkunci selama 15 menit."
+        )
+    else:
+        session_state["admin_failed_attempts"] = attempts
+        session_state["_admin_login_notice"] = (
+            f"Kode admin salah ({attempts}/5 percobaan)."
+        )
+    return False
 
 
 def question_is_allowed(

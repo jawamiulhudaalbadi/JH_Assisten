@@ -5,8 +5,10 @@
 - **Fase 1 — selesai:** operasi Firestore dibatasi, chat tetap berjalan saat
   Firestore gagal, statistik memakai WIB, pertanyaan FAQ dihitung tanpa UID, dan
   sandi Pengaturan dipindahkan ke Secrets.
-- **Fase 2 — selesai:** login `/admin`, dashboard, kebijakan pemeliharaan,
-  pengumuman, blokir dan batas harian, serta kontrol sinkronisasi tersedia.
+- **Fase 2 — selesai:** login admin melalui `/admin` atau klik judul aplikasi
+  7 kali dalam 3 detik, dashboard, kebijakan pemeliharaan, pengumuman, blokir
+  dan batas harian, serta kontrol sinkronisasi tersedia. Keduanya memakai
+  `ADMIN_CODE_HASH` dari Secrets dan perlindungan percobaan login yang sama.
   Ringkasan AI untuk FAQ sengaja belum diaktifkan sampai Fase 3.
 
 ## Berkas yang diubah atau ditambahkan
@@ -17,7 +19,7 @@
   penulisan latar, ringkasan statistik WIB, FAQ, konfigurasi admin, riwayat,
   dan status kesehatan.
 - `services/admin_logic.py` — verifikasi hash admin dan pemeriksaan blokir/batas
-  harian yang murni.
+  harian yang murni, serta pengelolaan autentikasi dan lockout login.
 - `services/admin_dashboard.py` — dashboard statistik, riwayat, FAQ, sinkron
   Drive, kontrol, dan kesehatan sistem; modul dimuat setelah login berhasil.
 - `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin.
@@ -48,6 +50,7 @@
 - `SETTINGS_PASSWORD` — sandi menu Pengaturan; bila kosong menu tetap terkunci.
 - `ADMIN_CODE_HASH` — hash kode admin, format
   `pbkdf2_sha256$iterasi$salt$hex_digest` atau `scrypt$salt$hex_digest`.
+  Jangan menyimpan kode admin teks biasa di source code atau repositori.
 - `FIREBASE_SERVICE_ACCOUNT` — kredensial Firestore yang sudah digunakan.
 
 ## Keputusan desain

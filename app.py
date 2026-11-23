@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
+from streamlit_javascript import st_javascript
 from PIL import Image
 from google.api_core.exceptions import GoogleAPIError
 from google.auth.exceptions import GoogleAuthError
@@ -48,7 +49,7 @@ from services.gdrive_service import (
     save_oauth_callback,
 )
 from services.device_identity import get_device_uid
-from services.admin_logic import question_is_allowed, verify_admin_code
+from services.admin_logic import process_admin_login, question_is_allowed
 from services.firestore_store import (
     HISTORY_WARNING_CHUNKS,
     HISTORY_WARNING_MESSAGES,
@@ -896,47 +897,53 @@ def _process_admin_command(command: str) -> bool:
     if not re.match(r"^/admin(?:\s|$)", command, flags=re.IGNORECASE):
         return False
 
-    now = time.monotonic()
-    locked_until = float(st.session_state.get("admin_locked_until", 0))
-    if now < locked_until:
-        remaining = ceil(locked_until - now)
-        st.session_state["_admin_login_notice"] = (
-            f"Login admin terkunci. Coba lagi dalam {remaining} detik."
-        )
-        return True
-    if locked_until:
-        st.session_state["admin_failed_attempts"] = 0
-        st.session_state.pop("admin_locked_until", None)
-
     code = command[len("/admin") :].strip()
-    if not code:
-        st.session_state["_admin_login_notice"] = "Gunakan format /admin <kode>."
-        return True
-    if not ADMIN_CODE_HASH:
-        st.session_state["_admin_login_notice"] = (
-            "Dashboard admin terkunci: secret ADMIN_CODE_HASH belum diatur."
-        )
-        return True
-    if verify_admin_code(code, ADMIN_CODE_HASH):
-        st.session_state["admin_failed_attempts"] = 0
-        st.session_state.pop("admin_locked_until", None)
-        st.session_state["admin_authenticated"] = True
-        st.session_state.pop("_admin_login_notice", None)
-        return True
-
-    attempts = int(st.session_state.get("admin_failed_attempts", 0)) + 1
-    if attempts >= 5:
-        st.session_state["admin_failed_attempts"] = 5
-        st.session_state["admin_locked_until"] = now + 15 * 60
-        st.session_state["_admin_login_notice"] = (
-            "Lima percobaan gagal. Login admin terkunci selama 15 menit."
-        )
-    else:
-        st.session_state["admin_failed_attempts"] = attempts
-        st.session_state["_admin_login_notice"] = (
-            f"Kode admin salah ({attempts}/5 percobaan)."
-        )
+    process_admin_login(
+        code,
+        ADMIN_CODE_HASH,
+        st.session_state,
+        time.monotonic(),
+        empty_code_notice="Gunakan format /admin <kode>.",
+    )
     return True
+
+
+_ADMIN_TITLE_CLICK_SCRIPT = """
+new Promise(resolve => {
+  const document = window.parent.document;
+  let clicks = 0;
+  let resetTimer;
+  const onClick = event => {
+    if (!event.target.closest(".app-brand-title")) return;
+    if (clicks === 0) {
+      resetTimer = window.setTimeout(() => { clicks = 0; }, 3000);
+    }
+    clicks += 1;
+    if (clicks === 7) {
+      window.clearTimeout(resetTimer);
+      document.removeEventListener("click", onClick);
+      resolve("admin-title-clicked");
+    }
+  };
+  document.addEventListener("click", onClick);
+})
+"""
+
+
+def _render_admin_title_click_listener() -> None:
+    if st.session_state.get("admin_authenticated"):
+        return
+
+    generation = int(st.session_state.get("_admin_title_watch_generation", 0))
+    result = st_javascript(
+        _ADMIN_TITLE_CLICK_SCRIPT,
+        key=f"admin_title_click_listener_{generation}",
+    )
+    if result == "admin-title-clicked":
+        st.session_state["_admin_title_watch_generation"] = generation + 1
+        st.session_state["_admin_login_prompt_open"] = True
+        st.rerun()
+
 
 if "app_title" not in st.session_state:
     st.session_state.app_title = str(
@@ -1059,6 +1066,7 @@ footer { display: none !important; }
     font-weight: 700;
     letter-spacing: -0.02em;
     color: __TEXT__;
+    cursor: pointer;
 }
 .app-brand-title::after {
     content: "";
@@ -1479,7 +1487,36 @@ def _render_header() -> None:
         st.markdown(title_html, unsafe_allow_html=True)
 
 
+def _render_admin_login_prompt() -> None:
+    st.subheader("Login dashboard admin")
+    with st.form("admin_title_login_form", clear_on_submit=True):
+        code = st.text_input("Kode admin", type="password")
+        submitted = st.form_submit_button("Masuk")
+
+    if submitted:
+        authenticated = process_admin_login(
+            code.strip(),
+            ADMIN_CODE_HASH,
+            st.session_state,
+            time.monotonic(),
+        )
+        if authenticated:
+            st.session_state["_admin_login_prompt_open"] = False
+            st.rerun()
+
+        notice = st.session_state.pop("_admin_login_notice", None)
+        if notice:
+            st.error(notice)
+
+    if st.button("Tutup login admin", key="close_admin_title_login"):
+        st.session_state["_admin_login_prompt_open"] = False
+        st.rerun()
+
+
 _render_header()
+_render_admin_title_click_listener()
+if st.session_state.get("_admin_login_prompt_open"):
+    _render_admin_login_prompt()
 
 api_key = st.session_state.google_api_key
 if not api_key:
