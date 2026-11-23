@@ -52,19 +52,26 @@ from services.admin_logic import (
     process_admin_login,
     question_is_allowed,
     register_admin_button_click,
+    verify_admin_code,
 )
 from services.firestore_store import (
     HISTORY_WARNING_CHUNKS,
     HISTORY_WARNING_MESSAGES,
     MAX_MESSAGES_PER_CHUNK,
-    clear_user_history,
+    SAVED_CHAT_LIMIT,
+    ChatStoreError,
+    SavedChatLimitError,
     credentials_json_from_secrets,
+    delete_all_user_chats,
+    delete_user_chat,
     enqueue_question_answer,
+    get_saved_chats,
     get_active_chat_id,
     get_firestore_client,
     get_runtime_config,
     load_chat_history,
     mark_active,
+    save_named_chat,
 )
 from services.sync_manager import DriveSyncManager
 
@@ -89,12 +96,18 @@ TEKS = {
     ),
     "clear_history": "Bersihkan riwayat",
     "clear_history_confirm": (
-        "Yakin badé ngabersihan sadaya riwayat obrolan dina alat ieu? "
-        "Riwayat anu parantos dipupus moal tiasa dipulangkeun."
+        "Yakin badé ngahapus paguneman anu keur dibuka? "
+        "Paguneman séjén moal dipupus."
     ),
-    "clear_history_confirm_button": "Muhun, bersihan",
+    "clear_history_confirm_button": "Muhun, hapus",
     "clear_history_cancel": "Ulah ayeuna",
-    "clear_history_done": "Riwayat obrolan parantos diberesihan.",
+    "clear_history_done": "Paguneman aktip parantos dipupus.",
+    "delete_all_history": "Hapus Sadaya Paguneman",
+    "delete_all_history_confirm": (
+        "Yakin badé ngahapus sadaya paguneman dina alat ieu, kaasup chat simpen? "
+        "Data anu parantos dipupus moal tiasa dipulangkeun."
+    ),
+    "delete_all_history_done": "Sadaya paguneman parantos dipupus.",
 }
 
 # --------------------------------------------------------------------------
@@ -1306,12 +1319,11 @@ def _build_app_css(theme: dict[str, str], font: dict[str, str]) -> str:
 
 theme = APP_THEMES[APP_THEME_ID]
 st.markdown(_build_app_css(theme, APP_FONTS[APP_FONT_ID]), unsafe_allow_html=True)
+runtime_config = get_runtime_config(FIRESTORE_CLIENT)
+settings_password_hash = str(runtime_config.get("settings_password_hash", ""))
+settings_password_valid = False
 
 with st.sidebar:
-    if st.button("Ngawitan Deui  Patarosan", key="new_chat_button", use_container_width=True):
-        _start_new_chat()
-        st.rerun()
-
     st.divider()
     st.subheader("KITAB RUJUKAN")
     folder_id = st.session_state.google_drive_folder_id
@@ -1324,9 +1336,9 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Pangaturan JH")
-    if not SETTINGS_PASSWORD:
+    if not settings_password_hash and not SETTINGS_PASSWORD:
         st.info(
-            "Menu Pengaturan terkunci. Atur secret SETTINGS_PASSWORD untuk membukanya."
+            "Menu Pengaturan terkunci. Admin tiasa ngatur sandina dina dashboard Admin."
         )
     else:
         settings_password = st.text_input(
@@ -1334,7 +1346,12 @@ with st.sidebar:
             type="password",
             key="settings_password",
         )
-    if SETTINGS_PASSWORD and settings_password == SETTINGS_PASSWORD:
+        settings_password_valid = (
+            verify_admin_code(settings_password, settings_password_hash)
+            if settings_password_hash
+            else settings_password == SETTINGS_PASSWORD
+        )
+    if settings_password_valid:
         if "app_title_input" not in st.session_state:
             st.session_state.app_title_input = st.session_state.app_title
 
@@ -1610,7 +1627,6 @@ if st.session_state.get("loaded_chat_id") != chat_id:
     st.session_state.history_stats = history_stats
     st.session_state.loaded_chat_id = chat_id
 mark_active(FIRESTORE_CLIENT, DEVICE_UID)
-runtime_config = get_runtime_config(FIRESTORE_CLIENT)
 if runtime_config["announcement"]:
     st.info(runtime_config["announcement"])
 
@@ -1629,6 +1645,13 @@ if st.session_state.get("admin_authenticated"):
     )
     st.stop()
 
+try:
+    saved_chats = get_saved_chats(FIRESTORE_CLIENT, DEVICE_UID)
+    saved_chats_error = ""
+except ChatStoreError as error:
+    saved_chats = []
+    saved_chats_error = str(error)
+
 history_stats = st.session_state.get("history_stats", {})
 if (
     int(history_stats.get("total_messages", 0)) > HISTORY_WARNING_MESSAGES
@@ -1637,34 +1660,7 @@ if (
     st.sidebar.warning(TEKS["history_warning"])
 
 if st.session_state.pop("_history_cleared_notice", False):
-    st.sidebar.success(TEKS["clear_history_done"])
-
-if st.sidebar.button(TEKS["clear_history"], key="clear_chat_history"):
-    st.session_state.clear_history_confirmation = True
-
-if st.session_state.get("clear_history_confirmation"):
-    st.sidebar.warning(TEKS["clear_history_confirm"])
-    confirm_columns = st.sidebar.columns(2)
-    if confirm_columns[0].button(
-        TEKS["clear_history_confirm_button"],
-        key="confirm_clear_chat_history",
-    ):
-        clear_user_history(FIRESTORE_CLIENT, DEVICE_UID)
-        st.session_state.messages = []
-        st.session_state.history_stats = {
-            "total_messages": 0,
-            "total_chunks": 0,
-            "active_chunk_count": 0,
-        }
-        st.session_state.clear_history_confirmation = False
-        st.session_state._history_cleared_notice = True
-        st.rerun()
-    if confirm_columns[1].button(
-        TEKS["clear_history_cancel"],
-        key="cancel_clear_chat_history",
-    ):
-        st.session_state.clear_history_confirmation = False
-        st.rerun()
+    st.success(TEKS["clear_history_done"])
 
 for message in st.session_state.messages:
     if message["role"] == "assistant":
@@ -1688,6 +1684,141 @@ for message in st.session_state.messages:
                 message["content"],
                 f"history_copy_{len(st.session_state.messages)}_{id(message)}",
             )
+
+if st.session_state.pop("_chat_saved_notice", False):
+    st.success("Paguneman disimpen. Paguneman anyar parantos dibuka.")
+if st.session_state.pop("_chat_deleted_notice", False):
+    st.success(TEKS["clear_history_done"])
+if st.session_state.pop("_all_chats_deleted_notice", False):
+    st.success(TEKS["delete_all_history_done"])
+
+st.divider()
+st.subheader("Riwayat Paguneman")
+if saved_chats_error:
+    st.warning(saved_chats_error)
+current_chat_is_saved = any(
+    item["chat_id"] == chat_id for item in saved_chats
+)
+save_disabled = (
+    not st.session_state.messages
+    or (len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved)
+)
+with st.form("save_named_chat_form", clear_on_submit=True):
+    saved_chat_name = st.text_input(
+        "Ngaran riwayat",
+        max_chars=60,
+        placeholder="Conto: Patarosan fikih",
+    )
+    st.caption("Simpen paguneman ieu kalayan nami, tuluy muka obrolan anyar.")
+    save_chat = st.form_submit_button(
+        "Simpan Paguneman",
+        disabled=save_disabled,
+        use_container_width=True,
+    )
+if save_disabled:
+    if not st.session_state.messages:
+        st.caption("Ajukan patarosan heula saméméh nyimpen paguneman.")
+    elif len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved:
+        st.caption(
+            f"Maksimal {SAVED_CHAT_LIMIT} paguneman. Pupus heula salah sahiji "
+            "paguneman simpen."
+        )
+if save_chat:
+    try:
+        save_named_chat(
+            FIRESTORE_CLIENT,
+            DEVICE_UID,
+            chat_id,
+            saved_chat_name,
+        )
+    except SavedChatLimitError as error:
+        st.warning(str(error))
+    except (ChatStoreError, ValueError) as error:
+        st.error(f"Paguneman teu tiasa disimpen: {error}")
+    else:
+        st.session_state._chat_saved_notice = True
+        _start_new_chat()
+        st.rerun()
+
+st.markdown(f"**Paguneman disimpen ({len(saved_chats)}/{SAVED_CHAT_LIMIT})**")
+st.caption(
+    "Pencét ngaran pikeun muka deui. Bersihkan riwayat ngahapus chat aktif wungkul."
+)
+for saved_chat in saved_chats:
+    saved_chat_id = saved_chat["chat_id"]
+    label = saved_chat["name"]
+    if saved_chat_id == chat_id:
+        label = f"✓ {label}"
+    if st.button(
+        label,
+        key=f"open_saved_chat_{saved_chat_id}",
+        use_container_width=True,
+    ):
+        st.query_params["chat"] = saved_chat_id
+        st.rerun()
+
+if st.button(TEKS["clear_history"], key="clear_active_chat"):
+    st.session_state.clear_active_chat_confirmation = True
+if st.session_state.get("clear_active_chat_confirmation"):
+    st.warning(TEKS["clear_history_confirm"])
+    confirm_columns = st.columns(2)
+    if confirm_columns[0].button(
+        TEKS["clear_history_confirm_button"],
+        key="confirm_clear_active_chat",
+    ):
+        try:
+            deleted_stats = delete_user_chat(FIRESTORE_CLIENT, DEVICE_UID, chat_id)
+        except (ChatStoreError, ValueError) as error:
+            st.error(f"Paguneman teu tiasa dipupus: {error}")
+        else:
+            history_stats = dict(st.session_state.get("history_stats", {}))
+            history_stats.update(deleted_stats)
+            st.session_state.history_stats = history_stats
+            st.session_state.clear_active_chat_confirmation = False
+            st.session_state._chat_deleted_notice = True
+            _start_new_chat()
+            st.rerun()
+    if confirm_columns[1].button(
+        TEKS["clear_history_cancel"],
+        key="cancel_clear_active_chat",
+    ):
+        st.session_state.clear_active_chat_confirmation = False
+        st.rerun()
+
+if st.button(TEKS["delete_all_history"], key="delete_all_chats"):
+    st.session_state.delete_all_chats_confirmation = True
+if st.session_state.get("delete_all_chats_confirmation"):
+    st.warning(TEKS["delete_all_history_confirm"])
+    confirm_columns = st.columns(2)
+    if confirm_columns[0].button(
+        TEKS["clear_history_confirm_button"],
+        key="confirm_delete_all_chats",
+    ):
+        try:
+            delete_all_user_chats(FIRESTORE_CLIENT, DEVICE_UID)
+        except ChatStoreError as error:
+            st.error(f"Sadaya paguneman teu tiasa dipupus: {error}")
+        else:
+            history_stats = dict(st.session_state.get("history_stats", {}))
+            history_stats.update(
+                {
+                    "total_messages": 0,
+                    "total_chunks": 0,
+                    "active_chunk_count": 0,
+                    "active_chunk_number": 0,
+                }
+            )
+            st.session_state.history_stats = history_stats
+            st.session_state.delete_all_chats_confirmation = False
+            st.session_state._all_chats_deleted_notice = True
+            _start_new_chat()
+            st.rerun()
+    if confirm_columns[1].button(
+        TEKS["clear_history_cancel"],
+        key="cancel_delete_all_chats",
+    ):
+        st.session_state.delete_all_chats_confirmation = False
+        st.rerun()
 
 def _santri_status(message: str) -> str:
     """Ubah pesan status teknis menjadi gaya santri (Sunda)."""

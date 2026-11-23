@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
+from services.admin_logic import hash_settings_password
 from services.firestore_store import (
     export_admin_users_csv,
     firestore_status,
@@ -21,6 +22,7 @@ from services.firestore_store import (
     get_admin_user_chats,
     get_admin_users,
     get_runtime_config,
+    save_settings_password_hash,
     set_user_blocked,
     update_runtime_config,
 )
@@ -277,6 +279,37 @@ def _render_health(client: Any | None) -> None:
         st.caption("Belum ada error tercatat.")
 
 
+def _render_settings_password(client: Any | None) -> None:
+    st.subheader("Sandi menu Pengaturan")
+    st.caption(
+        "Sandi ieu dipénta ka pamaké saméméh muka menu Pengaturan. "
+        "Admin cukup ngetik sandi anyar; aplikasi nyimpen hash-na."
+    )
+    with st.form("admin_settings_password", clear_on_submit=True):
+        password = st.text_input(
+            "Sandi Pengaturan anyar",
+            type="password",
+        )
+        confirmation = st.text_input(
+            "Ulangi sandi Pengaturan",
+            type="password",
+        )
+        save_password = st.form_submit_button("Simpan sandi")
+    if not save_password:
+        return
+    if not password:
+        st.error("Sandi Pengaturan tidak boleh kosong.")
+    elif password != confirmation:
+        st.error("Konfirmasi sandi tidak sama.")
+    else:
+        try:
+            save_settings_password_hash(client, hash_settings_password(password))
+        except (RuntimeError, ValueError) as error:
+            st.error(f"Sandi Pengaturan tidak tersimpan: {error}")
+        else:
+            st.success("Sandi Pengaturan berhasil diperbarui.")
+
+
 def render_dashboard(
     client: Any | None,
     manager: Any,
@@ -296,6 +329,7 @@ def render_dashboard(
             "Riwayat chat",
             "Pertanyaan sering",
             "Sinkron Drive",
+            "Sandi Pengaturan",
             "Kontrol lain",
             "Kesehatan sistem",
         ),
@@ -310,6 +344,8 @@ def render_dashboard(
         _render_faq(client)
     elif section == "Sinkron Drive":
         _render_drive_sync(manager, folder_id, api_key, drive_authorized)
+    elif section == "Sandi Pengaturan":
+        _render_settings_password(client)
     elif section == "Kontrol lain":
         users = _cached("users", lambda: get_admin_users(client))
         _render_controls(client, users)

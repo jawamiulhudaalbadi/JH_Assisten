@@ -34,7 +34,8 @@
 ## Struktur data Firestore
 
 - `users/{uid}` — aktivitas, penghitung, status blokir, hari dan jumlah
-  pertanyaan, `active_chat_id`, dan daftar `chat_ids` untuk navigasi dashboard.
+  pertanyaan, `active_chat_id`, daftar `chat_ids`, dan `saved_chats` berisi
+  maksimal lima ID serta nama paguneman yang disimpan.
 - `users/{uid}/chats/{chat_id}/chunks/{chunk_id}` — pesan per potongan.
 - `stats/global` — jumlah perangkat.
 - `stats/daily_YYYYMMDD` — jumlah pertanyaan dan UID perangkat aktif yang
@@ -43,12 +44,15 @@
   `active_at` untuk aktivitas per jam.
 - `faq/{sha256_pertanyaan_normalisasi}` — pertanyaan yang dinormalisasi,
   tampilan pertanyaan, hitungan, dan waktu terakhir; tidak menyimpan UID.
-- `settings/runtime` — mode perawatan, pengumuman, dan batas pertanyaan harian.
+- `settings/runtime` — mode perawatan, pengumuman, batas pertanyaan harian,
+  serta hash sandi menu Pengaturan yang diatur Admin.
 - `system_health/errors` — maksimal 20 error terakhir dalam satu dokumen.
 
 ## Secrets
 
-- `SETTINGS_PASSWORD` — sandi menu Pengaturan; bila kosong menu tetap terkunci.
+- `SETTINGS_PASSWORD` — sandi menu Pengaturan lama sebagai cadangan awal.
+  Sandi anyar diatur ti dashboard Admin sarta hash-na disimpen dina
+  `settings/runtime`.
 - `ADMIN_CODE_HASH` — hash kode admin, format
   `pbkdf2_sha256$iterasi$salt$hex_digest` atau `scrypt$salt$hex_digest`.
   Jangan menyimpan kode admin teks biasa di source code atau repositori.
@@ -81,6 +85,13 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
 - Konfigurasi runtime dicache di memori selama lima menit. Login admin
   menggunakan PBKDF2 atau scrypt dan `hmac.compare_digest`; dashboard hanya
   diimpor setelah login benar.
+- Admin cukup mengetik sandi menu Pengaturan di dashboard; aplikasi membuat
+  hash PBKDF2 sebelum menyimpannya. Hash runtime diutamakeun tina Secret
+  `SETTINGS_PASSWORD` heubeul. Pamaké biasa tetep kudu asupkeun sandi pikeun
+  muka menu.
+- Daptar chat simpan disimpen dina `users/{uid}.saved_chats`, maksimal lima.
+  Nyimpen chat ngaranana tuluy muka chat anyar; ngahapus chat aktif jeung
+  ngahapus sakabéh chat mangrupa dua aksi misah anu duanana menta konfirmasi.
 - Data aktif baru memakai timestamp untuk hitungan satu jam. Dokumen lama yang
   hanya berisi daftar UID ditampilkan sebagai perkiraan karena tidak memiliki
   waktu aktivitas.

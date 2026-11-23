@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
+import re
 import threading
 import time
 import unicodedata
@@ -37,7 +38,11 @@ _RUNTIME_CONFIG: dict[str, Any] = {
     "maintenance": False,
     "announcement": "",
     "daily_question_limit": 0,
+    "settings_password_hash": "",
 }
+SAVED_CHAT_LIMIT = 5
+_CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+_SAVED_CHAT_NAME_LIMIT = 60
 _RUNTIME_CONFIG_LOADED_AT = 0.0
 _RECENT_ERRORS: list[dict[str, str]] = []
 _RECENT_ERRORS_LOCK = threading.Lock()
@@ -517,6 +522,9 @@ def get_runtime_config(client: Any | None) -> dict[str, Any]:
                     "maintenance": bool(loaded.get("maintenance", False)),
                     "announcement": str(loaded.get("announcement", ""))[:1000],
                     "daily_question_limit": daily_question_limit,
+                    "settings_password_hash": str(
+                        loaded.get("settings_password_hash", "")
+                    ),
                 }
             )
         _RUNTIME_CONFIG_LOADED_AT = time.monotonic()
@@ -539,6 +547,45 @@ def update_runtime_config(client: Any | None, **updates: Any) -> None:
     if client is None or _circuit_is_open():
         return
     _WRITE_EXECUTOR.submit(_write_runtime_config, client, sanitized)
+
+
+def save_settings_password_hash(client: Any | None, encoded_hash: str) -> None:
+    """Persist an admin-entered settings password as a hash."""
+    global _RUNTIME_CONFIG_LOADED_AT
+    if not encoded_hash.startswith("pbkdf2_sha256$"):
+        raise ValueError("Format hash sandi Pengaturan tidak valid.")
+    if client is None:
+        raise RuntimeError("Firestore tidak tersedia untuk menyimpan sandi.")
+    if _circuit_is_open():
+        raise RuntimeError("Firestore sedang tidak tersedia; coba lagi nanti.")
+
+    future = _WRITE_EXECUTOR.submit(_write_settings_password_hash, client, encoded_hash)
+    try:
+        future.result(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS)
+    except FutureTimeoutError as error:
+        future.cancel()
+        timeout_error = TimeoutError(
+            "Penyimpanan sandi Pengaturan melewati batas waktu."
+        )
+        _trip_circuit(timeout_error, "penyimpanan sandi Pengaturan")
+        raise RuntimeError(str(timeout_error)) from error
+    except Exception as error:
+        _trip_circuit(error, "penyimpanan sandi Pengaturan")
+        raise RuntimeError("Sandi Pengaturan tidak berhasil disimpan.") from error
+
+    with _RUNTIME_CONFIG_LOCK:
+        _RUNTIME_CONFIG["settings_password_hash"] = encoded_hash
+        _RUNTIME_CONFIG_LOADED_AT = time.monotonic()
+
+
+def _write_settings_password_hash(client: Any, encoded_hash: str) -> None:
+    batch = client.batch()
+    batch.set(
+        client.collection("settings").document("runtime"),
+        {"settings_password_hash": encoded_hash},
+        merge=True,
+    )
+    batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
 
 
 def _write_runtime_config(client: Any, config: dict[str, Any]) -> None:
@@ -770,6 +817,304 @@ def get_active_chat_id(client: Any | None, uid: str) -> str | None:
     )
 
 
+class SavedChatLimitError(ValueError):
+    """Raised when a user tries to save more than the supported chat limit."""
+
+
+class ChatStoreError(RuntimeError):
+    """Raised when a named-chat operation cannot be persisted."""
+
+
+def _run_chat_mutation(
+    client: Any | None,
+    operation: Any,
+    *args: Any,
+    context: str,
+) -> Any:
+    if client is None:
+        raise ChatStoreError("Penyimpanan riwayat tidak tersedia.")
+    if _circuit_is_open():
+        raise ChatStoreError("Firestore sedang tidak tersedia; coba lagi nanti.")
+    future = _WRITE_EXECUTOR.submit(operation, client, *args)
+    try:
+        return future.result(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS)
+    except SavedChatLimitError:
+        raise
+    except FutureTimeoutError as error:
+        future.cancel()
+        timeout_error = TimeoutError(
+            f"Operasi {context} melewati batas waktu."
+        )
+        _trip_circuit(timeout_error, context)
+        raise ChatStoreError(str(timeout_error)) from error
+    except Exception as error:
+        _trip_circuit(error, context)
+        raise ChatStoreError(f"Operasi {context} tidak berhasil.") from error
+
+
+def _valid_saved_chats(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    saved: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        chat_id = str(item.get("chat_id", ""))
+        name = str(item.get("name", "")).strip()
+        if _CHAT_ID_RE.fullmatch(chat_id) and name:
+            saved.append({"chat_id": chat_id, "name": name[:_SAVED_CHAT_NAME_LIMIT]})
+    return saved
+
+
+def _upsert_saved_chat(
+    saved_chats: list[dict[str, str]], chat_id: str, name: str
+) -> list[dict[str, str]]:
+    existing = any(item["chat_id"] == chat_id for item in saved_chats)
+    if not existing and len(saved_chats) >= SAVED_CHAT_LIMIT:
+        raise SavedChatLimitError(
+            f"Maksimal {SAVED_CHAT_LIMIT} paguneman tiasa disimpen. "
+            "Pupus heula salah sahiji paguneman."
+        )
+    updated = [item for item in saved_chats if item["chat_id"] != chat_id]
+    updated.insert(0, {"chat_id": chat_id, "name": name})
+    return updated
+
+
+def get_saved_chats(client: Any | None, uid: str) -> list[dict[str, str]]:
+    """Read the user's named chat list."""
+    if client is None:
+        raise ChatStoreError("Penyimpanan riwayat tidak tersedia.")
+
+    def read_saved_chats() -> list[dict[str, str]]:
+        user_data = (
+            client.collection("users")
+            .document(uid)
+            .get(timeout=FIRESTORE_READ_TIMEOUT_SECONDS, retry=None)
+            .to_dict()
+            or {}
+        )
+        return _valid_saved_chats(user_data.get("saved_chats", []))
+
+    failed = object()
+    result = _bounded_read(
+        client,
+        read_saved_chats,
+        timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+        context="pembacaan daftar chat simpan",
+        fallback=failed,
+    )
+    if result is failed:
+        raise ChatStoreError("Daftar chat simpan tidak berhasil dimuat.")
+    return result
+
+
+def save_named_chat(
+    client: Any | None,
+    uid: str,
+    chat_id: str,
+    name: str,
+) -> list[dict[str, str]]:
+    """Save or rename a chat, enforcing the per-device chat limit."""
+    clean_name = name.strip()
+    if not _CHAT_ID_RE.fullmatch(chat_id):
+        raise ValueError("ID paguneman henteu valid.")
+    if not clean_name:
+        raise ValueError("Lebetkeun heula nami paguneman.")
+    if len(clean_name) > _SAVED_CHAT_NAME_LIMIT:
+        raise ValueError(
+            f"Nami paguneman maksimal {_SAVED_CHAT_NAME_LIMIT} karakter."
+        )
+    return _run_chat_mutation(
+        client,
+        _save_named_chat,
+        uid,
+        chat_id,
+        clean_name,
+        context="nyimpen paguneman",
+    )
+
+
+def _save_named_chat(
+    client: Any,
+    uid: str,
+    chat_id: str,
+    name: str,
+) -> list[dict[str, str]]:
+    from google.cloud import firestore
+
+    user_ref = client.collection("users").document(uid)
+    transaction = client.transaction()
+
+    @firestore.transactional
+    def save(transaction: Any) -> list[dict[str, str]]:
+        snapshot = _transaction_snapshot(transaction, user_ref)
+        user_data = snapshot.to_dict() or {}
+        saved = _valid_saved_chats(user_data.get("saved_chats", []))
+        saved = _upsert_saved_chat(saved, chat_id, name)
+        transaction.set(
+            user_ref,
+            {
+                "saved_chats": saved,
+                "chat_ids": firestore.ArrayUnion([chat_id]),
+            },
+            merge=True,
+        )
+        return saved
+
+    return save(transaction)
+
+
+def delete_user_chat(
+    client: Any | None, uid: str, chat_id: str
+) -> dict[str, int]:
+    """Delete one chat's chunks and remove its saved/list metadata."""
+    if not _CHAT_ID_RE.fullmatch(chat_id):
+        raise ValueError("ID paguneman henteu valid.")
+    return _run_chat_mutation(
+        client,
+        _delete_user_chat,
+        uid,
+        chat_id,
+        context="ngahapus paguneman",
+    )
+
+
+def _delete_chat_contents(
+    client: Any, user_ref: Any, chat_id: str
+) -> tuple[int, int, int]:
+    chat_ref = user_ref.collection("chats").document(chat_id)
+    chunks = chat_ref.collection("chunks").stream(
+        timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+        retry=None,
+    )
+    batch = client.batch()
+    pending = 0
+    message_count = 0
+    question_count = 0
+    chunk_count = 0
+    for chunk in chunks:
+        chunk_data = chunk.to_dict() or {}
+        messages = chunk_data.get("messages", [])
+        if isinstance(messages, list):
+            message_count += len(messages)
+            question_count += sum(
+                isinstance(message, dict) and message.get("role") == "user"
+                for message in messages
+            )
+        batch.delete(chunk.reference)
+        pending += 1
+        chunk_count += 1
+        if pending >= 450:
+            batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
+            batch = client.batch()
+            pending = 0
+    batch.delete(chat_ref)
+    batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
+    return message_count, question_count, chunk_count
+
+
+def _delete_user_chat(client: Any, uid: str, chat_id: str) -> dict[str, int]:
+    user_ref = client.collection("users").document(uid)
+    user_snapshot = user_ref.get(
+        timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+        retry=None,
+    )
+    user_data = user_snapshot.to_dict() or {}
+    message_count, question_count, chunk_count = _delete_chat_contents(
+        client, user_ref, chat_id
+    )
+    chat_ids = user_data.get("chat_ids", [])
+    chat_ids = (
+        [value for value in chat_ids if isinstance(value, str) and value != chat_id]
+        if isinstance(chat_ids, list)
+        else []
+    )
+    active_chat_id = user_data.get("active_chat_id")
+    saved = [
+        item
+        for item in _valid_saved_chats(user_data.get("saved_chats", []))
+        if item["chat_id"] != chat_id
+    ]
+    updated_stats = {
+        "total_messages": max(
+            0, int(user_data.get("total_messages", 0)) - message_count
+        ),
+        "total_questions": max(
+            0, int(user_data.get("total_questions", 0)) - question_count
+        ),
+        "total_chunks": max(
+            0, int(user_data.get("total_chunks", 0)) - chunk_count
+        ),
+    }
+    user_ref.set(
+        {
+            "chat_ids": chat_ids,
+            "saved_chats": saved,
+            "active_chat_id": None if active_chat_id == chat_id else active_chat_id,
+            **updated_stats,
+        },
+        merge=True,
+        timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS,
+    )
+    return updated_stats
+
+
+def delete_all_user_chats(client: Any | None, uid: str) -> None:
+    """Delete every chat and clear saved-chat metadata for one device."""
+    _run_chat_mutation(
+        client,
+        _delete_all_user_chats,
+        uid,
+        context="ngahapus sadaya paguneman",
+    )
+
+
+def _delete_all_user_chats(client: Any, uid: str) -> None:
+    user_ref = client.collection("users").document(uid)
+    user_snapshot = user_ref.get(
+        timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+        retry=None,
+    )
+    user_data = user_snapshot.to_dict() or {}
+    raw_ids = user_data.get("chat_ids", [])
+    chat_ids = (
+        [item for item in raw_ids if isinstance(item, str)]
+        if isinstance(raw_ids, list)
+        else []
+    )
+    active_chat_id = user_data.get("active_chat_id")
+    if isinstance(active_chat_id, str) and active_chat_id:
+        chat_ids.append(active_chat_id)
+    chat_ids.extend(
+        item["chat_id"]
+        for item in _valid_saved_chats(user_data.get("saved_chats", []))
+    )
+    chat_ids.extend(
+        snapshot.id
+        for snapshot in user_ref.collection("chats").stream(
+            timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+            retry=None,
+        )
+    )
+
+    for chat_id in dict.fromkeys(chat_ids):
+        if _CHAT_ID_RE.fullmatch(chat_id):
+            _delete_chat_contents(client, user_ref, chat_id)
+
+    user_ref.set(
+        {
+            "chat_ids": [],
+            "saved_chats": [],
+            "active_chat_id": None,
+            "total_questions": 0,
+            "total_messages": 0,
+            "total_chunks": 0,
+        },
+        merge=True,
+        timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS,
+    )
+
+
 def enqueue_question_answer(
     client: Any | None,
     uid: str,
@@ -969,44 +1314,5 @@ def _mark_active(client: Any, uid: str, now: datetime, hour_key: str) -> None:
 
 
 def clear_user_history(client: Any | None, uid: str) -> None:
-    """Jadwalkan penghapusan semua chunk tanpa menghapus statistik FAQ."""
-    if client is None or _circuit_is_open():
-        return
-    _WRITE_EXECUTOR.submit(_clear_user_history, client, uid)
-
-
-def _clear_user_history(client: Any, uid: str) -> None:
-    try:
-        user_ref = client.collection("users").document(uid)
-        chats = user_ref.collection("chats").stream(
-            timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
-            retry=None,
-        )
-        batch = client.batch()
-        pending = 0
-        for chat in chats:
-            for chunk in chat.reference.collection("chunks").stream(
-                timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
-                retry=None,
-            ):
-                batch.delete(chunk.reference)
-                pending += 1
-                if pending == 450:
-                    batch.commit(
-                        timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS,
-                        retry=None,
-                    )
-                    batch = client.batch()
-                    pending = 0
-        batch.set(
-            user_ref,
-            {
-                "total_questions": 0,
-                "total_messages": 0,
-                "total_chunks": 0,
-            },
-            merge=True,
-        )
-        batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
-    except Exception as error:
-        _trip_circuit(error, f"penghapusan riwayat perangkat {uid[:6]}")
+    """Compatibility wrapper for callers that clear all chats."""
+    delete_all_user_chats(client, uid)

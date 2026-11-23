@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timezone
 
 from services.admin_logic import (
+    hash_settings_password,
     process_admin_login,
     question_is_allowed,
     register_admin_button_click,
@@ -45,6 +46,13 @@ class AdminLogicTests(unittest.TestCase):
         encoded_hash = f"pbkdf2_sha256$200000$unit-test-salt${digest}"
 
         self.assertTrue(verify_admin_code("secret", encoded_hash))
+        self.assertFalse(verify_admin_code("wrong", encoded_hash))
+
+    def test_settings_password_is_hashed_and_verifiable(self) -> None:
+        encoded_hash = hash_settings_password("settings-secret")
+
+        self.assertNotIn("settings-secret", encoded_hash)
+        self.assertTrue(verify_admin_code("settings-secret", encoded_hash))
         self.assertFalse(verify_admin_code("wrong", encoded_hash))
 
     def test_admin_login_authenticates_matching_secret(self) -> None:

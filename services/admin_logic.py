@@ -8,6 +8,7 @@ import hashlib
 import hmac
 from math import ceil
 import re
+import secrets
 from zoneinfo import ZoneInfo
 
 _WIB = ZoneInfo("Asia/Jakarta")
@@ -45,6 +46,18 @@ def verify_admin_code(code: str, encoded_hash: str) -> bool:
         return len(expected) > 0 and hmac.compare_digest(actual, expected)
     except (ValueError, OverflowError):
         return False
+
+
+def hash_settings_password(password: str) -> str:
+    """Hash a settings password entered by an authenticated administrator."""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000,
+    ).hex()
+    return f"pbkdf2_sha256$200000${salt}${digest}"
 
 
 def process_admin_login(
