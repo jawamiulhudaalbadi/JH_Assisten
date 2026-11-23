@@ -919,6 +919,7 @@ def _process_admin_command(command: str) -> bool:
         ADMIN_CODE_HASH,
         st.session_state,
         time.monotonic(),
+        DEVICE_UID,
         empty_code_notice="Gunakan format /admin <kode>.",
     )
     return True
@@ -1495,6 +1496,7 @@ def _render_admin_login_prompt() -> None:
                 ADMIN_CODE_HASH,
                 st.session_state,
                 time.monotonic(),
+                DEVICE_UID,
             )
             if authenticated:
                 st.rerun()

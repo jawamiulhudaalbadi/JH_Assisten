@@ -2,6 +2,7 @@ import hashlib
 import unittest
 from datetime import datetime, timezone
 
+import services.admin_logic as admin_logic
 from services.admin_logic import (
     hash_settings_password,
     process_admin_login,
@@ -13,6 +14,13 @@ from services.firestore_store import normalize_question
 
 
 class AdminLogicTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with admin_logic._PROCESS_ADMIN_LOCK:
+            admin_logic._PROCESS_ADMIN_FAILED_ATTEMPTS_BY_UID.clear()
+            admin_logic._PROCESS_ADMIN_LOCKED_UNTIL_BY_UID.clear()
+            admin_logic._PROCESS_ADMIN_FAILED_ATTEMPTS = 0
+            admin_logic._PROCESS_ADMIN_LOCKED_UNTIL = 0.0
+
     def test_normalize_question_groups_case_punctuation_and_spacing(self) -> None:
         self.assertEqual(
             normalize_question("  Bagaimana   Hukum-Nya? "),
@@ -66,6 +74,7 @@ class AdminLogicTests(unittest.TestCase):
                 f"pbkdf2_sha256$200000$unit-test-salt${digest}",
                 state,
                 now=100.0,
+                uid="login-success-uid",
             )
         )
         self.assertTrue(state["admin_authenticated"])
@@ -81,15 +90,82 @@ class AdminLogicTests(unittest.TestCase):
 
         for _ in range(5):
             self.assertFalse(
-                process_admin_login("wrong", encoded_hash, state, now=100.0)
+                process_admin_login(
+                    "wrong", encoded_hash, state, now=100.0, uid="lockout-uid"
+                )
             )
 
         self.assertEqual(state["admin_locked_until"], 100.0 + 15 * 60)
         self.assertFalse(
-            process_admin_login("secret", encoded_hash, state, now=101.0)
+            process_admin_login(
+                "secret", encoded_hash, state, now=101.0, uid="lockout-uid"
+            )
         )
         self.assertNotIn("admin_authenticated", state)
         self.assertIn("terkunci", str(state["_admin_login_notice"]))
+
+    def test_admin_lockout_survives_session_refresh(self) -> None:
+        salt = b"unit-test-salt"
+        digest = hashlib.pbkdf2_hmac("sha256", b"secret", salt, 200_000).hex()
+        encoded_hash = f"pbkdf2_sha256$200000$unit-test-salt${digest}"
+        original_session: dict[str, object] = {}
+
+        for _ in range(3):
+            self.assertFalse(
+                process_admin_login(
+                    "wrong", encoded_hash, original_session, now=100.0, uid="shared-uid"
+                )
+            )
+
+        another_uid_session: dict[str, object] = {}
+        self.assertTrue(
+            process_admin_login(
+                "secret",
+                encoded_hash,
+                another_uid_session,
+                now=100.0,
+                uid="another-uid",
+            )
+        )
+
+        second_session: dict[str, object] = {}
+        for _ in range(2):
+            self.assertFalse(
+                process_admin_login(
+                    "wrong", encoded_hash, second_session, now=100.0, uid="shared-uid"
+                )
+            )
+
+        refreshed_session: dict[str, object] = {}
+        self.assertFalse(
+            process_admin_login(
+                "secret", encoded_hash, refreshed_session, now=101.0, uid="shared-uid"
+            )
+        )
+        self.assertIn("terkunci", str(refreshed_session["_admin_login_notice"]))
+
+    def test_admin_lockout_uses_global_failures_across_uids(self) -> None:
+        salt = b"unit-test-salt"
+        digest = hashlib.pbkdf2_hmac("sha256", b"secret", salt, 200_000).hex()
+        encoded_hash = f"pbkdf2_sha256$200000$unit-test-salt${digest}"
+
+        for uid in ("first-uid", "second-uid", "third-uid", "fourth-uid"):
+            self.assertFalse(
+                process_admin_login(
+                    "wrong", encoded_hash, {}, now=100.0, uid=uid
+                )
+            )
+        self.assertFalse(
+            process_admin_login("wrong", encoded_hash, {}, now=100.0, uid="fifth-uid")
+        )
+
+        other_uid_state: dict[str, object] = {}
+        self.assertFalse(
+            process_admin_login(
+                "secret", encoded_hash, other_uid_state, now=101.0, uid="other-uid"
+            )
+        )
+        self.assertIn("terkunci", str(other_uid_state["_admin_login_notice"]))
 
     def test_sidebar_admin_prompt_opens_after_three_button_clicks(self) -> None:
         state: dict[str, object] = {}

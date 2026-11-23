@@ -9,11 +9,17 @@ import hmac
 from math import ceil
 import re
 import secrets
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 _WIB = ZoneInfo("Asia/Jakarta")
 _PBKDF2_RE = re.compile(r"^pbkdf2_sha256\$(\d+)\$([^$]+)\$([0-9a-fA-F]+)$")
 _SCRYPT_RE = re.compile(r"^scrypt\$([^$]+)\$([0-9a-fA-F]+)$")
+_PROCESS_ADMIN_LOCK = Lock()
+_PROCESS_ADMIN_FAILED_ATTEMPTS_BY_UID: dict[str, int] = {}
+_PROCESS_ADMIN_LOCKED_UNTIL_BY_UID: dict[str, float] = {}
+_PROCESS_ADMIN_FAILED_ATTEMPTS = 0
+_PROCESS_ADMIN_LOCKED_UNTIL = 0.0
 
 
 def verify_admin_code(code: str, encoded_hash: str) -> bool:
@@ -65,50 +71,84 @@ def process_admin_login(
     encoded_hash: str,
     session_state: MutableMapping[str, object],
     now: float,
+    uid: str,
     empty_code_notice: str = "Kode admin belum diisi.",
 ) -> bool:
-    """Validate an admin login and update its session lockout state."""
-    locked_until = float(session_state.get("admin_locked_until", 0))
-    if now < locked_until:
-        remaining = ceil(locked_until - now)
-        session_state["_admin_login_notice"] = (
-            f"Login admin terkunci. Coba lagi dalam {remaining} detik."
-        )
-        return False
-    if locked_until:
-        session_state["admin_failed_attempts"] = 0
-        session_state.pop("admin_locked_until", None)
+    """Validate an admin login with session and process-wide lockout state."""
+    global _PROCESS_ADMIN_FAILED_ATTEMPTS, _PROCESS_ADMIN_LOCKED_UNTIL
 
-    if not code:
-        session_state["_admin_login_notice"] = empty_code_notice
-        return False
-    if not encoded_hash:
-        session_state["_admin_login_notice"] = (
-            "Dashboard admin terkunci: secret ADMIN_CODE_HASH belum diatur."
-        )
-        return False
-    if verify_admin_code(code, encoded_hash):
-        session_state["admin_failed_attempts"] = 0
-        session_state.pop("admin_locked_until", None)
-        session_state["_admin_login_prompt_open"] = False
-        session_state["_admin_button_clicks"] = 0
-        session_state["admin_authenticated"] = True
-        session_state.pop("_admin_login_notice", None)
-        return True
+    with _PROCESS_ADMIN_LOCK:
+        session_locked_until = float(session_state.get("admin_locked_until", 0))
+        uid_locked_until = _PROCESS_ADMIN_LOCKED_UNTIL_BY_UID.get(uid, 0.0)
+        if now >= uid_locked_until and uid_locked_until:
+            _PROCESS_ADMIN_LOCKED_UNTIL_BY_UID.pop(uid, None)
+            _PROCESS_ADMIN_FAILED_ATTEMPTS_BY_UID.pop(uid, None)
+            uid_locked_until = 0.0
+        if now >= _PROCESS_ADMIN_LOCKED_UNTIL and _PROCESS_ADMIN_LOCKED_UNTIL:
+            _PROCESS_ADMIN_LOCKED_UNTIL = 0.0
+            _PROCESS_ADMIN_FAILED_ATTEMPTS = 0
+        if now >= session_locked_until and session_locked_until:
+            session_state["admin_failed_attempts"] = 0
+            session_state.pop("admin_locked_until", None)
+            session_locked_until = 0.0
 
-    attempts = int(session_state.get("admin_failed_attempts", 0)) + 1
-    if attempts >= 5:
-        session_state["admin_failed_attempts"] = 5
-        session_state["admin_locked_until"] = now + 15 * 60
-        session_state["_admin_login_notice"] = (
-            "Lima percobaan gagal. Login admin terkunci selama 15 menit."
+        locked_until = max(
+            session_locked_until,
+            uid_locked_until,
+            _PROCESS_ADMIN_LOCKED_UNTIL,
         )
-    else:
-        session_state["admin_failed_attempts"] = attempts
-        session_state["_admin_login_notice"] = (
-            f"Kode admin salah ({attempts}/5 percobaan)."
+        if now < locked_until:
+            remaining = ceil(locked_until - now)
+            session_state["_admin_login_notice"] = (
+                f"Login admin terkunci. Coba lagi dalam {remaining} detik."
+            )
+            return False
+
+        if not code:
+            session_state["_admin_login_notice"] = empty_code_notice
+            return False
+        if not encoded_hash:
+            session_state["_admin_login_notice"] = (
+                "Dashboard admin terkunci: secret ADMIN_CODE_HASH belum diatur."
+            )
+            return False
+        if verify_admin_code(code, encoded_hash):
+            _PROCESS_ADMIN_FAILED_ATTEMPTS_BY_UID.pop(uid, None)
+            _PROCESS_ADMIN_LOCKED_UNTIL_BY_UID.pop(uid, None)
+            _PROCESS_ADMIN_FAILED_ATTEMPTS = 0
+            _PROCESS_ADMIN_LOCKED_UNTIL = 0.0
+            session_state["admin_failed_attempts"] = 0
+            session_state.pop("admin_locked_until", None)
+            session_state["_admin_login_prompt_open"] = False
+            session_state["_admin_button_clicks"] = 0
+            session_state["admin_authenticated"] = True
+            session_state.pop("_admin_login_notice", None)
+            return True
+
+        uid_attempts = _PROCESS_ADMIN_FAILED_ATTEMPTS_BY_UID.get(uid, 0) + 1
+        global_attempts = _PROCESS_ADMIN_FAILED_ATTEMPTS + 1
+        _PROCESS_ADMIN_FAILED_ATTEMPTS_BY_UID[uid] = uid_attempts
+        _PROCESS_ADMIN_FAILED_ATTEMPTS = global_attempts
+        attempts = max(
+            int(session_state.get("admin_failed_attempts", 0)) + 1,
+            uid_attempts,
+            global_attempts,
         )
-    return False
+        if attempts >= 5:
+            lockout_until = now + 15 * 60
+            session_state["admin_failed_attempts"] = 5
+            session_state["admin_locked_until"] = lockout_until
+            _PROCESS_ADMIN_LOCKED_UNTIL_BY_UID[uid] = lockout_until
+            _PROCESS_ADMIN_LOCKED_UNTIL = lockout_until
+            session_state["_admin_login_notice"] = (
+                "Lima percobaan gagal. Login admin terkunci selama 15 menit."
+            )
+        else:
+            session_state["admin_failed_attempts"] = attempts
+            session_state["_admin_login_notice"] = (
+                f"Kode admin salah ({attempts}/5 percobaan)."
+            )
+        return False
 
 
 def register_admin_button_click(
