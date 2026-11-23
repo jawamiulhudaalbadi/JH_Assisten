@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -31,6 +32,7 @@ KEY_SEEDS = {
     "admin": "GOOGLE_API_KEY_ADMIN",
 }
 FIRESTORE_KEY_TIMEOUT_SECONDS = 2.0
+FIRESTORE_ADMIN_TIMEOUT_SECONDS = 10.0
 KEY_CACHE_SECONDS = 60.0
 _PACIFIC = ZoneInfo("America/Los_Angeles")
 _CACHE_LOCK = threading.RLock()
@@ -79,6 +81,7 @@ def get_keys(
     secrets: Mapping[str, Any],
     *,
     refresh: bool = False,
+    admin: bool = False,
 ) -> tuple[ManagedKey, ...]:
     """Return persisted keys or the group-specific seed, falling back offline."""
     _validate_group(group)
@@ -93,12 +96,19 @@ def get_keys(
     records: tuple[ManagedKey, ...] = ()
     seed_disabled = False
     loaded = False
-    if client is not None and firestore_status()["connected"]:
+    if client is not None and (
+        admin or firestore_status()["connected"]
+    ):
         try:
+            timeout = (
+                FIRESTORE_ADMIN_TIMEOUT_SECONDS
+                if admin
+                else FIRESTORE_KEY_TIMEOUT_SECONDS
+            )
             snapshot = (
                 client.collection("config")
                 .document(KEY_DOCUMENTS[group])
-                .get(timeout=FIRESTORE_KEY_TIMEOUT_SECONDS, retry=None)
+                .get(timeout=timeout, retry=None)
             )
             data = snapshot.to_dict() or {}
             stored_records = data.get("keys", [])
@@ -108,10 +118,13 @@ def get_keys(
             )
             loaded = True
         except Exception as error:
-            _trip_circuit(
-                RuntimeError(type(error).__name__),
-                f"pembacaan kelompok key {group}",
-            )
+            if admin:
+                raise KeyPoolError(
+                    "Pembacaan kelompok API key gagal "
+                    f"({type(error).__name__}): "
+                    f"{_safe_admin_error(error, group, secrets)}"
+                ) from error
+            _trip_circuit(error, f"pembacaan kelompok key {group}")
             logger.warning(
                 "API key group read failed group=%s error_class=%s",
                 group,
@@ -174,13 +187,13 @@ def add_key(
     if clean_key in clean_label:
         clean_label = f"Key {key_fingerprint(clean_key)}"
 
-    current = list(get_keys(group, client, secrets, refresh=True))
+    current = list(get_keys(group, client, secrets, refresh=True, admin=True))
     sid = key_fingerprint(clean_key)
     if any(item.sid == sid for item in current):
         raise KeyPoolError("API key ieu parantos aya dina kelompokna.")
     new_key = ManagedKey(sid, clean_label, True, None, "", clean_key)
     current.append(new_key)
-    _save_group(group, client, secrets, current)
+    _save_group(group, client, secrets, current, admin=True)
     return new_key
 
 
@@ -190,14 +203,21 @@ def remove_key(
     secrets: Mapping[str, Any],
     sid: str,
 ) -> None:
-    current = list(get_keys(group, client, secrets, refresh=True))
+    current = list(get_keys(group, client, secrets, refresh=True, admin=True))
     updated = [item for item in current if item.sid != sid]
     if len(updated) == len(current):
         raise KeyPoolError("API key henteu kapendak.")
     seed_disabled = any(
         item.sid == sid and item.label == f"Seed {group}" for item in current
     )
-    _save_group(group, client, secrets, updated, seed_disabled=seed_disabled)
+    _save_group(
+        group,
+        client,
+        secrets,
+        updated,
+        seed_disabled=seed_disabled,
+        admin=True,
+    )
 
 
 def set_key_enabled(
@@ -207,7 +227,7 @@ def set_key_enabled(
     sid: str,
     enabled: bool,
 ) -> None:
-    current = list(get_keys(group, client, secrets, refresh=True))
+    current = list(get_keys(group, client, secrets, refresh=True, admin=True))
     updated = [
         replace(item, enabled=enabled) if item.sid == sid else item
         for item in current
@@ -216,7 +236,7 @@ def set_key_enabled(
         if not any(item.sid == sid for item in current):
             raise KeyPoolError("API key henteu kapendak.")
         return
-    _save_group(group, client, secrets, updated)
+    _save_group(group, client, secrets, updated, admin=True)
 
 
 def record_quota(
@@ -290,6 +310,8 @@ def get_key_status(
 def get_model_order(
     client: Any | None,
     secrets: Mapping[str, Any],
+    *,
+    admin: bool = False,
 ) -> dict[str, Any]:
     global _MODEL_ORDER_CACHE
     now = time.monotonic()
@@ -305,12 +327,19 @@ def get_model_order(
             or os.getenv("GEMINI_CHAT_MODELS", "")
         ),
     }
-    if client is not None and firestore_status()["connected"]:
+    if client is not None and (admin or firestore_status()["connected"]):
         try:
             snapshot = (
                 client.collection("config")
                 .document("model_order")
-                .get(timeout=FIRESTORE_KEY_TIMEOUT_SECONDS, retry=None)
+                .get(
+                    timeout=(
+                        FIRESTORE_ADMIN_TIMEOUT_SECONDS
+                        if admin
+                        else FIRESTORE_KEY_TIMEOUT_SECONDS
+                    ),
+                    retry=None,
+                )
             )
             data = snapshot.to_dict() or {}
             mode = data.get("mode")
@@ -321,10 +350,13 @@ def get_model_order(
                     models=[str(model) for model in models if str(model).strip()],
                 )
         except Exception as error:
-            _trip_circuit(
-                RuntimeError(type(error).__name__),
-                "pembacaan urutan model",
-            )
+            if admin:
+                raise KeyPoolError(
+                    "Pembacaan urutan model gagal "
+                    f"({type(error).__name__}): "
+                    f"{_safe_admin_error(error, 'model_order', secrets)}"
+                ) from error
+            _trip_circuit(error, "pembacaan urutan model")
             logger.warning(
                 "Model order read failed error_class=%s",
                 type(error).__name__,
@@ -340,7 +372,7 @@ def save_model_order(
     models: Sequence[str],
 ) -> None:
     global _MODEL_ORDER_CACHE
-    if client is None or not firestore_status()["connected"]:
+    if client is None:
         raise KeyPoolError("Firestore teu sayogi pikeun nyimpen urutan model.")
     if mode not in {"automatic", "manual"}:
         raise KeyPoolError("Mode urutan model henteu valid.")
@@ -348,11 +380,14 @@ def save_model_order(
     try:
         client.collection("config").document("model_order").set(
             data,
-            timeout=FIRESTORE_KEY_TIMEOUT_SECONDS,
+            timeout=FIRESTORE_ADMIN_TIMEOUT_SECONDS,
         )
     except Exception as error:
-        _trip_circuit(RuntimeError(type(error).__name__), "penyimpanan urutan model")
-        raise KeyPoolError("Urutan model teu tiasa disimpen.") from None
+        raise KeyPoolError(
+            "Penyimpanan urutan model gagal "
+            f"({type(error).__name__}): "
+            f"{_safe_admin_error(error, 'model_order', {})}"
+        ) from error
     with _CACHE_LOCK:
         _MODEL_ORDER_CACHE = (time.monotonic(), data)
 
@@ -411,8 +446,9 @@ def _save_group(
     records: Sequence[ManagedKey],
     *,
     seed_disabled: bool | None = None,
+    admin: bool = False,
 ) -> None:
-    if client is None or not firestore_status()["connected"]:
+    if client is None or (not admin and not firestore_status()["connected"]):
         raise KeyPoolError("Firestore teu sayogi pikeun nyimpen API key.")
     cipher = _get_cipher(secrets)
     encrypted_records = []
@@ -440,14 +476,22 @@ def _save_group(
     try:
         client.collection("config").document(KEY_DOCUMENTS[group]).set(
             {"keys": encrypted_records, "seed_disabled": disabled},
-            timeout=FIRESTORE_KEY_TIMEOUT_SECONDS,
+            timeout=(
+                FIRESTORE_ADMIN_TIMEOUT_SECONDS
+                if admin
+                else FIRESTORE_KEY_TIMEOUT_SECONDS
+            ),
         )
     except Exception as error:
-        _trip_circuit(
-            RuntimeError(type(error).__name__),
-            f"penyimpanan kelompok key {group}",
-        )
-        raise KeyPoolError("API key teu tiasa disimpen.") from None
+        sensitive_keys = [item.key for item in records]
+        if not admin:
+            _trip_circuit(error, f"penyimpanan kelompok key {group}")
+            raise KeyPoolError("API key teu tiasa disimpen.") from error
+        raise KeyPoolError(
+            "Penyimpanan API key gagal "
+            f"({type(error).__name__}): "
+            f"{_safe_admin_error(error, group, secrets, *sensitive_keys)}"
+        ) from error
     with _CACHE_LOCK:
         _KEY_CACHE[group] = (time.monotonic(), tuple(records))
         _SEED_DISABLED[group] = disabled
@@ -524,6 +568,21 @@ def _safe_label(label: str, key: str) -> str:
 def _validate_group(group: str) -> None:
     if group not in KEY_GROUPS:
         raise KeyPoolError("Kelompok API key henteu valid.")
+
+
+def _safe_admin_error(
+    error: BaseException,
+    context: str,
+    secrets: Mapping[str, Any],
+    *sensitive_values: str,
+) -> str:
+    message = str(error)
+    seed = str(secrets.get(KEY_SEEDS.get(context, ""), "") or "")
+    for value in (seed, *sensitive_values):
+        if value:
+            message = message.replace(value, "[disamarkan]")
+    message = re.sub(r"\b[a-f0-9]{16,32}\b", "[UID]", message, flags=re.IGNORECASE)
+    return message[:200]
 
 
 def _parse_datetime(value: Any) -> datetime | None:

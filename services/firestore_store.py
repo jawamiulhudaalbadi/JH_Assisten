@@ -25,29 +25,38 @@ HISTORY_WARNING_MESSAGES = 200
 HISTORY_WARNING_CHUNKS = 10
 FIRESTORE_READ_TIMEOUT_SECONDS = 5.0
 FIRESTORE_WRITE_TIMEOUT_SECONDS = 10.0
+FIRESTORE_ADMIN_TIMEOUT_SECONDS = 10.0
 FIRESTORE_WRITE_QUEUE_LIMIT = 200
 FIRESTORE_WRITE_RETRY_DELAYS = (1.0, 3.0, 8.0)
 HISTORY_LOAD_TIMEOUT_SECONDS = 5.0
 FIRESTORE_CIRCUIT_SECONDS = 120.0
 RUNTIME_CONFIG_CACHE_SECONDS = 300.0
-RUNTIME_CONFIG_READ_WAIT_SECONDS = 0.1
+RUNTIME_CONFIG_READ_TIMEOUT_SECONDS = 5.0
+RUNTIME_CONFIG_RETRY_SECONDS = 5.0
 _WIB = ZoneInfo("Asia/Jakarta")
 _WRITE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="firestore-write")
 _READ_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="firestore-read")
+_DEVICE_UID_RE = re.compile(r"^[a-f0-9]{16,32}$")
 _CIRCUIT_LOCK = threading.Lock()
 _CIRCUIT_OPEN_UNTIL = 0.0
 _CIRCUIT_FAILURE_LOGGED = False
 _RUNTIME_CONFIG_LOCK = threading.Lock()
-_RUNTIME_CONFIG: dict[str, Any] = {
+_RUNTIME_CONFIG_DEFAULTS: dict[str, Any] = {
     "maintenance": False,
     "announcement": "",
     "daily_question_limit": 0,
     "settings_password_hash": "",
 }
+_RUNTIME_CONFIG: dict[str, Any] = dict(_RUNTIME_CONFIG_DEFAULTS)
 SAVED_CHAT_LIMIT = 5
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 _SAVED_CHAT_NAME_LIMIT = 60
 _RUNTIME_CONFIG_LOADED_AT = 0.0
+_RUNTIME_CONFIG_LAST_ATTEMPT_AT = 0.0
+_RUNTIME_CONFIG_REFRESH_ID = 0
+_RUNTIME_CONFIG_REFRESHING = False
+_RUNTIME_CONFIG_SKIPPED_TIMEOUTS = 0
+_RUNTIME_CONFIG_VERSION = 0
 _RECENT_ERRORS: list[dict[str, str]] = []
 _RECENT_ERRORS_LOCK = threading.Lock()
 _ERRORS_FLUSHED_AT = 0.0
@@ -74,6 +83,7 @@ _WRITE_HEALTH: dict[str, Any] = {
     "writes_retried": 0,
     "writes_dropped": 0,
     "last_error": "",
+    "last_error_by_kind": {},
 }
 
 
@@ -137,6 +147,7 @@ def firestore_status() -> dict[str, Any]:
         remaining = max(0.0, _CIRCUIT_OPEN_UNTIL - time.monotonic())
     return {
         "connected": remaining == 0,
+        "circuit_open": remaining > 0,
         "circuit_open_seconds": round(remaining),
     }
 
@@ -154,7 +165,46 @@ def firestore_write_health() -> dict[str, Any]:
         if remaining
         else None
     )
+    with _RUNTIME_CONFIG_LOCK:
+        health["runtime_config_skipped_timeouts"] = (
+            _RUNTIME_CONFIG_SKIPPED_TIMEOUTS
+        )
     return health
+
+
+def _safe_error_message(error: BaseException, *sensitive_values: str) -> str:
+    message = str(error)
+    for value in sensitive_values:
+        if value:
+            message = message.replace(value, "[disamarkan]")
+    message = re.sub(r"\b[a-f0-9]{16,32}\b", "[UID]", message, flags=re.IGNORECASE)
+    return message[:240]
+
+
+def _firestore_failure_kind(error: BaseException) -> str | None:
+    """Return a circuit-worthy RPC failure, excluding local timeout budgets."""
+    code = getattr(error, "code", None)
+    if callable(code):
+        try:
+            code = code()
+        except Exception:
+            code = None
+    code_name = str(getattr(code, "name", None) or code or "").upper()
+    error_name = type(error).__name__.upper().replace("_", "")
+    if "UNAVAILABLE" in code_name or error_name in {
+        "UNAVAILABLE",
+        "SERVICEUNAVAILABLE",
+    }:
+        return "UNAVAILABLE"
+    if "DEADLINE_EXCEEDED" in code_name or error_name == "DEADLINEEXCEEDED":
+        return "DEADLINE_EXCEEDED"
+    if "PERMISSION_DENIED" in code_name or error_name == "PERMISSIONDENIED":
+        return "PERMISSION_DENIED"
+    return None
+
+
+def _is_local_timeout(error: BaseException) -> bool:
+    return type(error) is TimeoutError or isinstance(error, FutureTimeoutError)
 
 
 def _record_recent_error(error: BaseException, context: str) -> None:
@@ -170,6 +220,9 @@ def _record_recent_error(error: BaseException, context: str) -> None:
 
 def _trip_circuit(error: BaseException, context: str) -> None:
     global _CIRCUIT_OPEN_UNTIL, _CIRCUIT_FAILURE_LOGGED
+    failure_kind = _firestore_failure_kind(error)
+    if failure_kind is None:
+        return
     _record_recent_error(error, context)
     with _CIRCUIT_LOCK:
         now = time.monotonic()
@@ -179,7 +232,13 @@ def _trip_circuit(error: BaseException, context: str) -> None:
         should_log = not _CIRCUIT_FAILURE_LOGGED
         _CIRCUIT_FAILURE_LOGGED = True
     if should_log:
-        logger.error("Firestore dinonaktifkan sementara (%s): %s", context, error)
+        logger.error(
+            "Firestore dinonaktifkan sementara (%s) kind=%s error_class=%s: %s",
+            context,
+            failure_kind,
+            type(error).__name__,
+            _safe_error_message(error),
+        )
 
 
 def _circuit_is_open() -> bool:
@@ -208,12 +267,26 @@ def _bounded_read(
         return future.result(timeout=max(0.01, timeout))
     except FutureTimeoutError:
         future.cancel()
-        _trip_circuit(
+        _record_recent_error(
             TimeoutError(f"Pembacaan melampaui batas {timeout:g} detik."),
-            context,
+            f"{context} (anggaran waktu lokal)",
         )
     except Exception as error:
-        _trip_circuit(error, context)
+        if _firestore_failure_kind(error) is None:
+            _record_recent_error(
+                RuntimeError(
+                    f"{type(error).__name__}: {_safe_error_message(error)}"
+                ),
+                context,
+            )
+            logger.warning(
+                "Firestore read failed context=%s error_class=%s: %s",
+                context,
+                type(error).__name__,
+                _safe_error_message(error),
+            )
+        else:
+            _trip_circuit(error, context)
     return fallback
 
 
@@ -227,7 +300,10 @@ def _remaining_timeout(deadline: float, maximum: float) -> float:
 def reset_firestore_circuit() -> None:
     """Reset process-local state for isolated tests."""
     global _CIRCUIT_OPEN_UNTIL, _CIRCUIT_FAILURE_LOGGED
-    global _RUNTIME_CONFIG_LOADED_AT, _ERRORS_FLUSHED_AT
+    global _RUNTIME_CONFIG_LOADED_AT, _RUNTIME_CONFIG_LAST_ATTEMPT_AT
+    global _RUNTIME_CONFIG_REFRESH_ID, _RUNTIME_CONFIG_REFRESHING
+    global _RUNTIME_CONFIG_SKIPPED_TIMEOUTS, _RUNTIME_CONFIG_VERSION
+    global _ERRORS_FLUSHED_AT
     global _LATEST_WRITE_CLIENT
     with _CIRCUIT_LOCK:
         _CIRCUIT_OPEN_UNTIL = 0.0
@@ -243,9 +319,17 @@ def reset_firestore_circuit() -> None:
             writes_retried=0,
             writes_dropped=0,
             last_error="",
+            last_error_by_kind={},
         )
     with _RUNTIME_CONFIG_LOCK:
         _RUNTIME_CONFIG_LOADED_AT = 0.0
+        _RUNTIME_CONFIG_LAST_ATTEMPT_AT = 0.0
+        _RUNTIME_CONFIG_REFRESH_ID += 1
+        _RUNTIME_CONFIG_REFRESHING = False
+        _RUNTIME_CONFIG_SKIPPED_TIMEOUTS = 0
+        _RUNTIME_CONFIG_VERSION += 1
+        _RUNTIME_CONFIG.clear()
+        _RUNTIME_CONFIG.update(_RUNTIME_CONFIG_DEFAULTS)
     with _RECENT_ERRORS_LOCK:
         _RECENT_ERRORS.clear()
         _ERRORS_FLUSHED_AT = 0.0
@@ -340,12 +424,14 @@ def _write_queue_worker() -> None:
                         _append_write_locked(job)
                         _WRITE_CONDITION.notify_all()
                 else:
-                    _open_write_circuit()
+                    _open_write_circuit(error, f"penulisan {job.kind}")
                     job.retries = 0
                     job.ready_at = time.monotonic() + FIRESTORE_CIRCUIT_SECONDS
                     with _WRITE_CONDITION:
                         _append_write_locked(job)
                         _WRITE_CONDITION.notify_all()
+            elif _firestore_failure_kind(error) is not None:
+                _trip_circuit(error, f"penulisan {job.kind}")
         else:
             with _WRITE_HEALTH_LOCK:
                 _WRITE_HEALTH["writes_ok"] += 1
@@ -383,19 +469,37 @@ def _run_write_with_timeout(job: _QueuedWrite, client: Any) -> None:
 
 
 def _write_error_class(error: BaseException) -> str:
+    if isinstance(error, ValueError):
+        return "ValueError"
     return type(error).__name__
 
 
 def _record_write_failure(job: _QueuedWrite, error: BaseException) -> None:
     error_class = _write_error_class(error)
+    field_name = getattr(error, "field_name", "")
+    sensitive_values = (
+        (str(job.args[0]),)
+        if job.kind == "active_user" and job.args
+        else ()
+    )
+    error_message = _safe_error_message(error, *sensitive_values)
+    details = f"{error_class}: {error_message}"
+    if field_name:
+        details = f"{details} (field={field_name})"
     with _WRITE_HEALTH_LOCK:
         _WRITE_HEALTH["writes_failed"] += 1
-        _WRITE_HEALTH["last_error"] = f"{job.kind}: {error_class}"
-    _record_recent_error(RuntimeError(error_class), f"Firestore write {job.kind}")
+        _WRITE_HEALTH["last_error"] = f"{job.kind}: {details}"
+        _WRITE_HEALTH["last_error_by_kind"][job.kind] = details
+    _record_recent_error(
+        RuntimeError(details),
+        f"Firestore write {job.kind}",
+    )
     logger.error(
-        "Firestore write failed kind=%s error_class=%s",
+        "Firestore write failed kind=%s error_class=%s field=%s error_message=%s",
         job.kind,
         error_class,
+        field_name or "-",
+        error_message,
     )
 
 
@@ -419,14 +523,8 @@ def _is_retryable_write_error(error: BaseException) -> bool:
     return any(name in code_name.upper() for name in retryable)
 
 
-def _open_write_circuit() -> None:
-    global _CIRCUIT_OPEN_UNTIL, _CIRCUIT_FAILURE_LOGGED
-    with _CIRCUIT_LOCK:
-        _CIRCUIT_OPEN_UNTIL = max(
-            _CIRCUIT_OPEN_UNTIL,
-            time.monotonic() + FIRESTORE_CIRCUIT_SECONDS,
-        )
-        _CIRCUIT_FAILURE_LOGGED = True
+def _open_write_circuit(error: BaseException, context: str) -> None:
+    _trip_circuit(error, context)
 
 
 def normalize_question(question: str) -> str:
@@ -721,53 +819,128 @@ def get_admin_faq(client: Any | None) -> list[dict[str, Any]]:
 
 
 def get_runtime_config(client: Any | None) -> dict[str, Any]:
-    """Load maintenance and announcement settings at most every five minutes."""
-    global _RUNTIME_CONFIG_LOADED_AT
+    """Return cached settings immediately and refresh stale data in the background."""
+    global _RUNTIME_CONFIG_LAST_ATTEMPT_AT, _RUNTIME_CONFIG_REFRESH_ID
+    global _RUNTIME_CONFIG_REFRESHING
     now = time.monotonic()
+    refresh: tuple[int, int] | None = None
     with _RUNTIME_CONFIG_LOCK:
-        if now - _RUNTIME_CONFIG_LOADED_AT < RUNTIME_CONFIG_CACHE_SECONDS:
-            return dict(_RUNTIME_CONFIG)
-
-    def read_config() -> dict[str, Any]:
-        return (
-            client.collection("settings")
-            .document("runtime")
-            .get(timeout=FIRESTORE_READ_TIMEOUT_SECONDS, retry=None)
-            .to_dict()
-            or {}
-        )
-
-    loaded = _bounded_read(
-        client,
-        read_config,
-        timeout=RUNTIME_CONFIG_READ_WAIT_SECONDS,
-        context="pembacaan konfigurasi runtime",
-        fallback=None,
-    )
-    with _RUNTIME_CONFIG_LOCK:
-        if loaded is not None:
-            try:
-                daily_question_limit = max(
-                    0, int(loaded.get("daily_question_limit", 0))
-                )
-            except (TypeError, ValueError):
-                daily_question_limit = 0
-            _RUNTIME_CONFIG.update(
-                {
-                    "maintenance": bool(loaded.get("maintenance", False)),
-                    "announcement": str(loaded.get("announcement", ""))[:1000],
-                    "daily_question_limit": daily_question_limit,
-                    "settings_password_hash": str(
-                        loaded.get("settings_password_hash", "")
-                    ),
-                }
+        cached = dict(_RUNTIME_CONFIG)
+        stale = now - _RUNTIME_CONFIG_LOADED_AT >= RUNTIME_CONFIG_CACHE_SECONDS
+        should_refresh = (
+            client is not None
+            and stale
+            and not _RUNTIME_CONFIG_REFRESHING
+            and (
+                _RUNTIME_CONFIG_LAST_ATTEMPT_AT == 0.0
+                or now - _RUNTIME_CONFIG_LAST_ATTEMPT_AT
+                >= RUNTIME_CONFIG_RETRY_SECONDS
             )
-        _RUNTIME_CONFIG_LOADED_AT = time.monotonic()
-        return dict(_RUNTIME_CONFIG)
+        )
+        if should_refresh:
+            _RUNTIME_CONFIG_REFRESHING = True
+            _RUNTIME_CONFIG_LAST_ATTEMPT_AT = now
+            _RUNTIME_CONFIG_REFRESH_ID += 1
+            refresh = (_RUNTIME_CONFIG_REFRESH_ID, _RUNTIME_CONFIG_VERSION)
+    if refresh is not None and client is not None:
+        refresh_id, version = refresh
+        future = _READ_EXECUTOR.submit(_read_runtime_config, client)
+        future.add_done_callback(
+            lambda completed: _finish_runtime_config_refresh(
+                completed, refresh_id, version
+            )
+        )
+        timer = threading.Timer(
+            RUNTIME_CONFIG_READ_TIMEOUT_SECONDS,
+            _runtime_config_budget_expired,
+            args=(refresh_id,),
+        )
+        timer.daemon = True
+        timer.start()
+    return cached
+
+
+def _read_runtime_config(client: Any) -> dict[str, Any]:
+    return (
+        client.collection("settings")
+        .document("runtime")
+        .get(timeout=RUNTIME_CONFIG_READ_TIMEOUT_SECONDS, retry=None)
+        .to_dict()
+        or {}
+    )
+
+
+def _runtime_config_budget_expired(refresh_id: int) -> None:
+    global _RUNTIME_CONFIG_REFRESHING, _RUNTIME_CONFIG_SKIPPED_TIMEOUTS
+    with _RUNTIME_CONFIG_LOCK:
+        if (
+            refresh_id == _RUNTIME_CONFIG_REFRESH_ID
+            and _RUNTIME_CONFIG_REFRESHING
+        ):
+            _RUNTIME_CONFIG_SKIPPED_TIMEOUTS += 1
+            _RUNTIME_CONFIG_REFRESHING = False
+
+
+def _finish_runtime_config_refresh(
+    future: Any,
+    refresh_id: int,
+    version: int,
+) -> None:
+    global _RUNTIME_CONFIG_LOADED_AT, _RUNTIME_CONFIG_REFRESHING
+    try:
+        loaded = future.result()
+    except Exception as error:
+        if _is_local_timeout(error):
+            _runtime_config_budget_expired(refresh_id)
+        else:
+            if _firestore_failure_kind(error) is not None:
+                _trip_circuit(error, "pembacaan konfigurasi runtime")
+            else:
+                logger.warning(
+                    "Firestore read failed context=pembacaan konfigurasi runtime "
+                    "error_class=%s: %s",
+                    type(error).__name__,
+                    _safe_error_message(error),
+                )
+            _record_recent_error(
+                RuntimeError(
+                    f"{type(error).__name__}: {_safe_error_message(error)}"
+                ),
+                "pembacaan konfigurasi runtime",
+            )
+        with _RUNTIME_CONFIG_LOCK:
+            if refresh_id == _RUNTIME_CONFIG_REFRESH_ID:
+                _RUNTIME_CONFIG_REFRESHING = False
+        return
+
+    try:
+        daily_question_limit = max(
+            0, int(loaded.get("daily_question_limit", 0))
+        )
+    except (TypeError, ValueError):
+        daily_question_limit = 0
+    sanitized = {
+        "maintenance": bool(loaded.get("maintenance", False)),
+        "announcement": str(loaded.get("announcement", ""))[:1000],
+        "daily_question_limit": daily_question_limit,
+        "settings_password_hash": str(
+            loaded.get("settings_password_hash", "")
+        ),
+    }
+    with _RUNTIME_CONFIG_LOCK:
+        if (
+            refresh_id == _RUNTIME_CONFIG_REFRESH_ID
+            and version == _RUNTIME_CONFIG_VERSION
+            and _RUNTIME_CONFIG_REFRESHING
+        ):
+            _RUNTIME_CONFIG.update(sanitized)
+            _RUNTIME_CONFIG_LOADED_AT = time.monotonic()
+        if refresh_id == _RUNTIME_CONFIG_REFRESH_ID:
+            _RUNTIME_CONFIG_REFRESHING = False
 
 
 def update_runtime_config(client: Any | None, **updates: Any) -> None:
-    global _RUNTIME_CONFIG_LOADED_AT
+    global _RUNTIME_CONFIG_LOADED_AT, _RUNTIME_CONFIG_VERSION
     allowed = {"maintenance", "announcement", "daily_question_limit"}
     sanitized = {key: value for key, value in updates.items() if key in allowed}
     if "announcement" in sanitized:
@@ -776,41 +949,46 @@ def update_runtime_config(client: Any | None, **updates: Any) -> None:
         sanitized["daily_question_limit"] = max(
             0, int(sanitized["daily_question_limit"])
         )
+    if client is None:
+        raise RuntimeError("Firestore tidak tersedia untuk menyimpan kontrol admin.")
+    try:
+        batch = client.batch()
+        batch.set(
+            client.collection("settings").document("runtime"),
+            sanitized,
+            merge=True,
+        )
+        batch.commit(timeout=FIRESTORE_ADMIN_TIMEOUT_SECONDS, retry=None)
+    except Exception as error:
+        raise RuntimeError(
+            "Penyimpanan kontrol admin gagal "
+            f"({type(error).__name__}): {_safe_error_message(error)}"
+        ) from error
     with _RUNTIME_CONFIG_LOCK:
         _RUNTIME_CONFIG.update(sanitized)
         _RUNTIME_CONFIG_LOADED_AT = time.monotonic()
-    if client is None or _circuit_is_open():
-        return
-    _WRITE_EXECUTOR.submit(_write_runtime_config, client, sanitized)
+        _RUNTIME_CONFIG_VERSION += 1
 
 
 def save_settings_password_hash(client: Any | None, encoded_hash: str) -> None:
     """Persist an admin-entered settings password as a hash."""
-    global _RUNTIME_CONFIG_LOADED_AT
+    global _RUNTIME_CONFIG_LOADED_AT, _RUNTIME_CONFIG_VERSION
     if not encoded_hash.startswith("pbkdf2_sha256$"):
         raise ValueError("Format hash sandi Pengaturan tidak valid.")
     if client is None:
         raise RuntimeError("Firestore tidak tersedia untuk menyimpan sandi.")
-    if _circuit_is_open():
-        raise RuntimeError("Firestore sedang tidak tersedia; coba lagi nanti.")
-
-    future = _WRITE_EXECUTOR.submit(_write_settings_password_hash, client, encoded_hash)
     try:
-        future.result(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS)
-    except FutureTimeoutError as error:
-        future.cancel()
-        timeout_error = TimeoutError(
-            "Penyimpanan sandi Pengaturan melewati batas waktu."
-        )
-        _trip_circuit(timeout_error, "penyimpanan sandi Pengaturan")
-        raise RuntimeError(str(timeout_error)) from error
+        _write_settings_password_hash(client, encoded_hash)
     except Exception as error:
-        _trip_circuit(error, "penyimpanan sandi Pengaturan")
-        raise RuntimeError("Sandi Pengaturan tidak berhasil disimpan.") from error
+        raise RuntimeError(
+            "Penyimpanan sandi Pengaturan gagal "
+            f"({type(error).__name__}): {_safe_error_message(error, encoded_hash)}"
+        ) from error
 
     with _RUNTIME_CONFIG_LOCK:
         _RUNTIME_CONFIG["settings_password_hash"] = encoded_hash
         _RUNTIME_CONFIG_LOADED_AT = time.monotonic()
+        _RUNTIME_CONFIG_VERSION += 1
 
 
 def _write_settings_password_hash(client: Any, encoded_hash: str) -> None:
@@ -820,22 +998,13 @@ def _write_settings_password_hash(client: Any, encoded_hash: str) -> None:
         {"settings_password_hash": encoded_hash},
         merge=True,
     )
-    batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
-
-
-def _write_runtime_config(client: Any, config: dict[str, Any]) -> None:
-    try:
-        batch = client.batch()
-        batch.set(client.collection("settings").document("runtime"), config, merge=True)
-        batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
-    except Exception as error:
-        _trip_circuit(error, "penyimpanan konfigurasi runtime")
+    batch.commit(timeout=FIRESTORE_ADMIN_TIMEOUT_SECONDS, retry=None)
 
 
 def set_user_blocked(client: Any | None, uid: str, blocked: bool) -> None:
-    if client is None or _circuit_is_open():
-        return
-    _WRITE_EXECUTOR.submit(_write_user_blocked, client, uid, blocked)
+    if client is None:
+        raise RuntimeError("Firestore tidak tersedia untuk mengubah status pengguna.")
+    _write_user_blocked(client, uid, blocked)
 
 
 def _write_user_blocked(client: Any, uid: str, blocked: bool) -> None:
@@ -846,9 +1015,12 @@ def _write_user_blocked(client: Any, uid: str, blocked: bool) -> None:
             {"blocked": blocked},
             merge=True,
         )
-        batch.commit(timeout=FIRESTORE_WRITE_TIMEOUT_SECONDS, retry=None)
+        batch.commit(timeout=FIRESTORE_ADMIN_TIMEOUT_SECONDS, retry=None)
     except Exception as error:
-        _trip_circuit(error, "perubahan status blokir pengguna")
+        raise RuntimeError(
+            "Perubahan status pengguna gagal "
+            f"({type(error).__name__}): {_safe_error_message(error, uid)}"
+        ) from error
 
 
 def get_admin_recent_errors(client: Any | None) -> list[dict[str, str]]:
@@ -1547,6 +1719,15 @@ def _write_faq_question(
 
 def mark_active(client: Any | None, uid: str) -> None:
     """Catat aktivitas paling banyak sekali per jam per sesi."""
+    if not isinstance(uid, str) or not _DEVICE_UID_RE.fullmatch(uid):
+        error = ValueError("Invalid value for field 'uid': invalid device ID.")
+        _record_recent_error(error, "Firestore write active_user")
+        logger.error(
+            "Firestore write skipped kind=active_user error_class=ValueError "
+            "field=uid error_message=%s",
+            _safe_error_message(error, str(uid)),
+        )
+        return
     now = _now()
     previous = st.session_state.get("last_active_written_at")
     hour_key = now.strftime("%Y%m%d%H")
@@ -1571,9 +1752,20 @@ def mark_active(client: Any | None, uid: str) -> None:
 def _write_active_user(
     client: Any, deadline: float, uid: str, now: datetime
 ) -> None:
+    if not isinstance(uid, str) or not _DEVICE_UID_RE.fullmatch(uid):
+        raise _FirestoreFieldValueError(
+            "Invalid value for field 'uid': invalid device ID.",
+            field_name="uid",
+        )
     from google.cloud import firestore
 
-    user_ref = client.collection("users").document(uid)
+    try:
+        user_ref = client.collection("users").document(uid)
+    except ValueError as error:
+        raise _FirestoreFieldValueError(
+            _safe_error_message(error, uid),
+            field_name="uid",
+        ) from error
     transaction = client.transaction()
     snapshot = _transaction_snapshot(
         transaction,
@@ -1598,11 +1790,42 @@ def _write_active_user(
             {"total_devices": firestore.Increment(1)},
             merge=True,
         )
-    transaction.set(user_ref, fields, merge=True)
-    transaction.commit(
-        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
-        retry=None,
-    )
+    try:
+        transaction.set(user_ref, fields, merge=True)
+    except ValueError as error:
+        message = str(error)
+        field_name = next(
+            (name for name in fields if name in message),
+            "user_document_fields",
+        )
+        raise _FirestoreFieldValueError(
+            _safe_error_message(error, uid),
+            field_name=field_name,
+        ) from error
+    try:
+        transaction.commit(
+            timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
+            retry=None,
+        )
+    except ValueError as error:
+        field_name = next(
+            (
+                name
+                for name in (*fields, "total_devices")
+                if name in str(error)
+            ),
+            "user_document_fields",
+        )
+        raise _FirestoreFieldValueError(
+            _safe_error_message(error, uid),
+            field_name=field_name,
+        ) from error
+
+
+class _FirestoreFieldValueError(ValueError):
+    def __init__(self, message: str, *, field_name: str) -> None:
+        super().__init__(message)
+        self.field_name = field_name
 
 
 def _write_hourly_activity(

@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
@@ -9,6 +10,7 @@ from services.ai_service import (
     answer_question,
 )
 from services import key_pool
+from services import firestore_store
 from services.firestore_store import reset_firestore_circuit
 
 
@@ -26,14 +28,16 @@ class _Document:
         self.path = path
 
     def get(self, *, timeout, retry):
-        assert 0 < timeout <= 2
+        assert 0 < timeout <= 10
         assert retry is None
+        self.client.timeouts.append(timeout)
         if self.client.error:
             raise TimeoutError("Firestore unavailable")
         return _Snapshot(self.client.data.get(self.path, {}))
 
     def set(self, data, *, timeout):
-        assert 0 < timeout <= 2
+        assert 0 < timeout <= 10
+        self.client.timeouts.append(timeout)
         if self.client.error:
             raise TimeoutError("Firestore unavailable")
         self.client.data[self.path] = data
@@ -52,6 +56,7 @@ class _Client:
     def __init__(self):
         self.data = {}
         self.error = False
+        self.timeouts = []
 
     def collection(self, name):
         return _Collection(self, name)
@@ -137,6 +142,24 @@ class KeyPoolTests(unittest.TestCase):
             key_pool.get_keys("chat", self.client, self.secrets, refresh=True),
             (),
         )
+
+    def test_admin_key_write_bypasses_open_chat_breaker(self):
+        with key_pool._CACHE_LOCK:
+            key_pool._KEY_CACHE.clear()
+        with firestore_store._CIRCUIT_LOCK:
+            firestore_store._CIRCUIT_OPEN_UNTIL = time.monotonic() + 30
+
+        key_pool.add_key(
+            "admin",
+            self.client,
+            self.secrets,
+            "admin-secret-123456789",
+            "Admin utama",
+        )
+
+        self.assertIn("config/keys_admin", self.client.data)
+        self.assertFalse(key_pool.firestore_status()["connected"])
+        self.assertEqual(self.client.timeouts, [10.0, 10.0])
 
     def test_session_override_never_calls_database(self):
         session_state = {}

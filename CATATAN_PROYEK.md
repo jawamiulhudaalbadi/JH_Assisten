@@ -16,6 +16,13 @@
   dienkripsi dengan Fernet; rotasi kuota dan override chat khusus sesi
   diterapkan; dashboard dapat mengelola key dan urutan model; ringkasan FAQ AI
   berjalan hanya saat diminta admin.
+- **Perbaikan Firestore produksi — selesai:** konfigurasi runtime selalu dibaca
+  dari cache/nilai aman pada jalur render dan disegarkan di latar dengan batas
+  5 detik. Circuit breaker hanya bereaksi pada `UNAVAILABLE`,
+  `DEADLINE_EXCEEDED` RPC, dan `PermissionDenied`. Mutasi admin menggunakan
+  tenggat 10 detik dan tidak bergantung pada breaker chat. Kesehatan sistem
+  menampilkan breaker, timeout konfigurasi yang dilewati, dan error tulis
+  terakhir per jenis.
 - **Perbaikan tulis Firestore:** pasangan riwayat disimpan atomik bersama
   dokumen pengguna. Statistik harian, FAQ, dan aktivitas per jam dikirim
   terpisah; antrean tulis memori mempertahankan pekerjaan saat sirkuit terbuka
@@ -44,10 +51,11 @@
    chat lain. Uji indexing dan ringkasan FAQ secara terpisah dengan kelompok
    masing-masing. Ringkasan FAQ hanya dibuat setelah tombol **Rangkum dengan AI**
    ditekan dan digunakan ulang bila daftar FAQ tidak berubah.
-6. Jalankan `pytest -q tests/test_key_pool.py tests/test_ai_service.py
-   tests/test_sync_manager.py`, `python -m py_compile app.py services/*.py`, lalu
-   buka aplikasi dengan Streamlit AppTest. Tes tidak memerlukan kredensial
-   layanan produksi; tes integrasi manual sebaiknya memakai proyek uji.
+6. Jalankan `pytest -q tests/test_firestore_store.py tests/test_key_pool.py
+   tests/test_ai_service.py tests/test_sync_manager.py`, `python -m py_compile
+   app.py services/*.py`, lalu buka aplikasi dengan Streamlit AppTest. Tes tidak
+   memerlukan kredensial layanan produksi; tes integrasi manual sebaiknya
+   memakai proyek uji.
 
 ## Cara tes manual Fase 2
 
@@ -82,15 +90,17 @@ tidak disimpan di Firestore.
   tampilan pengumuman, dan pemindahan kontrol mulai/jeda/lanjut/coba ulang Drive.
 - `services/firestore_store.py` — batas waktu dan circuit breaker Firestore,
   antrean tulis latar, ringkasan statistik WIB, FAQ, konfigurasi admin,
-  riwayat, dan status kesehatan.
+  riwayat, serta status kesehatan. Pembacaan konfigurasi runtime tidak menunggu
+  Firestore pada jalur render; perubahan dashboard admin memakai timeout
+  10 detik yang terpisah dari breaker chat.
 - `services/admin_logic.py` — verifikasi hash admin, pengelolaan autentikasi
   dan penguncian login, serta pemeriksaan blokir dan batas harian.
 - `services/admin_dashboard.py` — dasbor statistik, riwayat, FAQ, sinkron
   Drive, kontrol, dan kesehatan sistem; modul dimuat setelah login berhasil.
 - `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin.
 - `tests/test_firestore_store.py` — uji kegagalan dan batas waktu riwayat
-  Firestore, retry tulis, ketahanan saat circuit breaker terbuka, serta
-  isolasi kegagalan statistik dari riwayat.
+  Firestore, konfigurasi runtime asinkron, penolakan UID perangkat invalid,
+  retry tulis, serta operasi admin saat breaker chat terbuka.
 - `tests/test_admin_logic.py` — uji normalisasi FAQ, blokir, batas WIB,
   verifikasi PBKDF2, dan penguncian login.
 - `CATATAN_PROYEK.md` — catatan fase, struktur data, keputusan, dan pekerjaan
@@ -151,17 +161,21 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
 
 ## Keputusan desain
 
-- Riwayat dan semua pembacaan admin memakai batas waktu maksimum 5 detik tanpa
-  percobaan ulang otomatis. Pemuatan riwayat memiliki batas waktu total 5 detik
-  dan mengembalikan sesi kosong bila gagal.
-- Pembacaan Firestore yang gagal mengaktifkan mekanisme pemutus sementara
-  selama 2 menit. Antrean tulis dibatasi 200 pekerjaan; saat penuh, pekerjaan
-  tertua dibuang dan penghitung `writes_dropped` bertambah. Error sementara
-  `UNAVAILABLE`, `DEADLINE_EXCEEDED`, dan `ABORTED` dijadwalkan ulang paling
-  banyak tiga kali dengan jeda 1, 3, dan 8 detik. Setelah seluruh retry gagal,
-  pekerjaan tetap di antrean sampai sirkuit tertutup. Error permanen dicatat
-  tanpa retry. Setiap upaya tulis memiliki tenggat 10 detik dan tidak menahan
-  pekerja antrean saat operasi melampaui tenggat.
+- Pembacaan riwayat dan ringkasan admin memakai batas waktu maksimum 5 detik
+  tanpa percobaan ulang otomatis. Pemuatan riwayat memiliki batas waktu total
+  5 detik dan mengembalikan sesi kosong bila gagal; operasi konfigurasi admin
+  yang menyimpan perubahan memakai tenggat terpisah 10 detik.
+- Circuit breaker chat terbuka selama 2 menit hanya untuk error layanan nyata
+  `UNAVAILABLE`, `DEADLINE_EXCEEDED` RPC, dan `PermissionDenied`; timeout lokal
+  ketika menunggu anggaran baca tidak membuka breaker. Antrean tulis dibatasi
+  200 pekerjaan; saat penuh, pekerjaan tertua dibuang dan penghitung
+  `writes_dropped` bertambah. Error sementara `UNAVAILABLE` dan
+  `DEADLINE_EXCEEDED` dijadwalkan ulang paling banyak tiga kali dengan jeda 1,
+  3, dan 8 detik; `ABORTED` dapat dicoba ulang tetapi tidak membuka breaker.
+  Setelah seluruh retry gagal, pekerjaan tetap di antrean sampai sirkuit
+  tertutup. Error permanen dicatat tanpa retry. Setiap upaya tulis chat memiliki
+  tenggat 10 detik dan tidak menahan pekerja antrean saat operasi melampaui
+  tenggat.
 - Setiap pertanyaan mengantrekan satu transaksi untuk chunk dan dokumen
   pengguna, lalu penulisan terpisah untuk `stats/daily.questions` dan FAQ
   (hanya jika pertanyaan hasil normalisasi tidak kosong). Aktivitas per jam
@@ -174,8 +188,16 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   membaca data pengguna yang sudah dimuat, tanpa membaca Firestore lagi di
   jalur pertanyaan.
 - Konfigurasi aplikasi saat berjalan disimpan sementara di memori selama lima
-  menit. Login admin menggunakan PBKDF2 atau scrypt dan `hmac.compare_digest`;
-  dasbor hanya diimpor setelah login berhasil.
+  menit. Nilai cache/default dikembalikan seketika; pembacaan awal dan refresh
+  dilakukan di thread latar dengan batas 5 detik. Timeout lokal dicatat pada
+  Kesehatan sistem tanpa membuka breaker. Login admin menggunakan PBKDF2 atau
+  scrypt dan `hmac.compare_digest`; dasbor hanya diimpor setelah login berhasil.
+- Mutasi dashboard admin (key, urutan model, konfigurasi runtime, sandi
+  Pengaturan, dan status blokir) memakai timeout Firestore 10 detik secara
+  langsung, tidak membaca status breaker chat, dan menampilkan jenis error
+  tanpa mencatat isi API key. Error tulis antrean mencatat pesan yang disamarkan
+  dan field penyebab; UID perangkat divalidasi sebelum dipakai sebagai ID
+  dokumen.
 - Penguncian login admin mencatat kegagalan per UID dan secara global di memori
   proses. Lima kegagalan mengunci semua login di proses tersebut selama 15
   menit. Hitungan global diatur ulang setelah login berhasil, sedangkan hitungan

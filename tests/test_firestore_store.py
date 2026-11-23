@@ -11,16 +11,20 @@ from services.firestore_store import (
     _delete_all_user_chats,
     _empty_history,
     _enqueue_write,
+    _now,
     _save_named_chat,
     _transaction_snapshot,
     _upsert_saved_chat,
+    _write_active_user,
     append_message_pair,
     firestore_status,
     firestore_write_health,
     enqueue_question_answer,
+    get_runtime_config,
     load_chat_history,
     reset_firestore_circuit,
     save_settings_password_hash,
+    update_runtime_config,
 )
 
 
@@ -90,6 +94,7 @@ class _FakeBatch:
     def __init__(self, client):
         self.client = client
         self.writes = []
+        self.timeout = None
 
     def set(self, reference, data, merge: bool = False):
         self.writes.append((reference.path, data, merge))
@@ -97,6 +102,7 @@ class _FakeBatch:
     def commit(self, *, timeout: float, retry: object):
         assert timeout > 0
         assert retry is None
+        self.timeout = timeout
         if self.client.fail_daily and any(
             "/daily_" in path for path, _data, _merge in self.writes
         ):
@@ -109,6 +115,7 @@ class _FakeClient:
         self.persisted = []
         self.fail_pair_once = False
         self.fail_daily = False
+        self.batches = []
 
     def collection(self, name: str):
         return _FakeReference(self, name)
@@ -117,7 +124,9 @@ class _FakeClient:
         return _FakeTransaction(self)
 
     def batch(self):
-        return _FakeBatch(self)
+        batch = _FakeBatch(self)
+        self.batches.append(batch)
+        return batch
 
 
 class FirestoreStoreTests(unittest.TestCase):
@@ -336,7 +345,7 @@ class FirestoreStoreTests(unittest.TestCase):
         class Document:
             def get(self, *, timeout: float, retry: object):
                 self.assert_timeout(timeout, retry)
-                raise OSError("Firestore unavailable")
+                raise _UnavailableError("Firestore unavailable")
 
             @staticmethod
             def assert_timeout(timeout: float, retry: object) -> None:
@@ -385,7 +394,136 @@ class FirestoreStoreTests(unittest.TestCase):
 
         self.assertEqual(history, _empty_history())
         self.assertLess(elapsed, 0.2)
+        self.assertTrue(firestore_status()["connected"])
+
+    def test_slow_runtime_config_read_does_not_delay_render_or_trip_breaker(self) -> None:
+        class Document:
+            def get(self, *, timeout: float, retry: object):
+                assert timeout == 5.0
+                assert retry is None
+                time.sleep(0.5)
+                return self
+
+            @staticmethod
+            def to_dict():
+                return {"announcement": "loaded in background"}
+
+        class Collection:
+            def document(self, _document_id: str):
+                return Document()
+
+        class Client:
+            def collection(self, _name: str):
+                return Collection()
+
+        started = time.monotonic()
+        config = get_runtime_config(Client())
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(config["announcement"], "")
+        self.assertTrue(
+            self._wait_until(
+                lambda: get_runtime_config(Client())["announcement"]
+                == "loaded in background"
+            )
+        )
+        self.assertTrue(firestore_status()["connected"])
+
+    def test_runtime_config_real_rpc_failure_opens_breaker(self) -> None:
+        class Document:
+            def get(self, *, timeout: float, retry: object):
+                assert timeout == 5.0
+                raise _UnavailableError("service unavailable")
+
+        class Collection:
+            def document(self, _document_id: str):
+                return Document()
+
+        class Client:
+            def collection(self, _name: str):
+                return Collection()
+
+        self.assertEqual(get_runtime_config(Client())["maintenance"], False)
+        self.assertTrue(
+            self._wait_until(lambda: firestore_status()["circuit_open"]),
+            (
+                firestore_status(),
+                firestore_store._RUNTIME_CONFIG_REFRESH_ID,
+                firestore_store._RUNTIME_CONFIG_REFRESHING,
+                firestore_write_health()["runtime_config_skipped_timeouts"],
+            ),
+        )
+
+    def test_runtime_config_local_budget_timeout_is_counted_not_breaking(self) -> None:
+        class Document:
+            def get(self, *, timeout: float, retry: object):
+                time.sleep(0.2)
+                return self
+
+            @staticmethod
+            def to_dict():
+                return {"announcement": "too late"}
+
+        class Collection:
+            def document(self, _document_id: str):
+                return Document()
+
+        class Client:
+            def collection(self, _name: str):
+                return Collection()
+
+        with patch(
+            "services.firestore_store.RUNTIME_CONFIG_READ_TIMEOUT_SECONDS",
+            0.05,
+        ):
+            get_runtime_config(Client())
+            self.assertTrue(
+                self._wait_until(
+                    lambda: firestore_write_health()[
+                        "runtime_config_skipped_timeouts"
+                    ]
+                    == 1
+                )
+            )
+
+        self.assertTrue(firestore_status()["connected"])
+
+    def test_admin_runtime_write_bypasses_open_chat_breaker(self) -> None:
+        client = _FakeClient()
+        with firestore_store._CIRCUIT_LOCK:
+            firestore_store._CIRCUIT_OPEN_UNTIL = time.monotonic() + 30
+
+        update_runtime_config(client, maintenance=True)
+
         self.assertFalse(firestore_status()["connected"])
+        self.assertEqual(firestore_store._RUNTIME_CONFIG["maintenance"], True)
+        self.assertEqual(client.persisted[-1][1], {"maintenance": True})
+        self.assertEqual(client.batches[-1].timeout, 10.0)
+
+    def test_active_user_invalid_uid_value_error_records_field_without_uid(self) -> None:
+        invalid_uid = "private-user-id/invalid"
+        with self.assertRaises(ValueError) as caught:
+            _write_active_user(_FakeClient(), time.monotonic() + 10, invalid_uid, _now())
+
+        job = firestore_store._QueuedWrite(
+            _FakeClient(),
+            "active_user",
+            _write_active_user,
+            (invalid_uid, _now()),
+        )
+        with patch("services.firestore_store.logger.error") as log_error:
+            firestore_store._record_write_failure(job, caught.exception)
+
+        self.assertEqual(caught.exception.field_name, "uid")
+        log_args = log_error.call_args.args
+        self.assertEqual(log_args[3], "uid")
+        self.assertNotIn(invalid_uid, str(log_args[-1]))
+        self.assertEqual(
+            firestore_write_health()["last_error_by_kind"]["active_user"].split(":")[0],
+            "ValueError",
+        )
+        self.assertTrue(firestore_status()["connected"])
 
     def test_question_write_retries_once_and_persists_all_domains(self) -> None:
         client = _FakeClient()

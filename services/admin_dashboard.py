@@ -27,7 +27,6 @@ from services.firestore_store import (
     get_admin_user_chats,
     get_admin_users,
     get_runtime_config,
-    _trip_circuit,
     save_settings_password_hash,
     set_user_blocked,
     update_runtime_config,
@@ -161,18 +160,21 @@ def _render_history(client: Any | None) -> None:
 
 
 def _read_faq_summary(client: Any | None, fingerprint: str) -> str:
-    if client is None or not firestore_status()["connected"]:
+    if client is None:
         return ""
     try:
         data = (
             client.collection("admin_cache")
             .document("faq_summary")
-            .get(timeout=2.0, retry=None)
+            .get(timeout=10.0, retry=None)
             .to_dict()
             or {}
         )
     except Exception as error:
-        _trip_circuit(RuntimeError(type(error).__name__), "pembacaan ringkesan FAQ")
+        st.warning(
+            "Ringkasan FAQ gagal dibaca "
+            f"({type(error).__name__}): {str(error)[:200]}"
+        )
         return ""
     if data.get("fingerprint") == fingerprint:
         return str(data.get("summary", ""))
@@ -184,7 +186,7 @@ def _write_faq_summary(
     fingerprint: str,
     summary: str,
 ) -> bool:
-    if client is None or not firestore_status()["connected"]:
+    if client is None:
         return False
     try:
         client.collection("admin_cache").document("faq_summary").set(
@@ -193,10 +195,13 @@ def _write_faq_summary(
                 "summary": summary,
                 "updated_at": datetime.now(_WIB),
             },
-            timeout=2.0,
+            timeout=10.0,
         )
     except Exception as error:
-        _trip_circuit(RuntimeError(type(error).__name__), "penyimpanan ringkesan FAQ")
+        st.warning(
+            "Ringkasan FAQ gagal disimpan "
+            f"({type(error).__name__}): {str(error)[:200]}"
+        )
         return False
     return True
 
@@ -280,7 +285,11 @@ def _render_api_keys(
     tabs = st.tabs([group_labels[group] for group in KEY_GROUPS])
     for tab, group in zip(tabs, KEY_GROUPS):
         with tab:
-            records = get_keys(group, client, secrets)
+            try:
+                records = get_keys(group, client, secrets, admin=True)
+            except KeyPoolError as error:
+                st.error(str(error))
+                continue
             for record in records:
                 columns = st.columns([2, 1, 2, 1, 1])
                 columns[0].write(record.label)
@@ -343,7 +352,11 @@ def _render_model_order(
     chat_keys: Sequence[str],
 ) -> None:
     st.subheader("Urutan model chat")
-    settings = get_model_order(client, secrets)
+    try:
+        settings = get_model_order(client, secrets, admin=True)
+    except KeyPoolError as error:
+        st.error(str(error))
+        return
     available = (
         _cached(
             "available_chat_models",
@@ -473,13 +486,17 @@ def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
         )
         save_runtime = st.form_submit_button("Simpan kontrol")
     if save_runtime:
-        update_runtime_config(
-            client,
-            maintenance=maintenance,
-            announcement=announcement,
-            daily_question_limit=int(daily_limit),
-        )
-        st.success("Kontrol disimpan dan berlaku di proses ini.")
+        try:
+            update_runtime_config(
+                client,
+                maintenance=maintenance,
+                announcement=announcement,
+                daily_question_limit=int(daily_limit),
+            )
+        except RuntimeError as error:
+            st.error(str(error))
+        else:
+            st.success("Kontrol disimpan dan berlaku di proses ini.")
 
     selectable_users = {
         user["short_id"]: user["uid"]
@@ -492,8 +509,12 @@ def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
             blocked = st.checkbox("Blokir perangkat ini")
             save_block = st.form_submit_button("Simpan blokir")
         if save_block:
-            set_user_blocked(client, selectable_users[selected], blocked)
-            st.success("Perubahan blokir dijadwalkan.")
+            try:
+                set_user_blocked(client, selectable_users[selected], blocked)
+            except RuntimeError as error:
+                st.error(str(error))
+            else:
+                st.success("Perubahan blokir berhasil disimpan.")
 
     if st.button("Bersihkan cache aplikasi", key="admin_clear_cache"):
         st.cache_data.clear()
@@ -513,9 +534,15 @@ def _render_health(client: Any | None) -> None:
     st.subheader("Kesehatan sistem")
     status = firestore_status()
     write_health = firestore_write_health()
-    connected = client is not None and status["connected"]
-    st.metric("Firestore", "Terkonfigurasi / siap" if connected else "Tidak tersedia")
-    if not status["connected"]:
+    st.metric(
+        "Firestore",
+        "Terkonfigurasi" if client is not None else "Tidak tersedia",
+    )
+    st.metric(
+        "Circuit breaker chat",
+        "Terbuka" if status["circuit_open"] else "Tertutup",
+    )
+    if status["circuit_open"]:
         st.caption(f"Sirkuit terbuka selama sekitar {status['circuit_open_seconds']} detik.")
     metric_columns = st.columns(4)
     for column, label, key in zip(
@@ -527,8 +554,23 @@ def _render_health(client: Any | None) -> None:
     st.caption(f"Antrean tulis: {write_health['writes_queued']} dari 200")
     if write_health["last_error"]:
         st.caption(f"Kesalahan tulis terakhir: {write_health['last_error']}")
+    st.caption(
+        "Baca konfigurasi runtime dilewati karena timeout anggaran: "
+        f"{write_health['runtime_config_skipped_timeouts']}"
+    )
     if write_health["breaker_open_until"]:
         st.caption(f"Sirkuit dibuka hingga: {write_health['breaker_open_until']}")
+    errors_by_kind = write_health["last_error_by_kind"]
+    if errors_by_kind:
+        st.markdown("**Kesalahan tulis terakhir per jenis**")
+        st.dataframe(
+            [
+                {"Jenis": kind, "Kesalahan": message}
+                for kind, message in sorted(errors_by_kind.items())
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
     st.markdown("**Snapshot model**")
     model_snapshot = router.snapshot()
     st.dataframe(model_snapshot, use_container_width=True, hide_index=True)
@@ -590,7 +632,11 @@ def render_dashboard(
     admin_keys = [
         item.key for item in get_available_keys("admin", client, secrets)
     ]
-    model_settings = get_model_order(client, secrets)
+    try:
+        model_settings = get_model_order(client, secrets, admin=True)
+    except KeyPoolError as error:
+        st.error(str(error))
+        model_settings = {"mode": "automatic", "models": [], "secrets_models": []}
     available_models = (
         get_available_chat_models(chat_keys[0]) if chat_keys else []
     )
