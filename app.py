@@ -23,6 +23,7 @@ except ModuleNotFoundError:
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 from PIL import Image
 from google.api_core.exceptions import GoogleAPIError
 from google.auth.exceptions import GoogleAuthError
@@ -45,6 +46,19 @@ from services.gdrive_service import (
     load_cached_credentials,
     save_oauth_callback,
 )
+from services.device_identity import get_device_uid
+from services.firestore_store import (
+    HISTORY_WARNING_CHUNKS,
+    HISTORY_WARNING_MESSAGES,
+    MAX_MESSAGES_PER_CHUNK,
+    clear_user_history,
+    credentials_json_from_secrets,
+    enqueue_question_answer,
+    get_active_chat_id,
+    get_firestore_client,
+    load_chat_history,
+    mark_active,
+)
 from services.sync_manager import DriveSyncManager
 
 
@@ -57,13 +71,24 @@ st.set_page_config(
 
 PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.json"
 CUSTOM_LOGO_PATH = PRIVATE_CONFIG_PATH.parent / ".app_custom_logo.png"
-CHAT_HISTORY_DIR = PRIVATE_CONFIG_PATH.parent / "chat_history"
-LATEST_CHAT_POINTER = CHAT_HISTORY_DIR / "_latest_chat_id.txt"
-MAX_SAVED_CHAT_MESSAGES = 40
 MAX_LOGO_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_LOGO_IMAGE_PIXELS = 16_000_000
 MAX_CHAT_IMAGE_COUNT = 4
 MAX_CHAT_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
+TEKS = {
+    "history_warning": (
+        "Riwayat obrolan parantos panjang; tiasa janten rada lambat. "
+        "Mugi dipertimbangkeun pikeun ngabersihan riwayat."
+    ),
+    "clear_history": "Bersihkan riwayat",
+    "clear_history_confirm": (
+        "Yakin badé ngabersihan sadaya riwayat obrolan dina alat ieu? "
+        "Riwayat anu parantos dipupus moal tiasa dipulangkeun."
+    ),
+    "clear_history_confirm_button": "Muhun, bersihan",
+    "clear_history_cancel": "Ulah ayeuna",
+    "clear_history_done": "Riwayat obrolan parantos diberesihan.",
+}
 
 # --------------------------------------------------------------------------
 # Tema (10 total). Kunci opsional "gradient" = CSS background-image halaman.
@@ -313,78 +338,41 @@ if APP_FONT_ID not in APP_FONTS:
 _ARABIC_TEXT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
 
 
-# --------------------------------------------------------------------------
-# Penyimpanan riwayat chat persisten (tahan putus WebSocket & reload Android).
-# --------------------------------------------------------------------------
 def _safe_chat_id(raw: object) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw or ""))
     return cleaned[:32]
 
 
-def _get_or_create_chat_id() -> str:
-    CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+def _get_or_create_chat_id(uid: str, firestore_client: object | None) -> str:
     param_chat_id = _safe_chat_id(st.query_params.get("chat"))
     if param_chat_id:
-        try:
-            LATEST_CHAT_POINTER.write_text(param_chat_id, encoding="utf-8")
-        except OSError:
-            pass
         return param_chat_id
 
-    if LATEST_CHAT_POINTER.is_file():
-        saved_id = _safe_chat_id(LATEST_CHAT_POINTER.read_text(encoding="utf-8").strip())
-        if saved_id:
-            st.query_params["chat"] = saved_id
-            return saved_id
+    saved_id = _safe_chat_id(get_active_chat_id(firestore_client, uid) or "")
+    if saved_id:
+        st.query_params["chat"] = saved_id
+        return saved_id
 
     new_id = uuid.uuid4().hex[:12]
     st.query_params["chat"] = new_id
-    try:
-        LATEST_CHAT_POINTER.write_text(new_id, encoding="utf-8")
-    except OSError:
-        pass
     return new_id
 
 
-def _load_persisted_messages(chat_id: str) -> list[dict]:
-    history_path = CHAT_HISTORY_DIR / f"{chat_id}.json"
-    if not history_path.is_file():
-        return []
-    try:
-        data = json.loads(history_path.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return data[-MAX_SAVED_CHAT_MESSAGES:]
-    except Exception:
-        pass
-    return []
-
-
-def _save_persisted_messages(chat_id: str, messages: list[dict]) -> None:
-    CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    history_path = CHAT_HISTORY_DIR / f"{chat_id}.json"
-    temp_path = history_path.with_suffix(".tmp")
-    trimmed = messages[-MAX_SAVED_CHAT_MESSAGES:]
-    try:
-        temp_path.write_text(
-            json.dumps(trimmed, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        temp_path.replace(history_path)
-        LATEST_CHAT_POINTER.write_text(chat_id, encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _start_new_chat() -> None:
-    CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     new_id = uuid.uuid4().hex[:12]
     st.query_params["chat"] = new_id
-    try:
-        LATEST_CHAT_POINTER.write_text(new_id, encoding="utf-8")
-    except OSError:
-        pass
     st.session_state.chat_id = new_id
     st.session_state.messages = []
+    st.session_state.loaded_chat_id = new_id
+    st.session_state.history_stats = {
+        "total_messages": int(
+            st.session_state.get("history_stats", {}).get("total_messages", 0)
+        ),
+        "total_chunks": int(
+            st.session_state.get("history_stats", {}).get("total_chunks", 0)
+        ),
+        "active_chunk_count": 0,
+    }
 
 
 def _save_private_config(config: dict[str, object]) -> None:
@@ -916,6 +904,12 @@ def _render_drive_sync_status(folder_id: str, api_key: str) -> None:
 
 st.session_state["google_api_key"] = DEFAULT_API_KEY
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
+DEVICE_UID = get_device_uid()
+try:
+    firestore_credentials_json = credentials_json_from_secrets(st.secrets)
+except StreamlitSecretNotFoundError:
+    firestore_credentials_json = None
+FIRESTORE_CLIENT = get_firestore_client(firestore_credentials_json)
 
 if "app_title" not in st.session_state:
     st.session_state.app_title = str(
@@ -1548,12 +1542,61 @@ if api_key and folder_id and drive_authorized:
     except (GoogleAPIError, GoogleAuthError, HttpError, OSError, ValueError) as error:
         st.warning(f"Sinkronisasi Drive berjalan di latar belakang; indeks lokal tetap digunakan bila tersedia. {error}")
 
-if "chat_id" not in st.session_state:
-    st.session_state.chat_id = _get_or_create_chat_id()
+requested_chat_id = _safe_chat_id(st.query_params.get("chat"))
+if (
+    "chat_id" not in st.session_state
+    or (requested_chat_id and requested_chat_id != st.session_state.chat_id)
+):
+    st.session_state.chat_id = _get_or_create_chat_id(DEVICE_UID, FIRESTORE_CLIENT)
 chat_id = st.session_state.chat_id
 
-if "messages" not in st.session_state:
-    st.session_state.messages = _load_persisted_messages(chat_id)
+if st.session_state.get("loaded_chat_id") != chat_id:
+    loaded_messages, history_stats = load_chat_history(
+        FIRESTORE_CLIENT,
+        DEVICE_UID,
+        chat_id,
+    )
+    st.session_state.messages = loaded_messages
+    st.session_state.history_stats = history_stats
+    st.session_state.loaded_chat_id = chat_id
+mark_active(FIRESTORE_CLIENT, DEVICE_UID)
+
+history_stats = st.session_state.get("history_stats", {})
+if (
+    int(history_stats.get("total_messages", 0)) > HISTORY_WARNING_MESSAGES
+    or int(history_stats.get("total_chunks", 0)) > HISTORY_WARNING_CHUNKS
+):
+    st.sidebar.warning(TEKS["history_warning"])
+
+if st.session_state.pop("_history_cleared_notice", False):
+    st.sidebar.success(TEKS["clear_history_done"])
+
+if st.sidebar.button(TEKS["clear_history"], key="clear_chat_history"):
+    st.session_state.clear_history_confirmation = True
+
+if st.session_state.get("clear_history_confirmation"):
+    st.sidebar.warning(TEKS["clear_history_confirm"])
+    confirm_columns = st.sidebar.columns(2)
+    if confirm_columns[0].button(
+        TEKS["clear_history_confirm_button"],
+        key="confirm_clear_chat_history",
+    ):
+        clear_user_history(FIRESTORE_CLIENT, DEVICE_UID)
+        st.session_state.messages = []
+        st.session_state.history_stats = {
+            "total_messages": 0,
+            "total_chunks": 0,
+            "active_chunk_count": 0,
+        }
+        st.session_state.clear_history_confirmation = False
+        st.session_state._history_cleared_notice = True
+        st.rerun()
+    if confirm_columns[1].button(
+        TEKS["clear_history_cancel"],
+        key="cancel_clear_chat_history",
+    ):
+        st.session_state.clear_history_confirmation = False
+        st.rerun()
 
 for message in st.session_state.messages:
     if message["role"] == "assistant":
@@ -1688,7 +1731,6 @@ if chat_submission is not None:
     if audio_preview is not None:
         user_message["audio"] = audio_preview
     st.session_state.messages.append(user_message)
-    _save_persisted_messages(chat_id, st.session_state.messages)
 
     with st.chat_message("user"):
         _render_message_content(displayed_question)
@@ -1817,4 +1859,23 @@ if chat_submission is not None:
             "sources": response_sources,
         }
     )
-    _save_persisted_messages(chat_id, st.session_state.messages)
+    enqueue_question_answer(
+        FIRESTORE_CLIENT,
+        DEVICE_UID,
+        chat_id,
+        displayed_question,
+        response_text,
+        response_sources,
+    )
+    updated_stats = dict(st.session_state.get("history_stats", {}))
+    active_chunk_count = int(updated_stats.get("active_chunk_count", 0))
+    if active_chunk_count + 2 > MAX_MESSAGES_PER_CHUNK:
+        updated_stats["active_chunk_count"] = 2
+        updated_stats["total_chunks"] = int(updated_stats.get("total_chunks", 0)) + 1
+    else:
+        updated_stats["active_chunk_count"] = active_chunk_count + 2
+        updated_stats.setdefault("total_chunks", 0)
+    updated_stats["total_messages"] = (
+        int(updated_stats.get("total_messages", 0)) + 2
+    )
+    st.session_state.history_stats = updated_stats

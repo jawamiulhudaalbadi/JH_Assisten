@@ -1,29 +1,21 @@
+# Rahasia
 .env
 credentials.json
 token.json
-.app_custom_logo.png
-.app_custom_logo.png.tmp
 private_config.json
+secrets.toml
 service-account*.json
+*firebase-adminsdk*.json
+
+# Dibuat otomatis
+.chat_model_stats.json
+.app_custom_logo.png
+*.log
+*.tmp
 __pycache__/
 .venv/
 venv/
-.streamlit/secrets.toml
 
-credentials.json
-private_config.json
-.env
-
-credentials.json
-private_config.json
-secrets.toml
-.env
-
-credentials.json
-private_config.json
-secrets.toml
-token.json
-.env
+# Indeks (hanya file status, indeks utamanya tetap ikut repo)
 faiss_index/sync_failures.json
-faiss_index/sync_failures.tmp
 faiss_index_backup_3072/
