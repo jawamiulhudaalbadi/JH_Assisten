@@ -322,10 +322,12 @@ def _render_users(client: Any | None) -> None:
     if not _admin_firestore_ready(client):
         return
     client_key = str(id(client)) if client is not None else "unavailable"
-    refresh_column, search_column = st.columns([1, 4])
+    refresh_column, delete_column, search_column = st.columns([1, 2, 4])
     if refresh_column.button("Segarkan", key="admin_users_refresh"):
         _cached_user_page.clear()
         st.session_state.pop("_admin_users_page_query", None)
+    if delete_column.button("Hapus semua tanpa nama", key="admin_delete_users_without_name"):
+        st.session_state["_admin_users_delete_without_name_confirm"] = True
     name_query = search_column.text_input(
         "Cari berdasarkan nama",
         key="admin_user_name_search",
@@ -372,6 +374,51 @@ def _render_users(client: Any | None) -> None:
         use_container_width=True,
         hide_index=True,
     )
+
+    if st.session_state.pop("_admin_users_delete_without_name_confirm", False):
+        try:
+            candidates = get_users_without_name(client)
+        except RuntimeError as error:
+            st.error(f"Tidak dapat memeriksa pengguna tanpa nama: {error}")
+        else:
+            st.session_state["_admin_users_delete_without_name_candidates"] = candidates
+            st.session_state["_admin_users_delete_without_name_confirm"] = True
+
+    if st.session_state.get("_admin_users_delete_without_name_confirm"):
+        candidates = st.session_state.get("_admin_users_delete_without_name_candidates", [])
+        st.warning(
+            f"{len(candidates)} pengguna tanpa nama (kosong/null/whitespace) "
+            "akan dihapus beserta riwayat chat mereka. Pengguna yang memiliki nama tidak disentuh."
+        )
+        confirm_column, cancel_column = st.columns(2)
+        if confirm_column.button(
+            "Konfirmasi hapus semua pengguna tanpa nama",
+            key="admin_confirm_delete_users_without_name",
+            type="primary",
+        ):
+            try:
+                deleted_count, remaining_count = delete_users_without_name_and_recount(
+                    client, candidates
+                )
+            except RuntimeError as error:
+                st.error(f"Penghapusan pengguna tanpa nama gagal: {error}")
+            else:
+                st.session_state.pop("_admin_users_delete_without_name_candidates", None)
+                st.session_state.pop("_admin_users_delete_without_name_confirm", None)
+                st.session_state.pop("_admin_cache_users", None)
+                st.session_state.pop("_admin_cache_statistics", None)
+                st.success(
+                    f"{deleted_count} pengguna tanpa nama dihapus; total perangkat "
+                    f"dihitung ulang menjadi {remaining_count}."
+                )
+                st.rerun(scope="fragment")
+        if cancel_column.button(
+            "Batal",
+            key="admin_cancel_delete_users_without_name",
+        ):
+            st.session_state.pop("_admin_users_delete_without_name_candidates", None)
+            st.session_state.pop("_admin_users_delete_without_name_confirm", None)
+
     previous_column, page_column, next_column = st.columns([1, 2, 1])
     previous_column.caption(f"Halaman {page_number + 1}")
     if previous_column.button(

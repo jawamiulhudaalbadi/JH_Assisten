@@ -188,8 +188,19 @@
   `total_questions == 0`. Setelah hapus, `total_devices` dihitung ulang dari
   dokumen pengguna yang tersisa (yang memiliki nama asli). UI dashboard
   menampilkan preview kandidat sebelum hapus.
+- **Tombol "Hapus semua tanpa nama" di tab Pengguna:** di sebelah tombol
+  "Segarkan", tombol baru menampilkan konfirmasi sebelum menghapus **SEMUA**
+  pengguna tanpa nama (termasuk yang sudah memiliki pertanyaan) beserta riwayat
+  chat mereka, lalu menghitung ulang `total_devices`.
 - **Perbarui unit test:** tambah test untuk verifikasi token persist setelah
   logout, revoke mencabut token, dan statistik guest dibaca dengan benar.
+- **Percepatan identifikasi ID perangkat:** `get_device_uid()` sekarang membaca
+  cookie `jh_uid` dari `st.context.cookies` pada request HTTP awal **sebelum**
+  menjalankan komponen JavaScript. Jika cookie valid, UID langsung dikembalikan
+  dan ditandai final (`DEVICE_ID_FINAL=True`) tanpa menunggu browser.
+  Komponen JavaScript (`streamlit_javascript`) hanya dipanggil untuk pengguna
+  baru yang belum memiliki cookie. Perilaku ini berlaku konsisten untuk semua
+  pengguna (biasa, guest, dan admin).
 
 ### Cara tes manual Fase 4D
 
@@ -206,6 +217,12 @@
    tabel harian menampilkan kolom "Pertanyaan tamu" > 0, "Total perangkat
    (terdaftar)" tidak berubah, dan "Pertanyaan pengguna" terpisah dari
    "Pertanyaan tamu".
+4. **Hapus semua tanpa nama:** buka Dashboard Admin → tab **Pengguna**, klik
+   tombol **"Hapus semua tanpa nama"** di sebelah "Segarkan". Konfirmasi dialog
+   akan muncul menampilkan jumlah kandidat. Klik **"Konfirmasi hapus semua
+   pengguna tanpa nama"** untuk menghapus. Verifikasi: pengguna bernama tidak
+   terhapus, `total_devices` di Statistik terhitung ulang, dan pengguna tanpa
+   nama (termasuk yang punya riwayat chat) terhapus.
 
 ### Cara tes manual Fase 4A
 
