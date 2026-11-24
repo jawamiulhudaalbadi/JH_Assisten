@@ -927,13 +927,41 @@ def _render_drive_sync_status(folder_id: str, api_keys: list[str]) -> None:
         _render_drive_sync_status_body(folder_id, api_keys)
 
 
+@st.fragment(run_every="1s")
+def _render_device_uid_wait() -> None:
+    get_device_uid(polling=True)
+    if (
+        st.session_state.get("_device_uid_browser_resolved")
+        or st.session_state.get("_device_uid_wait_timed_out")
+    ):
+        st.rerun(scope="app")
+    st.caption("Memeriksa ID perangkat di browser...")
+
+
 st.session_state.setdefault("chat_api_key_override", "")
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
 DEVICE_UID = get_device_uid()
 if st.session_state.get("_device_uid_wait_timed_out"):
-    st.caption("Penyimpanan browser tidak merespons; ID sesi sementara digunakan.")
+    st.caption("Riwayat belum tersimpan karena ID perangkat belum tersedia.")
+    if st.button("Coba lagi", key="device_uid_retry"):
+        for key in (
+            "_device_uid_wait_started",
+            "_device_uid_wait_attempts",
+            "_device_uid_waiting",
+            "_device_uid_wait_timed_out",
+        ):
+            st.session_state.pop(key, None)
+        st.rerun()
 elif st.session_state.get("_device_uid_waiting"):
-    st.caption("Memeriksa ID perangkat di browser...")
+    _render_device_uid_wait()
+if st.query_params.get("debug") == "1":
+    st.caption(
+        "Diagnostik ID perangkat: "
+        f"sumber={st.session_state.get('_device_uid_source', 'temporary')}; "
+        f"status={st.session_state.get('_device_uid_status', 'belum_balas')}; "
+        f"tipe nilai={st.session_state.get('_device_uid_raw_type', 'NoneType')}; "
+        f"UID awal={st.session_state.get('_device_uid_prefix', '')}"
+    )
 try:
     firestore_credentials_json = credentials_json_from_secrets(st.secrets)
 except StreamlitSecretNotFoundError:

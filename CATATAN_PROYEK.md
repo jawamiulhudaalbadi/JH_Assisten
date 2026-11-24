@@ -37,6 +37,16 @@
   `jh_uid` dibaca dari `st.context.cookies` pada request awal dan ditulis oleh
   browser dengan masa berlaku satu tahun serta `SameSite=Lax`. Parameter
   `?uid=` tetap didukung.
+- **Perbaikan eksekusi skrip UID browser:** akar masalah tambahan adalah
+  newline awal pada `_READ_UID_SCRIPT` dan `_CREATE_UID_SCRIPT`.
+  `streamlit_javascript` 0.1.5 membungkus kode sebagai
+  `eval("(async () => {return " + js_code + "})()")`; newline setelah `return`
+  memicu automatic semicolon insertion sehingga skrip tidak berjalan dan
+  komponen tidak mengembalikan prop `value`. Kedua skrip kini di-trim dan
+  dipastikan berbentuk ekspresi berawalan `(`. Saat balasan browser tertunda,
+  fragment melakukan polling 1 detik dan berhenti setelah batas 4 detik;
+  pengguna dapat menekan **Coba lagi**. UID sementara tidak disimpan di
+  browser dan tidak membuka akses Firestore.
 - **Pembuatan pengguna malas:** halaman yang hanya dibuka tidak lagi menulis
   aktivitas atau membuat dokumen pengguna. Transaksi pertama yang menyimpan
   pasangan pertanyaan-jawaban membuat `users/{uid}`, menaikkan
@@ -75,6 +85,16 @@
    app.py services/*.py`, lalu buka aplikasi dengan Streamlit AppTest. Tes tidak
    memerlukan kredensial layanan produksi; tes integrasi manual sebaiknya
    memakai proyek uji.
+7. Untuk menguji identitas browser, buka aplikasi pada browser uji dengan
+   penyimpanan lokal dan cookie aktif, lalu pastikan caption pemeriksaan hilang
+   dan riwayat tetap tersedia setelah muat ulang. Uji juga browser yang tidak
+   merespons: setelah 4 detik harus muncul keterangan riwayat belum tersimpan
+   dan tombol **Coba lagi**, tanpa UID sementara di Firestore atau storage
+   browser. Tambahkan `?debug=1` untuk melihat sumber, status, tipe nilai
+   komponen, dan hanya empat karakter awal UID; hapus parameter itu setelah
+   pengujian. Tes otomatis mengeksekusi kedua skrip dengan pembungkus
+   `streamlit_javascript` melalui Node.js (dilewati otomatis bila Node tidak
+   tersedia).
 
 ## Cara tes manual Fase 2
 
@@ -106,10 +126,12 @@ tidak disimpan di Firestore.
 ## Berkas yang diubah atau ditambahkan
 
 - `app.py` — login admin sebelum jalur percakapan, penerapan kebijakan sesi,
-  tampilan pengumuman, dan pemindahan kontrol mulai/jeda/lanjut/coba ulang Drive.
+  tampilan pengumuman, polling UID browser dengan timeout, dan pemindahan
+  kontrol mulai/jeda/lanjut/coba ulang Drive.
 - `services/device_identity.py` — prioritas UID URL/cookie, pembacaan browser
-  yang tidak menganggap respons kosong sebagai nilai tersimpan, serta penulisan
-  cookie dan localStorage setelah konfirmasi.
+  yang tidak menganggap respons kosong sebagai nilai tersimpan, skrip JavaScript
+  yang aman dari ASI pada pembungkus komponen, diagnostik terbatas, serta
+  penulisan cookie dan localStorage setelah konfirmasi.
 - `services/firestore_store.py` — batas waktu dan circuit breaker Firestore,
   antrean tulis latar, ringkasan statistik WIB, FAQ, konfigurasi admin,
   riwayat, statistik perangkat lazy, pembersihan pengguna kosong, serta status
@@ -126,7 +148,8 @@ tidak disimpan di Firestore.
   transaksi chunk dengan retry, pembuatan pengguna saat pertanyaan pertama,
   serta pembersihan pengguna kosong.
 - `tests/test_device_identity.py` — uji respons komponen kosong sebelum UID
-  localStorage tersedia, pemulihan UID melalui cookie, dan dukungan `?uid=`.
+  localStorage tersedia, pemulihan UID melalui cookie, dukungan `?uid=`, serta
+  eksekusi skrip UID melalui Node.js dengan pembungkus komponen yang sama.
 - `tests/test_admin_logic.py` — uji normalisasi FAQ, blokir, batas WIB,
   verifikasi PBKDF2, dan penguncian login.
 - `CATATAN_PROYEK.md` — catatan fase, struktur data, keputusan, dan pekerjaan
@@ -286,3 +309,7 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   transaksi dengan batas waktu RPC yang terkontrol.
 - Verifikasi belum memakai proyek Firestore produksi; hasil bergantung pada
   aturan IAM dan ketersediaan akun layanan saat penerapan.
+- Pengujian cookie `jh_uid`, rerun fragment, dan penyimpanan riwayat tetap perlu
+  diverifikasi pada deployment Streamlit Cloud serta Android WebView produksi;
+  tes otomatis lokal memeriksa eksekusi JavaScript dan batas akses Firestore,
+  tetapi tidak mereproduksi siklus hidup browser pada deployment tersebut.

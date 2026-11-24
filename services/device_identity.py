@@ -13,7 +13,6 @@ from streamlit_javascript import st_javascript
 _UID_RE = re.compile(r"^[a-f0-9]{16,32}$")
 _LOCAL_STORAGE_KEY = "jh_asisten_device_uid"
 _COOKIE_KEY = "jh_uid"
-_MAX_BROWSER_ATTEMPTS = 3
 _MAX_BROWSER_WAIT_SECONDS = 4.0
 
 
@@ -21,8 +20,30 @@ def _json_literal(value: str) -> str:
     return json.dumps(value)
 
 
+def _js_expression(body: str) -> str:
+    expression = body.strip()
+    return expression if expression.startswith("(") else f"({expression})"
+
+
 def _is_valid_uid(value: object) -> bool:
     return isinstance(value, str) and _UID_RE.fullmatch(value) is not None
+
+
+def _record_diagnostic(
+    *,
+    source: str | None = None,
+    status: str | None = None,
+    raw_value: object | None = None,
+    uid: str | None = None,
+) -> None:
+    if source is not None:
+        st.session_state["_device_uid_source"] = source
+    if status is not None:
+        st.session_state["_device_uid_status"] = status
+    if raw_value is not None or status == "belum_balas":
+        st.session_state["_device_uid_raw_type"] = type(raw_value).__name__
+    if uid is not None:
+        st.session_state["_device_uid_prefix"] = uid[:4]
 
 
 def _resolve_uid(uid: str) -> str:
@@ -32,10 +53,11 @@ def _resolve_uid(uid: str) -> str:
     st.session_state.pop("_device_uid_wait_attempts", None)
     st.session_state.pop("_device_uid_waiting", None)
     st.session_state.pop("_device_uid_wait_timed_out", None)
+    _record_diagnostic(status="found", uid=uid)
     return uid
 
 
-_READ_UID_SCRIPT = f"""
+_READ_UID_SCRIPT = _js_expression(f"""
 (() => {{
   try {{
     const uid = window.localStorage.getItem({_json_literal(_LOCAL_STORAGE_KEY)});
@@ -53,9 +75,9 @@ _READ_UID_SCRIPT = f"""
     return {{status: "error"}};
   }}
 }})()
-"""
+""")
 
-_CREATE_UID_SCRIPT = f"""
+_CREATE_UID_SCRIPT = _js_expression(f"""
 (() => {{
   try {{
     const key = {_json_literal(_LOCAL_STORAGE_KEY)};
@@ -78,7 +100,7 @@ _CREATE_UID_SCRIPT = f"""
     return {{status: "error"}};
   }}
 }})()
-"""
+""")
 
 
 def _temporary_uid() -> str:
@@ -94,28 +116,41 @@ def _temporary_uid() -> str:
 def _record_browser_wait() -> None:
     now = time.monotonic()
     started = st.session_state.setdefault("_device_uid_wait_started", now)
-    attempts = min(
-        st.session_state.get("_device_uid_wait_attempts", 0) + 1,
-        _MAX_BROWSER_ATTEMPTS,
+    timed_out = now - started >= _MAX_BROWSER_WAIT_SECONDS
+    st.session_state["_device_uid_wait_attempts"] = (
+        st.session_state.get("_device_uid_wait_attempts", 0) + 1
     )
-    timed_out = (
-        attempts >= _MAX_BROWSER_ATTEMPTS
-        or now - started >= _MAX_BROWSER_WAIT_SECONDS
-    )
-    st.session_state._device_uid_wait_attempts = attempts
     st.session_state._device_uid_wait_timed_out = timed_out
     st.session_state._device_uid_waiting = not timed_out
 
 
-def get_device_uid() -> str:
+def _record_browser_result(value: object) -> str:
+    if not isinstance(value, dict):
+        status = "belum_balas"
+    else:
+        status = value.get("status")
+        if not isinstance(status, str) or status not in {
+            "found",
+            "empty",
+            "error",
+        }:
+            status = "error"
+    _record_diagnostic(status=status, raw_value=value)
+    return status
+
+
+def get_device_uid(*, polling: bool = False) -> str:
     """Resolve the URL, request cookie, or browser storage UID in that order."""
+    key_suffix = "_poll" if polling else ""
     requested_uid = st.query_params.get("uid")
     st.query_params.pop("uid", None)
     if _is_valid_uid(requested_uid):
+        _record_diagnostic(source="url")
         return _resolve_uid(requested_uid)
 
     cookie_uid = st.context.cookies.get(_COOKIE_KEY)
     if _is_valid_uid(cookie_uid):
+        _record_diagnostic(source="cookie")
         return _resolve_uid(cookie_uid)
 
     if st.session_state.get("_device_uid_browser_resolved"):
@@ -123,24 +158,30 @@ def get_device_uid() -> str:
         if _is_valid_uid(session_uid):
             return session_uid
         st.session_state.pop("_device_uid_browser_resolved", None)
-    browser_result = st_javascript(_READ_UID_SCRIPT, key="read_device_uid")
-    if isinstance(browser_result, dict):
-        status = browser_result.get("status")
+    browser_result = st_javascript(
+        _READ_UID_SCRIPT,
+        key=f"read_device_uid{key_suffix}",
+    )
+    status = _record_browser_result(browser_result)
+    if status == "found":
         browser_uid = browser_result.get("uid")
-        if status == "found" and _is_valid_uid(browser_uid):
+        if _is_valid_uid(browser_uid):
+            _record_diagnostic(source="localStorage")
             return _resolve_uid(browser_uid)
-        if status == "empty":
-            created_result = st_javascript(
-                _CREATE_UID_SCRIPT,
-                key="create_device_uid",
-            )
-            if isinstance(created_result, dict):
-                created_uid = created_result.get("uid")
-                if (
-                    created_result.get("status") == "found"
-                    and _is_valid_uid(created_uid)
-                ):
-                    return _resolve_uid(created_uid)
+        _record_diagnostic(status="error")
+    if status == "empty":
+        created_result = st_javascript(
+            _CREATE_UID_SCRIPT,
+            key=f"create_device_uid{key_suffix}",
+        )
+        created_status = _record_browser_result(created_result)
+        if created_status == "found":
+            created_uid = created_result.get("uid")
+            if _is_valid_uid(created_uid):
+                _record_diagnostic(source="localStorage")
+                return _resolve_uid(created_uid)
+            _record_diagnostic(status="error")
 
     _record_browser_wait()
-    return _temporary_uid()
+    _record_diagnostic(source="temporary", uid=_temporary_uid())
+    return st.session_state["_device_uid_temporary"]
