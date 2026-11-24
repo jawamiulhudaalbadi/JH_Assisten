@@ -2973,7 +2973,24 @@ if chat_submission is not None:
             updated_stats["day"] = today_wib
             updated_stats["day_count"] = current_day_count + 1
         st.session_state.history_stats = updated_stats
-
+if st.query_params.get("dbg") == "1":
+    import base64, time as _t
+    from services.admin_session import get_admin_session_epoch
+    _tok = st.context.cookies.get("jh_adm") or ""
+    _info = "tidak_ada"
+    if _tok:
+        try:
+            _raw = base64.urlsafe_b64decode(_tok + "=" * (-len(_tok) % 4)).decode()
+            _u, _exp, _sig = _raw.split("|", 2)
+            _info = f"uid_cocok={_u == DEVICE_UID} sisa_detik={int(float(_exp) - _t.time())}"
+        except Exception as _e:
+            _info = f"format_salah:{type(_e).__name__}"
+    st.caption(
+        f"cookie_adm={bool(_tok)} token[{_info}] "
+        f"epoch_server={get_admin_session_epoch(FIRESTORE_CLIENT)} "
+        f"dev_ver={st.session_state.get('admin_device_verified')} "
+        f"metode={st.session_state.get('_admin_auth_method')}"
+    )
 
 _lc_persist()
 _record_app_perf()
