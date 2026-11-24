@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 
 import streamlit as st
@@ -12,8 +13,8 @@ from streamlit_javascript import st_javascript
 _UID_RE = re.compile(r"^[a-f0-9]{16,32}$")
 _LOCAL_STORAGE_KEY = "jh_asisten_device_uid"
 _COOKIE_KEY = "jh_uid"
-_STORAGE_MISSING = "__device_uid_missing__"
-_STORAGE_ERROR = "__device_uid_storage_error__"
+_MAX_BROWSER_ATTEMPTS = 3
+_MAX_BROWSER_WAIT_SECONDS = 4.0
 
 
 def _json_literal(value: str) -> str:
@@ -27,6 +28,10 @@ def _is_valid_uid(value: object) -> bool:
 def _resolve_uid(uid: str) -> str:
     st.session_state.device_uid = uid
     st.session_state._device_uid_browser_resolved = True
+    st.session_state.pop("_device_uid_wait_started", None)
+    st.session_state.pop("_device_uid_wait_attempts", None)
+    st.session_state.pop("_device_uid_waiting", None)
+    st.session_state.pop("_device_uid_wait_timed_out", None)
     return uid
 
 
@@ -34,15 +39,18 @@ _READ_UID_SCRIPT = f"""
 (() => {{
   try {{
     const uid = window.localStorage.getItem({_json_literal(_LOCAL_STORAGE_KEY)});
-    if (!/^[a-f0-9]{{16,32}}$/.test(uid || "")) {{
-      return uid === null ? {_json_literal(_STORAGE_MISSING)} : {_json_literal(_STORAGE_ERROR)};
+    if (uid === null) {{
+      return {{status: "empty"}};
+    }}
+    if (!/^[a-f0-9]{{16,32}}$/.test(uid)) {{
+      return {{status: "error"}};
     }}
     document.cookie = {_json_literal(_COOKIE_KEY + "=")} + uid
       + "; Max-Age=31536000; Path=/; SameSite=Lax"
       + (location.protocol === "https:" ? "; Secure" : "");
-    return uid;
+    return {{status: "found", uid}};
   }} catch (error) {{
-    return {_json_literal(_STORAGE_ERROR)};
+    return {{status: "error"}};
   }}
 }})()
 """
@@ -65,9 +73,9 @@ _CREATE_UID_SCRIPT = f"""
     document.cookie = {_json_literal(_COOKIE_KEY + "=")} + uid
       + "; Max-Age=31536000; Path=/; SameSite=Lax"
       + (location.protocol === "https:" ? "; Secure" : "");
-    return uid;
+    return {{status: "found", uid}};
   }} catch (error) {{
-    return {_json_literal(_STORAGE_ERROR)};
+    return {{status: "error"}};
   }}
 }})()
 """
@@ -81,6 +89,22 @@ def _temporary_uid() -> str:
     st.session_state.device_uid = uid
     st.session_state._device_uid_browser_resolved = False
     return uid
+
+
+def _record_browser_wait() -> None:
+    now = time.monotonic()
+    started = st.session_state.setdefault("_device_uid_wait_started", now)
+    attempts = min(
+        st.session_state.get("_device_uid_wait_attempts", 0) + 1,
+        _MAX_BROWSER_ATTEMPTS,
+    )
+    timed_out = (
+        attempts >= _MAX_BROWSER_ATTEMPTS
+        or now - started >= _MAX_BROWSER_WAIT_SECONDS
+    )
+    st.session_state._device_uid_wait_attempts = attempts
+    st.session_state._device_uid_wait_timed_out = timed_out
+    st.session_state._device_uid_waiting = not timed_out
 
 
 def get_device_uid() -> str:
@@ -99,13 +123,24 @@ def get_device_uid() -> str:
         if _is_valid_uid(session_uid):
             return session_uid
         st.session_state.pop("_device_uid_browser_resolved", None)
+    browser_result = st_javascript(_READ_UID_SCRIPT, key="read_device_uid")
+    if isinstance(browser_result, dict):
+        status = browser_result.get("status")
+        browser_uid = browser_result.get("uid")
+        if status == "found" and _is_valid_uid(browser_uid):
+            return _resolve_uid(browser_uid)
+        if status == "empty":
+            created_result = st_javascript(
+                _CREATE_UID_SCRIPT,
+                key="create_device_uid",
+            )
+            if isinstance(created_result, dict):
+                created_uid = created_result.get("uid")
+                if (
+                    created_result.get("status") == "found"
+                    and _is_valid_uid(created_uid)
+                ):
+                    return _resolve_uid(created_uid)
 
-    browser_uid = st_javascript(_READ_UID_SCRIPT, key="read_device_uid")
-    if _is_valid_uid(browser_uid.strip() if isinstance(browser_uid, str) else None):
-        return _resolve_uid(browser_uid.strip())
-    if browser_uid == _STORAGE_MISSING or browser_uid == _STORAGE_ERROR:
-        created_uid = st_javascript(_CREATE_UID_SCRIPT, key="create_device_uid")
-        if isinstance(created_uid, str) and _is_valid_uid(created_uid.strip()):
-            return _resolve_uid(created_uid.strip())
-
+    _record_browser_wait()
     return _temporary_uid()

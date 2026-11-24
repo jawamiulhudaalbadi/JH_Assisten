@@ -125,6 +125,13 @@ def get_firestore_client(credentials_json: str | None) -> Any | None:
         return None
 
 
+def get_device_firestore_client(client: Any | None) -> Any | None:
+    """Expose the client to device-scoped operations only after UID resolution."""
+    if not st.session_state.get("_device_uid_browser_resolved"):
+        return None
+    return client
+
+
 def _now() -> datetime:
     return datetime.now(_WIB)
 
@@ -1637,6 +1644,8 @@ def enqueue_question_answer(
     count_for_daily_limit: bool = True,
 ) -> None:
     """Queue history and each independent question summary write."""
+    if client is None:
+        return
     now = _now()
     _enqueue_write(
         client,

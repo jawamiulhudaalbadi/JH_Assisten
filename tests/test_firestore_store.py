@@ -789,6 +789,49 @@ class FirestoreStoreTests(unittest.TestCase):
         )
         javascript.assert_not_called()
 
+    def test_temporary_uid_never_reaches_device_firestore_operations(self) -> None:
+        state = _SessionState()
+        client = _FakeClient()
+        with (
+            patch.object(device_identity.st, "session_state", state),
+            patch.object(device_identity.st, "query_params", {}),
+            patch.object(
+                device_identity.st,
+                "context",
+                SimpleNamespace(cookies={}),
+            ),
+            patch.object(device_identity, "st_javascript", return_value=0),
+        ):
+            uid = device_identity.get_device_uid()
+            device_client = firestore_store.get_device_firestore_client(client)
+
+            self.assertFalse(state["_device_uid_browser_resolved"])
+            self.assertIsNone(device_client)
+            self.assertEqual(load_chat_history(device_client, uid, "chat")[0], [])
+            self.assertIsNone(firestore_store.get_active_chat_id(device_client, uid))
+            with self.assertRaises(firestore_store.ChatStoreError):
+                firestore_store.get_saved_chats(device_client, uid)
+            with self.assertRaises(firestore_store.ChatStoreError):
+                firestore_store.save_named_chat(device_client, uid, "chat", "saved")
+            with self.assertRaises(firestore_store.ChatStoreError):
+                firestore_store.delete_user_chat(device_client, uid, "chat")
+            with self.assertRaises(firestore_store.ChatStoreError):
+                firestore_store.delete_all_user_chats(device_client, uid)
+            with patch.object(firestore_store, "_enqueue_write") as enqueue:
+                enqueue_question_answer(
+                    device_client,
+                    uid,
+                    "chat",
+                    "question",
+                    "answer",
+                    [],
+                )
+                enqueue.assert_not_called()
+
+        self.assertEqual(client.read_paths, [])
+        self.assertEqual(client.persisted, [])
+        self.assertEqual(client.created_documents, set())
+
     def test_existing_user_question_does_not_increment_total_devices(self) -> None:
         client = _FakeClient()
         uid = "0123456789abcdef"

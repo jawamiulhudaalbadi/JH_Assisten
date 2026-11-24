@@ -66,6 +66,7 @@ from services.firestore_store import (
     get_saved_chats,
     get_active_chat_id,
     get_firestore_client,
+    get_device_firestore_client,
     get_runtime_config,
     load_chat_history,
     save_named_chat,
@@ -929,14 +930,16 @@ def _render_drive_sync_status(folder_id: str, api_keys: list[str]) -> None:
 st.session_state.setdefault("chat_api_key_override", "")
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
 DEVICE_UID = get_device_uid()
-if not st.session_state.get("_device_uid_browser_resolved"):
-    st.info("Menunggu ID perangkat dari penyimpanan browser...")
-    st.stop()
+if st.session_state.get("_device_uid_wait_timed_out"):
+    st.caption("Penyimpanan browser tidak merespons; ID sesi sementara digunakan.")
+elif st.session_state.get("_device_uid_waiting"):
+    st.caption("Memeriksa ID perangkat di browser...")
 try:
     firestore_credentials_json = credentials_json_from_secrets(st.secrets)
 except StreamlitSecretNotFoundError:
     firestore_credentials_json = None
 FIRESTORE_CLIENT = get_firestore_client(firestore_credentials_json)
+DEVICE_FIRESTORE_CLIENT = get_device_firestore_client(FIRESTORE_CLIENT)
 try:
     KEY_SECRETS = dict(st.secrets)
 except StreamlitSecretNotFoundError:
@@ -1685,12 +1688,15 @@ if (
     "chat_id" not in st.session_state
     or (requested_chat_id and requested_chat_id != st.session_state.chat_id)
 ):
-    st.session_state.chat_id = _get_or_create_chat_id(DEVICE_UID, FIRESTORE_CLIENT)
+    st.session_state.chat_id = _get_or_create_chat_id(
+        DEVICE_UID,
+        DEVICE_FIRESTORE_CLIENT,
+    )
 chat_id = st.session_state.chat_id
 
 if st.session_state.get("loaded_chat_id") != chat_id:
     loaded_messages, history_stats = load_chat_history(
-        FIRESTORE_CLIENT,
+        DEVICE_FIRESTORE_CLIENT,
         DEVICE_UID,
         chat_id,
     )
@@ -1717,7 +1723,7 @@ if st.session_state.get("admin_authenticated"):
     st.stop()
 
 try:
-    saved_chats = get_saved_chats(FIRESTORE_CLIENT, DEVICE_UID)
+    saved_chats = get_saved_chats(DEVICE_FIRESTORE_CLIENT, DEVICE_UID)
     saved_chats_error = ""
 except ChatStoreError as error:
     saved_chats = []
@@ -1772,7 +1778,7 @@ with st.sidebar:
     if save_chat:
         try:
             save_named_chat(
-                FIRESTORE_CLIENT,
+                DEVICE_FIRESTORE_CLIENT,
                 DEVICE_UID,
                 chat_id,
                 saved_chat_name,
@@ -1811,7 +1817,7 @@ with st.sidebar:
             key="confirm_delete_all_chats",
         ):
             try:
-                delete_all_user_chats(FIRESTORE_CLIENT, DEVICE_UID)
+                delete_all_user_chats(DEVICE_FIRESTORE_CLIENT, DEVICE_UID)
             except ChatStoreError as error:
                 st.error(f"Sadaya paguneman teu tiasa dipupus: {error}")
             else:
@@ -1873,7 +1879,7 @@ if st.session_state.get("clear_active_chat_confirmation"):
     ):
         try:
             deleted_stats = delete_user_chat(
-                FIRESTORE_CLIENT,
+                DEVICE_FIRESTORE_CLIENT,
                 DEVICE_UID,
                 chat_id,
             )
@@ -2180,7 +2186,7 @@ if chat_submission is not None:
         }
     )
     enqueue_question_answer(
-        FIRESTORE_CLIENT,
+        DEVICE_FIRESTORE_CLIENT,
         DEVICE_UID,
         chat_id,
         displayed_question,
