@@ -24,14 +24,28 @@
   menampilkan breaker, timeout konfigurasi yang dilewati, dan error tulis
   terakhir per jenis.
 - **Perbaikan tulis Firestore:** pasangan riwayat disimpan atomik bersama
-  dokumen pengguna. Statistik harian, FAQ, dan aktivitas per jam dikirim
-  terpisah; antrean tulis memori mempertahankan pekerjaan saat sirkuit terbuka
-  dan menjadwalkan ulang error sementara.
-- **Perbaikan transaksi aktivitas Firestore:** `active_user` tidak membaca atau
-  memakai transaksi. Dokumen pengguna dibuat dengan `create` untuk mendeteksi
-  perangkat baru, lalu diperbarui melalui batch; statistik global hanya
-  bertambah setelah pembuatan berhasil. Transaksi hanya digunakan saat membaca
-  dan menulis pasangan pesan ke chunk.
+  dokumen pengguna. Statistik harian dan FAQ dikirim terpisah; statistik jam
+  dan jumlah perangkat untuk UID baru tersimpan dalam transaksi pasangan chat.
+  Antrean tulis memori mempertahankan pekerjaan saat sirkuit terbuka dan
+  menjadwalkan ulang error sementara.
+- **Perbaikan ID perangkat produksi:** penyebab UID berubah adalah respons
+  kosong sementara dari komponen JavaScript dianggap sebagai UID browser yang
+  rusak. Jalur perbaikan lalu membuat UID server dan menandainya final, walau
+  localStorage masih berisi UID lama. Kini respons kosong hanya menghasilkan
+  UID sementara sesi dan aplikasi menunggu; pembuatan UID persisten hanya
+  dilakukan setelah skrip browser menyatakan penyimpanan benar-benar kosong.
+  `jh_uid` dibaca dari `st.context.cookies` pada request awal dan ditulis oleh
+  browser dengan masa berlaku satu tahun serta `SameSite=Lax`. Parameter
+  `?uid=` tetap didukung.
+- **Pembuatan pengguna malas:** halaman yang hanya dibuka tidak lagi menulis
+  aktivitas atau membuat dokumen pengguna. Transaksi pertama yang menyimpan
+  pasangan pertanyaan-jawaban membuat `users/{uid}`, menaikkan
+  `stats/global.total_devices` hanya untuk UID baru, dan memperbarui statistik
+  per jam secara atomik.
+- **Pembersihan pengguna kosong:** menu **Kontrol lain** menampilkan jumlah
+  calon sebelum konfirmasi. Hanya dokumen dengan `total_questions` tepat 0 dan
+  tanpa chunk yang dapat dihapus; setelahnya `total_devices` dihitung ulang
+  dari dokumen pengguna tersisa.
 
 ## Cara tes manual Fase 3
 
@@ -93,11 +107,15 @@ tidak disimpan di Firestore.
 
 - `app.py` — login admin sebelum jalur percakapan, penerapan kebijakan sesi,
   tampilan pengumuman, dan pemindahan kontrol mulai/jeda/lanjut/coba ulang Drive.
+- `services/device_identity.py` — prioritas UID URL/cookie, pembacaan browser
+  yang tidak menganggap respons kosong sebagai nilai tersimpan, serta penulisan
+  cookie dan localStorage setelah konfirmasi.
 - `services/firestore_store.py` — batas waktu dan circuit breaker Firestore,
   antrean tulis latar, ringkasan statistik WIB, FAQ, konfigurasi admin,
-  riwayat, serta status kesehatan. Pembacaan konfigurasi runtime tidak menunggu
-  Firestore pada jalur render; perubahan dashboard admin memakai timeout
-  10 detik yang terpisah dari breaker chat.
+  riwayat, statistik perangkat lazy, pembersihan pengguna kosong, serta status
+  kesehatan. Pembacaan konfigurasi runtime tidak menunggu Firestore pada jalur
+  render; perubahan dashboard admin memakai timeout 10 detik yang terpisah dari
+  breaker chat.
 - `services/admin_logic.py` — verifikasi hash admin, pengelolaan autentikasi
   dan penguncian login, serta pemeriksaan blokir dan batas harian.
 - `services/admin_dashboard.py` — dasbor statistik, riwayat, FAQ, sinkron
@@ -105,8 +123,10 @@ tidak disimpan di Firestore.
 - `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin.
 - `tests/test_firestore_store.py` — uji kegagalan dan batas waktu riwayat
   Firestore, konfigurasi runtime asinkron, penolakan UID perangkat invalid,
-  transaksi chunk dengan retry, penulisan aktivitas tanpa transaksi, serta
-  operasi admin saat breaker chat terbuka.
+  transaksi chunk dengan retry, pembuatan pengguna saat pertanyaan pertama,
+  serta pembersihan pengguna kosong.
+- `tests/test_device_identity.py` — uji respons komponen kosong sebelum UID
+  localStorage tersedia, pemulihan UID melalui cookie, dan dukungan `?uid=`.
 - `tests/test_admin_logic.py` — uji normalisasi FAQ, blokir, batas WIB,
   verifikasi PBKDF2, dan penguncian login.
 - `CATATAN_PROYEK.md` — catatan fase, struktur data, keputusan, dan pekerjaan
@@ -120,8 +140,7 @@ tidak disimpan di Firestore.
 - `users/{uid}/chats/{chat_id}/chunks/{chunk_id}` — pesan per potongan.
 - `stats/global` — jumlah perangkat.
 - `stats/daily_YYYYMMDD` — jumlah pertanyaan dan UID perangkat aktif yang
-  di-hash untuk hari WIB; `active_count` menghitung pencatatan aktivitas per
-  jam dengan operasi `Increment`.
+  di-hash untuk hari WIB.
 - `stats/hourly_YYYYMMDDHH` — UID yang di-hash dan peta `active_at` untuk
   aktivitas per jam.
 - `faq/{sha256_pertanyaan_normalisasi}` — pertanyaan yang dinormalisasi,
@@ -186,15 +205,26 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
 - Setiap pertanyaan mengantrekan satu transaksi `@firestore.transactional`
   untuk membaca dan memperbarui chunk serta dokumen pengguna. Retry antrean
   membuat objek transaksi baru; transaksi tidak dibagikan antar-thread.
+  UID yang belum terkonfirmasi tidak dipakai untuk membaca atau menulis riwayat.
+  Transaksi pertama menyimpan pertanyaan juga membuat dokumen pengguna,
+  menaikkan `stats/global.total_devices` jika dokumen belum ada, dan mencatat
+  UID ter-hash pada `stats/hourly_YYYYMMDDHH`. Pembukaan halaman saja tidak
+  membuat dokumen statistik atau pengguna.
   Penulisan `stats/daily.questions` dan FAQ terpisah (FAQ hanya jika pertanyaan
-  hasil normalisasi tidak kosong). Penulisan aktivitas pengguna tidak memakai
-  transaksi: dokumen baru dideteksi dengan `users/{uid}.create`, lalu
-  `users/{uid}` dan `stats/global` diperbarui lewat batch; ringkasan aktivitas
-  jam memakai `ArrayUnion`, sedangkan `stats/daily.active_count` memakai
-  `Increment`. Aktivitas ditulis paling banyak sekali per jam per sesi.
+  hasil normalisasi tidak kosong).
   Menu Kesehatan sistem menampilkan `writes_ok`, `writes_failed`,
   `writes_retried`, `writes_dropped`, error terakhir, dan waktu penutupan
   circuit breaker.
+- Streamlit menyediakan `st.context.cookies` setidaknya sejak versi 1.52,
+  sesuai batas minimum pada dependency proyek (antarmuka hanya-baca untuk
+  cookie pada request awal).
+  Cookie `jh_uid` dibuat sebagai cookie first-party browser dengan atribut
+  standar `Max-Age=31536000`, `Path=/`, dan `SameSite=Lax` (`Secure` pada
+  HTTPS). Android WebView memiliki pengelola cookie Chromium; pemulihan tetap
+  bergantung pada cookie yang diaktifkan di WebView dan cookie dikirim ke host
+  aplikasi yang sama. Penerimaan aktual pada deployment Streamlit Cloud dan
+  build WebView produksi perlu dites di perangkat/lingkungan tersebut; repositori
+  tidak menyediakan akses runtime untuk menguji konfigurasi deployment.
 - Hash UID dipakai pada ringkasan pengguna unik. FAQ menggunakan hash SHA-256
   dari pertanyaan, sehingga tidak menyimpan UID. Pemeriksaan blokir dan batas
   membaca data pengguna yang sudah dimuat, tanpa membaca Firestore lagi di

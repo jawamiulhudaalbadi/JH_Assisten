@@ -26,6 +26,8 @@ from services.firestore_store import (
     get_admin_statistics,
     get_admin_user_chats,
     get_admin_users,
+    delete_empty_users_and_recount,
+    get_empty_user_uids,
     get_runtime_config,
     save_settings_password_hash,
     set_user_blocked,
@@ -497,6 +499,50 @@ def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
             st.error(str(error))
         else:
             st.success("Kontrol disimpan dan berlaku di proses ini.")
+
+    if st.button("Bersihkan pengguna kosong", key="admin_preview_empty_users"):
+        try:
+            st.session_state["_empty_user_cleanup_candidates"] = (
+                get_empty_user_uids(client)
+            )
+        except RuntimeError as error:
+            st.error(f"Tidak dapat memeriksa pengguna kosong: {error}")
+        else:
+            st.session_state["_empty_user_cleanup_confirmation"] = True
+
+    if st.session_state.get("_empty_user_cleanup_confirmation"):
+        candidates = st.session_state.get("_empty_user_cleanup_candidates", [])
+        st.warning(
+            f"{len(candidates)} pengguna dengan 0 pertanyaan dan tanpa chunk "
+            "akan dihapus. Pengguna yang memiliki riwayat tidak disentuh."
+        )
+        confirm_column, cancel_column = st.columns(2)
+        if confirm_column.button(
+            "Konfirmasi hapus pengguna kosong",
+            key="admin_confirm_empty_users",
+            type="primary",
+        ):
+            try:
+                deleted_count, remaining_count = delete_empty_users_and_recount(
+                    client, candidates
+                )
+            except RuntimeError as error:
+                st.error(f"Pembersihan pengguna kosong gagal: {error}")
+            else:
+                st.session_state.pop("_empty_user_cleanup_candidates", None)
+                st.session_state.pop("_empty_user_cleanup_confirmation", None)
+                st.session_state.pop("_admin_cache_users", None)
+                st.session_state.pop("_admin_cache_statistics", None)
+                st.success(
+                    f"{deleted_count} pengguna dihapus; total perangkat "
+                    f"dihitung ulang menjadi {remaining_count}."
+                )
+        if cancel_column.button(
+            "Batal",
+            key="admin_cancel_empty_users",
+        ):
+            st.session_state.pop("_empty_user_cleanup_candidates", None)
+            st.session_state.pop("_empty_user_cleanup_confirmation", None)
 
     selectable_users = {
         user["short_id"]: user["uid"]

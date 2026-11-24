@@ -477,12 +477,7 @@ def _write_error_class(error: BaseException) -> str:
 def _record_write_failure(job: _QueuedWrite, error: BaseException) -> None:
     error_class = _write_error_class(error)
     field_name = getattr(error, "field_name", "")
-    sensitive_values = (
-        (str(job.args[0]),)
-        if job.kind == "active_user" and job.args
-        else ()
-    )
-    error_message = _safe_error_message(error, *sensitive_values)
+    error_message = _safe_error_message(error)
     details = f"{error_class}: {error_message}"
     if field_name:
         details = f"{details} (field={field_name})"
@@ -686,6 +681,117 @@ def get_admin_users(client: Any | None) -> list[dict[str, Any]]:
         context="pembacaan daftar pengguna admin",
         fallback=[],
     )
+
+
+def get_empty_user_uids(client: Any | None) -> list[str]:
+    """List users with an explicit zero question count and no history chunks."""
+    if client is None:
+        raise RuntimeError("Penyimpanan Firestore tidak tersedia.")
+    from google.api_core.exceptions import GoogleAPICallError
+
+    try:
+        deadline = time.monotonic() + FIRESTORE_READ_TIMEOUT_SECONDS
+        users_ref = client.collection("users")
+        uids_with_chunks: set[str] = set()
+        for chunk_snapshot in _snapshots(
+            client.collection_group("chunks"), deadline
+        ):
+            path_parts = chunk_snapshot.reference.path.split("/")
+            if (
+                len(path_parts) == 6
+                and path_parts[0] == "users"
+                and path_parts[2] == "chats"
+                and path_parts[4] == "chunks"
+            ):
+                uids_with_chunks.add(path_parts[1])
+        empty_uids: list[str] = []
+        for user_snapshot in _snapshots(users_ref, deadline):
+            user_data = user_snapshot.to_dict() or {}
+            question_count = user_data.get("total_questions")
+            if (
+                isinstance(question_count, bool)
+                or not isinstance(question_count, (int, float))
+                or question_count != 0
+            ):
+                continue
+            if user_snapshot.id not in uids_with_chunks:
+                empty_uids.append(user_snapshot.id)
+        return empty_uids
+    except (
+        GoogleAPICallError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+    ) as error:
+        raise RuntimeError(
+            "Daftar pengguna kosong gagal dimuat "
+            f"({type(error).__name__}): {_safe_error_message(error)}"
+        ) from error
+
+
+def delete_empty_users_and_recount(
+    client: Any | None, candidate_uids: list[str]
+) -> tuple[int, int]:
+    """Delete only the previewed still-empty users and recalculate device count."""
+    if client is None:
+        raise RuntimeError("Penyimpanan Firestore tidak tersedia.")
+    from google.api_core.exceptions import GoogleAPICallError
+
+    try:
+        deadline = time.monotonic() + FIRESTORE_ADMIN_TIMEOUT_SECONDS
+        candidates = set(candidate_uids)
+        still_empty = set(get_empty_user_uids(client)) & candidates
+        users_ref = client.collection("users")
+        batch = client.batch()
+        pending = 0
+        for uid in sorted(still_empty):
+            user_ref = users_ref.document(uid)
+            for chat_snapshot in _snapshots(user_ref.collection("chats"), deadline):
+                batch.delete(user_ref.collection("chats").document(chat_snapshot.id))
+                pending += 1
+            batch.delete(user_ref)
+            pending += 1
+            if pending >= 450:
+                batch.commit(
+                    timeout=_remaining_timeout(
+                        deadline, FIRESTORE_ADMIN_TIMEOUT_SECONDS
+                    ),
+                    retry=None,
+                )
+                batch = client.batch()
+                pending = 0
+        if pending:
+            batch.commit(
+                timeout=_remaining_timeout(
+                    deadline, FIRESTORE_ADMIN_TIMEOUT_SECONDS
+                ),
+                retry=None,
+            )
+
+        remaining = len(_snapshots(users_ref, deadline))
+        recount_batch = client.batch()
+        recount_batch.set(
+            client.collection("stats").document("global"),
+            {"total_devices": remaining},
+            merge=True,
+        )
+        recount_batch.commit(
+            timeout=_remaining_timeout(deadline, FIRESTORE_ADMIN_TIMEOUT_SECONDS),
+            retry=None,
+        )
+        return len(still_empty), remaining
+    except (
+        GoogleAPICallError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+    ) as error:
+        raise RuntimeError(
+            "Penghapusan pengguna kosong atau hitung ulang total perangkat gagal "
+            f"({type(error).__name__}): {_safe_error_message(error)}"
+        ) from error
 
 
 def get_admin_user_chats(client: Any | None, uid: str) -> list[dict[str, str]]:
@@ -1660,6 +1766,22 @@ def _write_question_pair(
             {"messages": next_messages, "count": len(next_messages)},
         )
         transaction.set(user_ref, user_fields, merge=True)
+        if not user_snapshot.exists:
+            transaction.set(
+                client.collection("stats").document("global"),
+                {"total_devices": firestore.Increment(1)},
+                merge=True,
+            )
+        hashed_uid = _stats_uid(uid)
+        hour_key = now.strftime("%Y%m%d%H")
+        transaction.set(
+            client.collection("stats").document(f"hourly_{hour_key}"),
+            {
+                "uids": firestore.ArrayUnion([hashed_uid]),
+                "active_at": {hashed_uid: now},
+            },
+            merge=True,
+        )
 
     write_pair(client.transaction())
 
@@ -1715,154 +1837,10 @@ def _write_faq_question(
     )
 
 
-def mark_active(client: Any | None, uid: str) -> None:
-    """Catat aktivitas paling banyak sekali per jam per sesi."""
-    if not isinstance(uid, str) or not _DEVICE_UID_RE.fullmatch(uid):
-        error = ValueError("Invalid value for field 'uid': invalid device ID.")
-        _record_recent_error(error, "Firestore write active_user")
-        logger.error(
-            "Firestore write skipped kind=active_user error_class=ValueError "
-            "field=uid error_message=%s",
-            _safe_error_message(error, str(uid)),
-        )
-        return
-    now = _now()
-    previous = st.session_state.get("last_active_written_at")
-    hour_key = now.strftime("%Y%m%d%H")
-    if (
-        isinstance(previous, datetime)
-        and previous.strftime("%Y%m%d%H") == hour_key
-    ):
-        return
-    st.session_state.last_active_written_at = now
-    _enqueue_write(client, "active_user", _write_active_user, uid, now)
-    _enqueue_write(
-        client,
-        "hourly_activity",
-        _write_hourly_activity,
-        uid,
-        now,
-        hour_key,
-    )
-    _enqueue_write(client, "daily_activity", _write_daily_activity, uid, now)
-
-
-def _write_active_user(
-    client: Any, deadline: float, uid: str, now: datetime
-) -> None:
-    if not isinstance(uid, str) or not _DEVICE_UID_RE.fullmatch(uid):
-        raise _FirestoreFieldValueError(
-            "Invalid value for field 'uid': invalid device ID.",
-            field_name="uid",
-        )
-    from google.cloud import firestore
-    from google.api_core.exceptions import AlreadyExists
-
-    try:
-        user_ref = client.collection("users").document(uid)
-    except ValueError as error:
-        raise _FirestoreFieldValueError(
-            _safe_error_message(error, uid),
-            field_name="uid",
-        ) from error
-    initial_fields: dict[str, Any] = {
-        "last_active": now,
-        "first_seen": now,
-        "total_questions": 0,
-        "total_messages": 0,
-        "total_chunks": 0,
-        "blocked": False,
-        "day": now.strftime("%Y%m%d"),
-        "day_count": 0,
-    }
-    try:
-        user_ref.create(
-            initial_fields,
-            timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
-            retry=None,
-        )
-        created = True
-    except AlreadyExists:
-        created = False
-
-    batch = client.batch()
-    fields = {"last_active": now}
-    batch.set(user_ref, fields, merge=True)
-    if created:
-        batch.set(
-            client.collection("stats").document("global"),
-            {"total_devices": firestore.Increment(1)},
-            merge=True,
-        )
-    try:
-        batch.commit(
-            timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
-            retry=None,
-        )
-    except ValueError as error:
-        field_name = next(
-            (
-                name
-                for name in (*fields, "total_devices")
-                if name in str(error)
-            ),
-            "user_document_fields",
-        )
-        raise _FirestoreFieldValueError(
-            _safe_error_message(error, uid),
-            field_name=field_name,
-        ) from error
-
-
 class _FirestoreFieldValueError(ValueError):
     def __init__(self, message: str, *, field_name: str) -> None:
         super().__init__(message)
         self.field_name = field_name
-
-
-def _write_hourly_activity(
-    client: Any,
-    deadline: float,
-    uid: str,
-    now: datetime,
-    hour_key: str,
-) -> None:
-    from google.cloud import firestore
-
-    hashed_uid = _stats_uid(uid)
-    batch = client.batch()
-    batch.set(
-        client.collection("stats").document(f"hourly_{hour_key}"),
-        {
-            "uids": firestore.ArrayUnion([hashed_uid]),
-            "active_at": {hashed_uid: now},
-        },
-        merge=True,
-    )
-    batch.commit(
-        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
-        retry=None,
-    )
-
-
-def _write_daily_activity(
-    client: Any, deadline: float, uid: str, now: datetime
-) -> None:
-    from google.cloud import firestore
-
-    batch = client.batch()
-    batch.set(
-        client.collection("stats").document(f"daily_{now:%Y%m%d}"),
-        {
-            "uids": firestore.ArrayUnion([_stats_uid(uid)]),
-            "active_count": firestore.Increment(1),
-        },
-        merge=True,
-    )
-    batch.commit(
-        timeout=_remaining_timeout(deadline, FIRESTORE_WRITE_TIMEOUT_SECONDS),
-        retry=None,
-    )
 
 
 def clear_user_history(client: Any | None, uid: str) -> None:

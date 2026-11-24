@@ -68,7 +68,6 @@ from services.firestore_store import (
     get_firestore_client,
     get_runtime_config,
     load_chat_history,
-    mark_active,
     save_named_chat,
 )
 from services.key_pool import (
@@ -930,6 +929,9 @@ def _render_drive_sync_status(folder_id: str, api_keys: list[str]) -> None:
 st.session_state.setdefault("chat_api_key_override", "")
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
 DEVICE_UID = get_device_uid()
+if not st.session_state.get("_device_uid_browser_resolved"):
+    st.info("Menunggu ID perangkat dari penyimpanan browser...")
+    st.stop()
 try:
     firestore_credentials_json = credentials_json_from_secrets(st.secrets)
 except StreamlitSecretNotFoundError:
@@ -1695,7 +1697,6 @@ if st.session_state.get("loaded_chat_id") != chat_id:
     st.session_state.messages = loaded_messages
     st.session_state.history_stats = history_stats
     st.session_state.loaded_chat_id = chat_id
-mark_active(FIRESTORE_CLIENT, DEVICE_UID)
 if runtime_config["announcement"]:
     st.info(runtime_config["announcement"])
 
