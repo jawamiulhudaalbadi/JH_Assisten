@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+(function () {
+  "use strict";
+  var PREFIX = "jh_lc:";
+  var UID_KEY = "jh_asisten_device_uid";
+  var UID_RE = /^[a-f0-9]{16,32}$/;
+  var hydrated = false, hidden = false;
+  var lastWrite = "", lastClear = 0, pending = null, timer = null;
+
+  function send(type, extra) {
+    var m = { isStreamlitMessage: true, type: type };
+    for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) m[k] = extra[k]; }
+    window.parent.postMessage(m, "*");
+  }
+  function store() { try { return window.localStorage; } catch (e) { return null; } }
+
+  function setCookie(uid) {
+    var c = "jh_uid=" + uid + "; Max-Age=31536000; Path=/; SameSite=Lax" +
+            (location.protocol === "https:" ? "; Secure" : "");
+    try { window.parent.document.cookie = c; } catch (e) { try { document.cookie = c; } catch (e2) {} }
+  }
+
+  function hideFrame() {
+    if (hidden) return;
+    hidden = true;
+    try {
+      var f = window.frameElement;
+      if (!f) return;
+      f.style.cssText = "width:0;height:0;border:0;position:absolute;";
+      var box = f.closest('[data-testid="stElementContainer"], .element-container');
+      if (box) box.style.cssText = "position:absolute;width:0;height:0;overflow:hidden;margin:0;padding:0;";
+    } catch (e) {}
+  }
+
+  function writeNow() {
+    if (!pending) return;
+    var ls = store(), p = pending;
+    pending = null;
+    if (!ls) return;
+    var key = PREFIX + p.uid;
+    try { ls.setItem(key, p.raw); }
+    catch (e) { try { ls.removeItem(key); ls.setItem(key, p.raw); } catch (e2) {} }
+  }
+
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () {
+      if (window.requestIdleCallback) window.requestIdleCallback(writeNow, { timeout: 1500 });
+      else writeNow();
+    }, 300);
+  }
+
+  function purgeExpired(ttl) {
+    var ls = store(); if (!ls) return;
+    try {
+      var now = Date.now() / 1000;
+      for (var i = ls.length - 1; i >= 0; i--) {
+        var k = ls.key(i);
+        if (k && k.indexOf(PREFIX) === 0) {
+          try { var o = JSON.parse(ls.getItem(k)); if (!o || now - o.ts > ttl) ls.removeItem(k); }
+          catch (e) { ls.removeItem(k); }
+        }
+      }
+    } catch (e) {}
+  }
+
+  function hydrate(args) {
+    var ls = store(), uid = null, snap = null;
+    if (ls) {
+      try { uid = ls.getItem(UID_KEY); } catch (e) {}
+      if (!UID_RE.test(uid || "")) uid = null;
+      var use = args.uid || uid;
+      if (use) {
+        try { snap = ls.getItem(PREFIX + use); } catch (e) {}
+        if (snap) {
+          try {
+            var o = JSON.parse(snap);
+            if (o.v !== args.schema || (Date.now() / 1000 - o.ts) > args.ttl) { ls.removeItem(PREFIX + use); snap = null; }
+          } catch (e) { snap = null; }
+        }
+      }
+    }
+    if (uid) setCookie(uid);
+    hydrated = true;
+    send("streamlit:setComponentValue", { value: { ready: true, uid: uid, snapshot: snap }, dataType: "json" });
+    if (window.requestIdleCallback) window.requestIdleCallback(function () { purgeExpired(args.ttl); });
+  }
+
+  function onRender(ev) {
+    var a = (ev.data && ev.data.args) || {};
+    hideFrame();
+    var ls = store();
+
+    if (a.store_uid && UID_RE.test(a.store_uid) && ls) {
+      try { if (ls.getItem(UID_KEY) !== a.store_uid) ls.setItem(UID_KEY, a.store_uid); } catch (e) {}
+      setCookie(a.store_uid);
+    }
+    if (!hydrated) hydrate(a);
+
+    if (a.clear_nonce && a.clear_nonce > lastClear) {
+      lastClear = a.clear_nonce; pending = null; lastWrite = "";
+      if (ls && a.uid) { try { ls.removeItem(PREFIX + a.uid); } catch (e) {} }
+    }
+    if (a.snapshot && a.uid && a.write_id !== lastWrite) {
+      lastWrite = a.write_id;
+      pending = { uid: a.uid, raw: a.snapshot };
+      schedule();
+    }
+  }
+
+  window.addEventListener("message", function (ev) {
+    if (ev.data && ev.data.type === "streamlit:render") onRender(ev);
+  });
+
+  // Flush sinkron saat tab disembunyikan / ditutup / di-reload.
+  function flush() { if (timer) clearTimeout(timer); writeNow(); }
+  function onVis() { if (document.visibilityState === "hidden") flush(); }
+  [window, window.parent].forEach(function (w) {
+    try {
+      w.addEventListener("pagehide", flush);
+      w.addEventListener("beforeunload", flush);
+      w.document.addEventListener("visibilitychange", onVis);
+    } catch (e) {}
+  });
+
+  send("streamlit:componentReady", { apiVersion: 1 });
+  send("streamlit:setFrameHeight", { height: 0 });
+})();
+</script>
+</body>
+</html>
