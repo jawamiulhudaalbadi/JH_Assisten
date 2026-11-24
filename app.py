@@ -1366,6 +1366,8 @@ def _restore_admin_session() -> bool:
     browser_token = st.context.cookies.get("jh_adm", "")
     token = session_token if isinstance(session_token, str) else browser_token
     if not token:
+        token = local_cache.hydrated_admin_token()
+    if not token:
         return False
     epoch = get_admin_session_epoch(
         FIRESTORE_CLIENT,
@@ -1412,6 +1414,7 @@ if st.query_params.get("dbg") == "1":
             _info = f"format_salah:{type(_e).__name__}"
     st.info(
         f"DBG cookie_adm={bool(_tok)} token[{_info}] "
+        f"adm_ls={bool(local_cache.hydrated_admin_token())} "
         f"dev_ver={st.session_state.get('admin_device_verified')} "
         f"metode={st.session_state.get('_admin_auth_method')} "
         f"epoch_blok={_admin_session_epoch_unavailable}"

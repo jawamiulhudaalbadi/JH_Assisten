@@ -38,6 +38,7 @@ TTL_SECONDS = 14 * 24 * 3600  # snapshot kedaluwarsa 14 hari
 
 _STATE_KEY = "jh_lc"
 _UID_RE = re.compile(r"^[a-f0-9]{16,32}$")
+_ADMIN_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _KEEP_FIELDS = ("role", "content", "timestamp", "model_used", "sources", "answer_id")
 
 _component = components.declare_component(
@@ -62,6 +63,18 @@ def hydrated_uid() -> Optional[str]:
     """UID dari localStorage browser (None jika belum ada / belum siap)."""
     uid = _hydrated().get("uid")
     return uid if isinstance(uid, str) and _UID_RE.match(uid) else None
+
+
+def hydrated_admin_token() -> Optional[str]:
+    """Token sesi admin dari localStorage browser, jika formatnya valid."""
+    token = _hydrated().get("adm")
+    return (
+        token
+        if isinstance(token, str)
+        and len(token) <= 1024
+        and _ADMIN_TOKEN_RE.fullmatch(token)
+        else None
+    )
 
 
 def remember_uid(uid: str) -> None:

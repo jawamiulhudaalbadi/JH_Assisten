@@ -72,17 +72,29 @@ class AdminSessionRestoreTests(unittest.TestCase):
     def setUp(self):
         clear_admin_session_epoch_cache()
 
-    def _run_app(self, client):
+    def _run_app(
+        self, client, *, restore_from_hydrated=False, hydrated_admin_token=None
+    ):
         app = AppTest.from_file(str(_APP_PATH))
         app.secrets["ENCRYPTION_KEY"] = _SECRETS["ENCRYPTION_KEY"]
         app.session_state["device_uid"] = _UID
         app.session_state["_device_uid_browser_resolved"] = True
-        app.session_state["admin_authenticated"] = True
-        app.session_state["admin_device_verified"] = True
-        app.session_state["_admin_session_token"] = create_admin_session_token(
-            _UID, client.epoch, _SECRETS
-        )
-        app.session_state["_admin_auth_method"] = "token"
+        if restore_from_hydrated:
+            app.session_state["admin_authenticated"] = False
+            app.session_state["admin_device_verified"] = False
+            app.session_state["_admin_session_token"] = ""
+            app.session_state["_admin_auth_method"] = ""
+            app.session_state["jh_lc"] = {
+                "ready": True,
+                "adm": hydrated_admin_token,
+            }
+        else:
+            app.session_state["admin_authenticated"] = True
+            app.session_state["admin_device_verified"] = True
+            app.session_state["_admin_session_token"] = create_admin_session_token(
+                _UID, client.epoch, _SECRETS
+            )
+            app.session_state["_admin_auth_method"] = "token"
 
         with ExitStack() as stack:
             stack.enter_context(
@@ -122,6 +134,14 @@ class AdminSessionRestoreTests(unittest.TestCase):
                 )
             )
             stack.enter_context(patch.object(local_cache, "_component"))
+            if restore_from_hydrated:
+                stack.enter_context(
+                    patch.object(
+                        local_cache,
+                        "_hydrated",
+                        return_value={"ready": True, "adm": hydrated_admin_token},
+                    )
+                )
             stack.enter_context(patch("services.warmup.warm_start_once"))
             stack.enter_context(
                 patch.object(
@@ -181,6 +201,69 @@ class AdminSessionRestoreTests(unittest.TestCase):
         self.assertTrue(app.session_state["admin_authenticated"])
         self.assertTrue(app.session_state["admin_device_verified"])
         render_dashboard.assert_called_once()
+
+    def test_hydrated_token_restores_admin_when_cookie_is_empty(self):
+        client = _Client()
+        token = create_admin_session_token(_UID, client.epoch, _SECRETS)
+
+        app, render_dashboard, _ = self._run_app(
+            client,
+            restore_from_hydrated=True,
+            hydrated_admin_token=token,
+        )
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(app.session_state["admin_authenticated"])
+        self.assertTrue(app.session_state["admin_device_verified"])
+        self.assertEqual(app.session_state["_admin_auth_method"], "token")
+        self.assertEqual(app.session_state["_admin_session_token"], token)
+        render_dashboard.assert_called_once()
+
+    def test_invalid_hydrated_tokens_do_not_restore_admin(self):
+        invalid_tokens = {
+            "forged": "not a token",
+            "different UID": create_admin_session_token(
+                "abcdef0123456789", 4, _SECRETS
+            ),
+            "expired": create_admin_session_token(
+                _UID, 4, _SECRETS, now=1
+            ),
+            "different epoch": create_admin_session_token(
+                _UID, 3, _SECRETS
+            ),
+        }
+
+        for reason, token in invalid_tokens.items():
+            with self.subTest(reason=reason):
+                client = _Client()
+
+                app, render_dashboard, _ = self._run_app(
+                    client,
+                    restore_from_hydrated=True,
+                    hydrated_admin_token=token,
+                )
+
+                self.assertEqual(len(app.exception), 0)
+                self.assertFalse(app.session_state["admin_authenticated"])
+                self.assertFalse(app.session_state["admin_device_verified"])
+                render_dashboard.assert_not_called()
+
+    def test_hydrated_token_with_invalid_pattern_is_ignored(self):
+        for token in ("contains invalid characters!", "x" * 1025):
+            with self.subTest(token_length=len(token)):
+                client = _Client()
+
+                app, render_dashboard, epoch_reader = self._run_app(
+                    client,
+                    restore_from_hydrated=True,
+                    hydrated_admin_token=token,
+                )
+
+                self.assertEqual(len(app.exception), 0)
+                self.assertFalse(app.session_state["admin_authenticated"])
+                self.assertFalse(app.session_state["admin_device_verified"])
+                epoch_reader.assert_not_called()
+                render_dashboard.assert_not_called()
 
 
 if __name__ == "__main__":

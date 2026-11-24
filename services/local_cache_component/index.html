@@ -8,6 +8,7 @@
   var PREFIX = "jh_lc:";
   var UID_KEY = "jh_asisten_device_uid";
   var UID_RE = /^[a-f0-9]{16,32}$/;
+  var ADMIN_TOKEN_RE = /^[A-Za-z0-9_-]+$/;
   var hydrated = false, hidden = false;
   var lastWrite = "", lastClear = 0, pending = null, timer = null;
 
@@ -69,10 +70,12 @@
   }
 
   function hydrate(args) {
-    var ls = store(), uid = null, snap = null;
+    var ls = store(), uid = null, snap = null, adm = null;
     if (ls) {
       try { uid = ls.getItem(UID_KEY); } catch (e) {}
       if (!UID_RE.test(uid || "")) uid = null;
+      try { adm = ls.getItem("jh_adm"); } catch (e) {}
+      if (typeof adm !== "string" || adm.length > 1024 || !ADMIN_TOKEN_RE.test(adm)) adm = null;
       var use = args.uid || uid;
       if (use) {
         try { snap = ls.getItem(PREFIX + use); } catch (e) {}
@@ -86,7 +89,7 @@
     }
     if (uid) setCookie(uid);
     hydrated = true;
-    send("streamlit:setComponentValue", { value: { ready: true, uid: uid, snapshot: snap }, dataType: "json" });
+    send("streamlit:setComponentValue", { value: { ready: true, uid: uid, snapshot: snap, adm: adm }, dataType: "json" });
     if (window.requestIdleCallback) window.requestIdleCallback(function () { purgeExpired(args.ttl); });
   }
 
