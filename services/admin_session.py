@@ -11,6 +11,7 @@ import logging
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
 from typing import Any
 
@@ -26,6 +27,11 @@ _UID_RE = re.compile(r"^[a-f0-9]{16,32}$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _EPOCH_CACHE_LOCK = threading.Lock()
 _EPOCH_CACHE: dict[int, tuple[float, int | None]] = {}
+_EPOCH_GENERATION: dict[int, int] = {}
+_EPOCH_REFRESHING: dict[int, int] = {}
+_EPOCH_REFRESH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="jh-admin-epoch"
+)
 
 
 def _session_signing_key(secrets: Mapping[str, Any]) -> bytes:
@@ -157,6 +163,7 @@ def get_admin_session_epoch(
     client: Any | None,
     *,
     force_refresh: bool = False,
+    background_refresh: bool = False,
 ) -> int | None:
     """Read the revocation epoch, caching successful and failed reads for 5 minutes."""
     if client is None:
@@ -172,17 +179,22 @@ def get_admin_session_epoch(
         ):
             return cached[1]
 
+    if background_refresh:
+        with _EPOCH_CACHE_LOCK:
+            cached = _EPOCH_CACHE.get(cache_key)
+            generation = _EPOCH_GENERATION.get(cache_key, 0)
+            if _EPOCH_REFRESHING.get(cache_key) != generation:
+                _EPOCH_REFRESHING[cache_key] = generation
+                _EPOCH_REFRESH_EXECUTOR.submit(
+                    _refresh_admin_session_epoch,
+                    client,
+                    cache_key,
+                    generation,
+                )
+        return cached[1] if cached is not None else None
+
     def read_epoch() -> int:
-        snapshot = (
-            client.collection("config")
-            .document("admin_session")
-            .get(timeout=2.0, retry=None)
-        )
-        data = snapshot.to_dict() or {}
-        epoch = data.get("epoch", 0)
-        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
-            raise ValueError("Epoch sesi admin tidak valid.")
-        return epoch
+        return _read_admin_session_epoch(client)
 
     epoch = _bounded_read(
         client,
@@ -194,6 +206,50 @@ def get_admin_session_epoch(
     with _EPOCH_CACHE_LOCK:
         _EPOCH_CACHE[cache_key] = (time.monotonic(), epoch)
     return epoch
+
+
+def has_cached_admin_session_epoch(client: Any | None) -> bool:
+    """Return whether a successful epoch read is present in the cache."""
+    if client is None:
+        return False
+    with _EPOCH_CACHE_LOCK:
+        cached = _EPOCH_CACHE.get(id(client))
+        return cached is not None and cached[1] is not None
+
+
+def _read_admin_session_epoch(client: Any) -> int:
+    snapshot = (
+        client.collection("config")
+        .document("admin_session")
+        .get(timeout=2.0, retry=None)
+    )
+    data = snapshot.to_dict() or {}
+    epoch = data.get("epoch", 0)
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise ValueError("Epoch sesi admin tidak valid.")
+    return epoch
+
+
+def _refresh_admin_session_epoch(
+    client: Any,
+    cache_key: int,
+    generation: int,
+) -> None:
+    try:
+        epoch = _bounded_read(
+            client,
+            lambda: _read_admin_session_epoch(client),
+            timeout=2.5,
+            context="pembacaan epoch sesi admin",
+            fallback=None,
+        )
+        with _EPOCH_CACHE_LOCK:
+            if _EPOCH_GENERATION.get(cache_key, 0) == generation:
+                _EPOCH_CACHE[cache_key] = (time.monotonic(), epoch)
+    finally:
+        with _EPOCH_CACHE_LOCK:
+            if _EPOCH_REFRESHING.get(cache_key) == generation:
+                _EPOCH_REFRESHING.pop(cache_key, None)
 
 
 def revoke_all_admin_sessions(client: Any | None) -> None:
@@ -220,10 +276,19 @@ def revoke_all_admin_sessions(client: Any | None) -> None:
             f"({type(error).__name__})."
         ) from error
     with _EPOCH_CACHE_LOCK:
-        _EPOCH_CACHE.pop(id(client), None)
+        cache_key = id(client)
+        _EPOCH_GENERATION[cache_key] = (
+            _EPOCH_GENERATION.get(cache_key, 0) + 1
+        )
+        _EPOCH_CACHE.pop(cache_key, None)
 
 
 def clear_admin_session_epoch_cache() -> None:
     """Reset epoch cache for isolated tests."""
     with _EPOCH_CACHE_LOCK:
+        for cache_key in set(_EPOCH_CACHE) | set(_EPOCH_REFRESHING):
+            _EPOCH_GENERATION[cache_key] = (
+                _EPOCH_GENERATION.get(cache_key, 0) + 1
+            )
         _EPOCH_CACHE.clear()
+        _EPOCH_REFRESHING.clear()

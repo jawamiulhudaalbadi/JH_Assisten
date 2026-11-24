@@ -885,7 +885,6 @@ class FirestoreStoreTests(unittest.TestCase):
                 "context",
                 SimpleNamespace(cookies={"jh_uid": uid}),
             ),
-            patch.object(device_identity, "st_javascript") as javascript,
         ):
             resolved_uid = device_identity.get_device_uid()
             history, loaded_stats = load_chat_history(
@@ -909,10 +908,10 @@ class FirestoreStoreTests(unittest.TestCase):
         self.assertFalse(
             any(path.startswith("stats/hourly_") for path in client.persisted)
         )
-        javascript.assert_not_called()
 
     def test_temporary_uid_never_reaches_device_firestore_operations(self) -> None:
         state = _SessionState()
+        state["_device_uid_wait_started"] = 10.0
         client = _FakeClient()
         with (
             patch.object(device_identity.st, "session_state", state),
@@ -922,7 +921,17 @@ class FirestoreStoreTests(unittest.TestCase):
                 "context",
                 SimpleNamespace(cookies={}),
             ),
-            patch.object(device_identity, "st_javascript", return_value=0),
+            patch.object(device_identity.local_cache, "hydrated_uid", return_value=None),
+            patch.object(
+                device_identity.local_cache,
+                "component_ready",
+                return_value=False,
+            ),
+            patch.object(
+                device_identity.time,
+                "monotonic",
+                return_value=14.1,
+            ),
         ):
             uid = device_identity.get_device_uid()
             device_client = firestore_store.get_device_firestore_client(client)

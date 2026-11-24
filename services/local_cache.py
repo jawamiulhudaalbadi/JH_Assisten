@@ -125,7 +125,12 @@ def mount(uid: Optional[str], server_loader: Optional[Callable[[str], list]] = N
         if time.time() - float(snap.get("ts", 0)) > TTL_SECONDS:
             return
         messages, chat_id = snap.get("messages"), snap.get("chat_id")
-        if not isinstance(messages, list) or not messages or not chat_id:
+        if (
+            not isinstance(messages, list)
+            or not messages
+            or not isinstance(chat_id, str)
+            or not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", chat_id)
+        ):
             return
     except Exception:
         return
@@ -134,6 +139,8 @@ def mount(uid: Optional[str], server_loader: Optional[Callable[[str], list]] = N
     ss["messages"] = messages
     ss["chat_id"] = chat_id
     ss["loaded_chat_id"] = chat_id  # lewati reload Firestore sinkron di app.py
+    if not st.query_params.get("chat"):
+        st.query_params["chat"] = chat_id
     ss["_lc_last_wid"] = None
     if server_loader is not None:
         ss["_lc_future"] = _EXECUTOR.submit(server_loader, chat_id)

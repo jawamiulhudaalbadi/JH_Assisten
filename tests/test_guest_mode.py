@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from streamlit.testing.v1 import AppTest
 
-from services import firestore_store
+from services import device_identity, firestore_store, local_cache
 
 
 _APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
@@ -43,6 +43,16 @@ class GuestModeAppTests(unittest.TestCase):
     @contextmanager
     def _firestore_isolation(self, app, runtime=None, guest_hash=True):
         strict_client = _RejectingFirestoreClient()
+
+        def get_test_uid(*_args, **_kwargs):
+            uid = (
+                app.session_state.get("device_uid", "0123456789abcdef")
+                if app.session_state.get("_device_uid_browser_resolved")
+                else "fedcba9876543210"
+            )
+            app.session_state["device_uid"] = uid
+            return uid
+
         config = {
             "maintenance": False,
             "announcement": "",
@@ -75,6 +85,13 @@ class GuestModeAppTests(unittest.TestCase):
                     "secrets_models": [],
                 },
             ),
+            patch.object(
+                device_identity,
+                "get_device_uid",
+                side_effect=get_test_uid,
+            ),
+            patch("services.warmup.warm_start_once"),
+            patch.object(local_cache, "_component"),
         ):
             yield strict_client
 
@@ -108,6 +125,7 @@ class GuestModeAppTests(unittest.TestCase):
         app.session_state["chat_id"] = chat_id
         app.session_state["loaded_chat_id"] = chat_id
         app.session_state["_loaded_chat_uid"] = uid
+        app.session_state["_history_stats_loaded"] = True
         app.session_state["messages"] = [
             {"role": "user", "content": "Patarosan"},
             {"role": "assistant", "content": "Waleran"},

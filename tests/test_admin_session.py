@@ -189,6 +189,17 @@ console.log(JSON.stringify({result: eval(script), cookie, stored: storage.size})
         self.assertEqual(get_admin_session_epoch(client, force_refresh=True), 3)
         self.assertEqual(client.reads, 2)
 
+    def test_warm_epoch_background_check_does_not_read_firestore(self):
+        client = _Client(epoch=2)
+        self.assertEqual(get_admin_session_epoch(client), 2)
+        client.epoch = 3
+
+        self.assertEqual(
+            get_admin_session_epoch(client, background_refresh=True),
+            2,
+        )
+        self.assertEqual(client.reads, 1)
+
     def test_unavailable_firestore_fails_closed(self):
         self.assertIsNone(get_admin_session_epoch(None))
         client = _Client(unavailable=True)

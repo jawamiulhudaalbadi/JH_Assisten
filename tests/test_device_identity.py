@@ -2,6 +2,7 @@ import json
 import shutil
 import subprocess
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,361 +14,209 @@ class _SessionState(dict):
 
 
 class DeviceIdentityTests(unittest.TestCase):
-    def test_empty_component_round_then_reads_existing_uid_without_replacing_it(
-        self,
-    ) -> None:
-        uid = "0123456789abcdef"
-        state = _SessionState()
-        query_params = {}
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
+    def _patch_identity(self, stack, state, query_params, cookies=None):
+        stack.enter_context(
+            patch.object(device_identity.st, "session_state", state)
+        )
+        stack.enter_context(
+            patch.object(device_identity.st, "query_params", query_params)
+        )
+        stack.enter_context(
             patch.object(
                 device_identity.st,
                 "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                side_effect=[
-                    {"status": "empty"},
-                    0,
-                    {"status": "found", "uid": uid},
-                ],
-            ) as javascript,
-        ):
+                SimpleNamespace(cookies=cookies or {}),
+            )
+        )
+
+    def test_query_uid_and_cookie_precedence_are_unchanged(self) -> None:
+        uid = "fedcba9876543210"
+        state = _SessionState()
+        query_params = {"uid": uid}
+        with ExitStack() as stack:
+            self._patch_identity(
+                stack,
+                state,
+                query_params,
+                {"jh_uid": "abcdef0123456789"},
+            )
+            cache = stack.enter_context(
+                patch.object(device_identity, "local_cache")
+            )
+            self.assertEqual(device_identity.get_device_uid(), uid)
+
+        self.assertEqual(state["_device_uid_source"], "url")
+        cache.hydrated_uid.assert_not_called()
+
+        state.clear()
+        query_params = {}
+        with ExitStack() as stack:
+            self._patch_identity(
+                stack,
+                state,
+                query_params,
+                {"jh_uid": "abcdef0123456789"},
+            )
+            cache = stack.enter_context(
+                patch.object(device_identity, "local_cache")
+            )
+            self.assertEqual(
+                device_identity.get_device_uid(),
+                "abcdef0123456789",
+            )
+
+        cache.hydrated_uid.assert_not_called()
+
+    def test_waits_for_cache_hydration_before_resolving_uid(self) -> None:
+        state = _SessionState()
+        with ExitStack() as stack:
+            self._patch_identity(stack, state, {})
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache, "hydrated_uid", return_value=None
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache,
+                    "component_ready",
+                    return_value=False,
+                )
+            )
+            persist = stack.enter_context(
+                patch.object(device_identity.local_cache, "persist")
+            )
+            stack.enter_context(
+                patch.object(
+                    device_identity.st, "stop", side_effect=RuntimeError("stop")
+                )
+            )
+            stack.enter_context(
+                patch.object(device_identity.time, "monotonic", return_value=10.0)
+            )
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                device_identity.get_device_uid()
+
+        persist.assert_called_once_with(None, None, None)
+        self.assertEqual(state["_device_uid_wait_attempts"], 1)
+
+    def test_fragment_polling_advances_timeout_without_stopping_or_repersisting(self):
+        state = _SessionState(_device_uid_wait_started=10.0)
+        with ExitStack() as stack:
+            self._patch_identity(stack, state, {})
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache, "hydrated_uid", return_value=None
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache,
+                    "component_ready",
+                    return_value=False,
+                )
+            )
+            persist = stack.enter_context(
+                patch.object(device_identity.local_cache, "persist")
+            )
+            stop = stack.enter_context(patch.object(device_identity.st, "stop"))
+            stack.enter_context(
+                patch.object(device_identity.time, "monotonic", return_value=11.0)
+            )
+            uid = device_identity.get_device_uid(polling=True)
+
+        self.assertRegex(uid, r"^[a-f0-9]{32}$")
+        self.assertTrue(state["_device_uid_waiting"])
+        persist.assert_not_called()
+        stop.assert_not_called()
+
+    def test_ready_cache_uid_is_resolved(self) -> None:
+        uid = "0123456789abcdef"
+        state = _SessionState()
+        with ExitStack() as stack:
+            self._patch_identity(stack, state, {})
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache,
+                    "hydrated_uid",
+                    return_value=uid,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache,
+                    "component_ready",
+                    return_value=True,
+                )
+            )
+            self.assertEqual(device_identity.get_device_uid(), uid)
+
+        self.assertEqual(state["device_uid"], uid)
+        self.assertTrue(state["_device_uid_browser_resolved"])
+        self.assertEqual(state["_device_uid_source"], "localStorage")
+
+    def test_ready_cache_without_uid_creates_and_remembers_uid(self) -> None:
+        state = _SessionState()
+        with ExitStack() as stack:
+            self._patch_identity(stack, state, {})
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache, "hydrated_uid", return_value=None
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache, "component_ready", return_value=True
+                )
+            )
+            remember = stack.enter_context(
+                patch.object(device_identity.local_cache, "remember_uid")
+            )
+            uid = device_identity.get_device_uid()
+
+        self.assertRegex(uid, r"^[a-f0-9]{16,32}$")
+        remember.assert_called_once_with(uid)
+        self.assertEqual(state["device_uid"], uid)
+        self.assertTrue(state["_device_uid_browser_resolved"])
+
+    def test_timeout_falls_back_to_temporary_uid_then_accepts_hydrated_uid(self) -> None:
+        uid = "abcdef0123456789"
+        state = _SessionState()
+        with ExitStack() as stack:
+            self._patch_identity(stack, state, {})
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache,
+                    "hydrated_uid",
+                    side_effect=[None, uid],
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    device_identity.local_cache,
+                    "component_ready",
+                    return_value=False,
+                )
+            )
+            persist = stack.enter_context(
+                patch.object(device_identity.local_cache, "persist")
+            )
+            stack.enter_context(
+                patch.object(
+                    device_identity.time,
+                    "monotonic",
+                    side_effect=[10.0, 14.1],
+                )
+            )
             temporary_uid = device_identity.get_device_uid()
             self.assertRegex(temporary_uid, r"^[a-f0-9]{32}$")
             self.assertFalse(state["_device_uid_browser_resolved"])
             self.assertEqual(device_identity.get_device_uid(), uid)
 
-        self.assertEqual(state["device_uid"], uid)
-        self.assertTrue(state["_device_uid_browser_resolved"])
-        self.assertEqual(
-            [call.kwargs["key"] for call in javascript.call_args_list],
-            ["read_device_uid", "create_device_uid", "read_device_uid"],
-        )
-
-    def test_timeout_uses_temporary_uid_without_persisting_it(self) -> None:
-        state = _SessionState(device_uid="previous-session-value")
-        query_params = {"uid": "invalid"}
-
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                return_value=0,
-            ) as javascript,
-            patch.object(
-                device_identity.time,
-                "monotonic",
-                side_effect=[10.0, 11.0, 12.0, 14.1],
-            ),
-        ):
-            temporary_uid = ""
-            for _ in range(4):
-                temporary_uid = device_identity.get_device_uid()
-
-        self.assertRegex(temporary_uid, r"^[a-f0-9]{32}$")
-        self.assertFalse(state["_device_uid_browser_resolved"])
-        self.assertNotIn("uid", query_params)
-        self.assertEqual(state["_device_uid_wait_attempts"], 4)
-        self.assertTrue(state["_device_uid_wait_timed_out"])
-        self.assertEqual(javascript.call_count, 4)
-        self.assertEqual(
-            {call.kwargs["key"] for call in javascript.call_args_list},
-            {"read_device_uid"},
-        )
-        for call in javascript.call_args_list:
-            self.assertEqual(call.args[0], device_identity._READ_UID_SCRIPT)
-            self.assertNotIn(temporary_uid, call.args[0])
-
-    def test_times_out_after_four_seconds_before_three_attempts(self) -> None:
-        state = _SessionState()
-        query_params = {}
-
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                return_value=0,
-            ) as javascript,
-            patch.object(device_identity.time, "monotonic", side_effect=[10.0, 14.1]),
-        ):
-            device_identity.get_device_uid()
-            device_identity.get_device_uid()
-
-        self.assertTrue(state["_device_uid_wait_timed_out"])
-        self.assertEqual(state["_device_uid_wait_attempts"], 2)
-        self.assertEqual(javascript.call_count, 2)
-
-    def test_empty_component_values_use_temporary_uid(self) -> None:
-        for component_value in (None, ""):
-            with self.subTest(component_value=component_value):
-                state = _SessionState()
-                with (
-                    patch.object(device_identity.st, "session_state", state),
-                    patch.object(device_identity.st, "query_params", {}),
-                    patch.object(
-                        device_identity.st,
-                        "context",
-                        SimpleNamespace(cookies={}),
-                    ),
-                    patch.object(
-                        device_identity,
-                        "st_javascript",
-                        return_value=component_value,
-                    ),
-                ):
-                    uid = device_identity.get_device_uid()
-
-                self.assertRegex(uid, r"^[a-f0-9]{32}$")
-                self.assertFalse(state["_device_uid_browser_resolved"])
-                self.assertTrue(state["_device_uid_waiting"])
-
-    def test_cookie_is_final_and_skips_javascript_on_every_rerun(self) -> None:
-        cookie_uid = "abcdef0123456789"
-        state = _SessionState()
-        query_params = {}
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={"jh_uid": cookie_uid}),
-            ),
-            patch.object(device_identity, "st_javascript") as javascript,
-        ):
-            self.assertEqual(device_identity.get_device_uid(), cookie_uid)
-            self.assertEqual(device_identity.get_device_uid(), cookie_uid)
-
-        javascript.assert_not_called()
-        self.assertNotIn("uid", query_params)
-        self.assertEqual(state["_device_uid_source"], "cookie")
-
-    def test_query_uid_is_supported_before_identity_becomes_final(self) -> None:
-        query_uid = "fedcba9876543210"
-        state = _SessionState()
-        query_params = {"uid": query_uid}
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(device_identity, "st_javascript") as javascript,
-        ):
-            self.assertEqual(device_identity.get_device_uid(), query_uid)
-
-        javascript.assert_not_called()
-        self.assertEqual(state["_device_uid_source"], "url")
-        self.assertTrue(state["_device_uid_browser_resolved"])
-
-    def test_uses_browser_uid_and_marks_it_resolved(self) -> None:
-        uid = "0123456789abcdef"
-        state = _SessionState()
-        query_params = {}
-
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                return_value={"status": "found", "uid": uid},
-            ),
-        ):
-            self.assertEqual(device_identity.get_device_uid(), uid)
-
-        self.assertEqual(state["device_uid"], uid)
-        self.assertTrue(state["_device_uid_browser_resolved"])
-
-    def test_created_uid_is_reported_as_new_and_final(self) -> None:
-        uid = "0123456789abcdef"
-        state = _SessionState()
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", {}),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                side_effect=[
-                    {"status": "empty"},
-                    {"status": "found", "uid": uid},
-                ],
-            ),
-        ):
-            self.assertEqual(device_identity.get_device_uid(), uid)
-
-        self.assertEqual(state["_device_uid_source"], "baru")
-        self.assertTrue(state["_device_uid_browser_resolved"])
-
-    def test_resolves_browser_uid_on_a_later_rerun_after_error(self) -> None:
-        uid = "abcdef0123456789"
-        state = _SessionState()
-        query_params = {}
-
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                side_effect=[{"status": "error"}, {"status": "found", "uid": uid}],
-            ) as javascript,
-        ):
-            self.assertRegex(device_identity.get_device_uid(), r"^[a-f0-9]{32}$")
-            self.assertEqual(device_identity.get_device_uid(), uid)
-
-        self.assertEqual(state["device_uid"], uid)
-        self.assertTrue(state["_device_uid_browser_resolved"])
-        self.assertEqual(
-            [call.kwargs["key"] for call in javascript.call_args_list],
-            ["read_device_uid", "read_device_uid"],
-        )
-
-    def test_resolves_browser_uid_after_temporary_uid_timeout(self) -> None:
-        uid = "0123456789abcdef"
-        state = _SessionState()
-        query_params = {}
-
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                side_effect=[
-                    *([0] * 4),
-                    {"status": "found", "uid": uid},
-                ],
-            ) as javascript,
-            patch.object(
-                device_identity.time,
-                "monotonic",
-                side_effect=[10.0, 11.0, 12.0, 14.1],
-            ),
-        ):
-            for _ in range(4):
-                temporary_uid = device_identity.get_device_uid()
-            self.assertTrue(state["_device_uid_wait_timed_out"])
-            self.assertEqual(device_identity.get_device_uid(), uid)
-
-        self.assertNotEqual(temporary_uid, uid)
+        persist.assert_called_once_with(None, None, None)
         self.assertEqual(state["device_uid"], uid)
         self.assertTrue(state["_device_uid_browser_resolved"])
         self.assertNotIn("_device_uid_wait_timed_out", state)
-        self.assertEqual(javascript.call_count, 5)
-
-    def test_storage_errors_do_not_create_a_persistent_uid(self) -> None:
-        state = _SessionState(device_uid="abcdef0123456789")
-        query_params = {}
-
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                return_value={"status": "error"},
-            ) as javascript,
-        ):
-            temporary_uid = device_identity.get_device_uid()
-
-        self.assertRegex(temporary_uid, r"^[a-f0-9]{32}$")
-        self.assertNotEqual(temporary_uid, "abcdef0123456789")
-        self.assertFalse(state["_device_uid_browser_resolved"])
-        javascript.assert_called_once()
-
-    def test_create_result_is_not_assumed_when_component_is_empty(self) -> None:
-        state = _SessionState()
-        query_params = {}
-
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", query_params),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                side_effect=[{"status": "empty"}, 0],
-            ),
-        ):
-            uid = device_identity.get_device_uid()
-
-        self.assertRegex(uid, r"^[a-f0-9]{32}$")
-        self.assertEqual(state["device_uid"], uid)
-        self.assertFalse(state["_device_uid_browser_resolved"])
-
-    def test_fragment_polling_uses_distinct_component_keys(self) -> None:
-        state = _SessionState()
-        with (
-            patch.object(device_identity.st, "session_state", state),
-            patch.object(device_identity.st, "query_params", {}),
-            patch.object(
-                device_identity.st,
-                "context",
-                SimpleNamespace(cookies={}),
-            ),
-            patch.object(
-                device_identity,
-                "st_javascript",
-                side_effect=[{"status": "empty"}, 0],
-            ) as javascript,
-        ):
-            device_identity.get_device_uid(polling=True)
-
-        self.assertEqual(
-            [call.kwargs["key"] for call in javascript.call_args_list],
-            ["read_device_uid_poll", "create_device_uid_poll"],
-        )
 
 
 class DeviceIdentityScriptTests(unittest.TestCase):

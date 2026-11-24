@@ -8,7 +8,8 @@ import time
 import uuid
 
 import streamlit as st
-from streamlit_javascript import st_javascript
+
+from services import local_cache
 
 _UID_RE = re.compile(r"^[a-f0-9]{16,32}$")
 _LOCAL_STORAGE_KEY = "jh_asisten_device_uid"
@@ -147,7 +148,6 @@ def get_device_uid(*, polling: bool = False) -> str:
             return session_uid
         st.session_state.pop("_device_uid_browser_resolved", None)
 
-    key_suffix = "_poll" if polling else ""
     requested_uid = st.query_params.get("uid")
     st.query_params.pop("uid", None)
     if _is_valid_uid(requested_uid):
@@ -159,30 +159,23 @@ def get_device_uid(*, polling: bool = False) -> str:
         _record_diagnostic(source="cookie")
         return _resolve_uid(cookie_uid)
 
-    browser_result = st_javascript(
-        _READ_UID_SCRIPT,
-        key=f"read_device_uid{key_suffix}",
-    )
-    status = _record_browser_result(browser_result)
-    if status == "found":
-        browser_uid = browser_result.get("uid")
-        if _is_valid_uid(browser_uid):
-            _record_diagnostic(source="localStorage")
-            return _resolve_uid(browser_uid)
-        _record_diagnostic(status="error")
-    if status == "empty":
-        created_result = st_javascript(
-            _CREATE_UID_SCRIPT,
-            key=f"create_device_uid{key_suffix}",
-        )
-        created_status = _record_browser_result(created_result)
-        if created_status == "found":
-            created_uid = created_result.get("uid")
-            if _is_valid_uid(created_uid):
-                _record_diagnostic(source="baru")
-                return _resolve_uid(created_uid)
-            _record_diagnostic(status="error")
+    browser_uid = local_cache.hydrated_uid()
+    if browser_uid:
+        _record_diagnostic(source="localStorage")
+        return _resolve_uid(browser_uid)
 
-    _record_browser_wait()
+    if not local_cache.component_ready():
+        _record_browser_wait()
+        if not st.session_state["_device_uid_wait_timed_out"]:
+            if not polling:
+                local_cache.persist(None, None, None)
+                st.stop()
+            return _temporary_uid()
+    else:
+        browser_uid = uuid.uuid4().hex
+        local_cache.remember_uid(browser_uid)
+        _record_diagnostic(source="baru")
+        return _resolve_uid(browser_uid)
+
     _record_diagnostic(source="temporary", uid=_temporary_uid())
     return st.session_state["_device_uid_temporary"]

@@ -59,6 +59,7 @@ from services.admin_session import (
     build_admin_session_store_script,
     create_admin_session_token,
     get_admin_session_epoch,
+    has_cached_admin_session_epoch,
     verify_admin_session_token,
 )
 from services.firestore_store import (
@@ -98,6 +99,7 @@ from services.key_pool import (
 from services.perf_monitor import record_run as record_perf_run
 from services.sync_manager import DriveSyncManager
 from services.user_profile import USER_NAME_ERROR, needs_user_name, validate_user_name
+from services import local_cache, warmup
 
 
 APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "app_icon.png"
@@ -569,10 +571,14 @@ def _get_or_create_chat_id(uid: str, firestore_client: object | None) -> str:
     return new_id
 
 
-def _start_new_chat() -> None:
+def _start_new_chat(*, clear_cache: bool = True) -> None:
     new_id = uuid.uuid4().hex[:12]
     st.query_params["chat"] = new_id
     st.session_state.chat_id = new_id
+    if clear_cache:
+        local_cache.clear(
+            globals().get("DEVICE_UID") or st.session_state.get("device_uid")
+        )
     st.session_state.messages = []
     st.session_state.loaded_chat_id = new_id
     st.session_state.history_stats = {
@@ -1184,11 +1190,13 @@ def _render_drive_sync_status(folder_id: str, api_keys: list[str]) -> None:
 
 
 @st.fragment(run_every="1s")
-def _render_device_uid_wait() -> None:
+def _render_device_uid_wait(*, initial_wait: bool = False) -> None:
     get_device_uid(polling=True)
     if st.session_state.get("_device_uid_browser_resolved"):
         st.rerun(scope="app")
     if st.session_state.get("_device_uid_wait_timed_out"):
+        if initial_wait:
+            st.rerun(scope="app")
         st.caption("ID alat teu acan kapendak; riwayat can tiasa disimpen.")
         if st.button("Coba deui", key="device_uid_retry"):
             for key in (
@@ -1205,11 +1213,38 @@ def _render_device_uid_wait() -> None:
 
 st.session_state.setdefault("chat_api_key_override", "")
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
+if (
+    not st.session_state.get("_device_uid_browser_resolved")
+    and not st.session_state.get("_device_uid_wait_timed_out")
+    and not re.fullmatch(
+        r"[a-f0-9]{16,32}",
+        str(st.query_params.get("uid") or ""),
+    )
+    and not re.fullmatch(
+        r"[a-f0-9]{16,32}",
+        str(st.context.cookies.get("jh_uid") or ""),
+    )
+):
+    _render_device_uid_wait(initial_wait=True)
 with _measure_perf("identity"):
     DEVICE_UID = get_device_uid()
     DEVICE_ID_FINAL = bool(
         st.session_state.get("_device_uid_browser_resolved")
     )
+_lc_done = {"v": False}
+
+
+def _lc_persist() -> None:
+    if _lc_done["v"]:
+        return
+    _lc_done["v"] = True
+    local_cache.persist(
+        DEVICE_UID,
+        st.session_state.get("chat_id"),
+        st.session_state.get("messages"),
+    )
+
+
 IS_GUEST = bool(st.session_state.get("guest_mode"))
 GUEST_CODE_HASH = ""
 try:
@@ -1253,6 +1288,13 @@ with _measure_perf("configuration"):
         KEY_SECRETS = dict(st.secrets)
     except StreamlitSecretNotFoundError:
         KEY_SECRETS = {}
+warmup.warm_start_once(FIRESTORE_CLIENT, KEY_SECRETS)
+local_cache.mount(
+    DEVICE_UID,
+    server_loader=lambda cid, uid=DEVICE_UID, client=DEVICE_FIRESTORE_CLIENT: (
+        load_chat_history(client, uid, cid)[0]
+    ),
+)
 try:
     SETTINGS_PASSWORD = str(st.secrets.get("SETTINGS_PASSWORD", "") or "")
     ADMIN_CODE_HASH = str(st.secrets.get("ADMIN_CODE_HASH", "") or "")
@@ -1316,17 +1358,22 @@ def _render_admin_session_storage() -> None:
             st.caption(f"Rincian: {error_class}")
 
 
-def _restore_admin_session() -> None:
+def _restore_admin_session() -> bool:
     if not DEVICE_ID_FINAL:
-        return
+        return False
     session_token = st.session_state.get("_admin_session_token")
     auth_method = st.session_state.get("_admin_auth_method")
     browser_token = st.context.cookies.get("jh_adm", "")
     token = session_token if isinstance(session_token, str) else browser_token
     if not token:
-        return
-    epoch = get_admin_session_epoch(FIRESTORE_CLIENT)
-    valid = epoch is not None and verify_admin_session_token(
+        return False
+    epoch = get_admin_session_epoch(
+        FIRESTORE_CLIENT,
+        background_refresh=has_cached_admin_session_epoch(FIRESTORE_CLIENT),
+    )
+    if epoch is None:
+        return True
+    valid = verify_admin_session_token(
         token,
         DEVICE_UID,
         epoch,
@@ -1339,16 +1386,19 @@ def _restore_admin_session() -> None:
         # Only auto-open dashboard if user hasn't manually exited
         if not st.session_state.get("admin_exited_manually", False):
             st.session_state["admin_authenticated"] = True
-        return
+        return False
     if auth_method == "token" or not st.session_state.get("admin_authenticated"):
         st.session_state["admin_authenticated"] = False
         st.session_state["admin_device_verified"] = False
         st.session_state.pop("_admin_session_token", None)
         st.session_state.pop("_admin_auth_method", None)
+    return False
 
 
 if not IS_GUEST:
-    _restore_admin_session()
+    _admin_session_epoch_unavailable = _restore_admin_session()
+else:
+    _admin_session_epoch_unavailable = False
 if st.session_state.get("_admin_session_store_pending"):
     _render_admin_session_storage()
 if st.session_state.get("admin_authenticated"):
@@ -2164,11 +2214,13 @@ if IS_GUEST:
 elif not DEVICE_ID_FINAL:
     st.session_state.messages = []
     st.session_state.history_stats = {}
+    st.session_state["_history_stats_loaded"] = False
     st.session_state.loaded_chat_id = chat_id
     st.session_state.pop("_loaded_chat_uid", None)
 elif (
     st.session_state.get("loaded_chat_id") != chat_id
     or st.session_state.get("_loaded_chat_uid") != DEVICE_UID
+    or not st.session_state.get("_history_stats_loaded")
 ):
     loaded_messages, history_stats = load_chat_history(
         DEVICE_FIRESTORE_CLIENT,
@@ -2179,6 +2231,7 @@ elif (
     st.session_state.history_stats = history_stats
     st.session_state.loaded_chat_id = chat_id
     st.session_state["_loaded_chat_uid"] = DEVICE_UID
+    st.session_state["_history_stats_loaded"] = True
 _finish_perf_block("history_loading", _history_loading_started)
 if runtime_config["announcement"]:
     st.info(runtime_config["announcement"])
@@ -2190,7 +2243,10 @@ admin_session_warning = st.session_state.pop("_admin_session_clear_warning", Non
 if admin_session_warning:
     st.warning(admin_session_warning)
 
-if st.session_state.get("admin_authenticated"):
+if (
+    st.session_state.get("admin_authenticated")
+    and not _admin_session_epoch_unavailable
+):
     _record_app_perf()
     admin_dashboard = import_module("services.admin_dashboard")
     admin_dashboard.render_dashboard(
@@ -2201,6 +2257,7 @@ if st.session_state.get("admin_authenticated"):
         drive_authorized,
         KEY_SECRETS,
     )
+    _lc_persist()
     st.stop()
 
 if IS_GUEST:
@@ -2385,6 +2442,7 @@ with st.sidebar:
             except ChatStoreError as error:
                 st.error(f"Sadaya paguneman teu tiasa dipupus: {error}")
             else:
+                local_cache.clear(DEVICE_UID)
                 history_stats = dict(st.session_state.get("history_stats", {}))
                 history_stats.update(
                     {
@@ -2398,7 +2456,7 @@ with st.sidebar:
                 st.session_state["_saved_chats"] = []
                 st.session_state.delete_all_chats_confirmation = False
                 st.session_state._all_chats_deleted_notice = True
-                _start_new_chat()
+                _start_new_chat(clear_cache=False)
                 st.rerun()
         if confirm_columns[1].button(
             TEKS["clear_history_cancel"],
@@ -2483,7 +2541,9 @@ if st.session_state.get("clear_active_chat_confirmation"):
             st.session_state.history_stats = history_stats
             st.session_state.clear_active_chat_confirmation = False
             st.session_state._chat_deleted_notice = True
-            _start_new_chat()
+            if chat_id == st.session_state.get("chat_id"):
+                local_cache.clear(DEVICE_UID)
+            _start_new_chat(clear_cache=False)
             st.rerun()
     if confirm_columns[1].button(
         TEKS["clear_history_cancel"],
@@ -2575,8 +2635,10 @@ if chat_submission is not None:
         )
     ):
         st.warning("Mangga simpen nami heula sateuacan ngamimitian paguneman.")
+        _lc_persist()
         st.stop()
     if guest_limit_reached:
+        _lc_persist()
         st.stop()
     typed_question = chat_submission.text.strip()
     if not IS_GUEST and _process_admin_command(typed_question):
@@ -2586,6 +2648,7 @@ if chat_submission is not None:
             runtime_config["announcement"]
             or "Aplikasi sedang dalam mode perawatan. Silakan coba kembali nanti."
         )
+        _lc_persist()
         st.stop()
     allowed, policy_notice = (
         (True, "")
@@ -2598,6 +2661,7 @@ if chat_submission is not None:
     )
     if not allowed:
         st.warning(policy_notice)
+        _lc_persist()
         st.stop()
 
     image_uploads = chat_submission.files
@@ -2911,4 +2975,5 @@ if chat_submission is not None:
         st.session_state.history_stats = updated_stats
 
 
+_lc_persist()
 _record_app_perf()
