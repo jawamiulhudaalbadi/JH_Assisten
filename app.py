@@ -576,13 +576,9 @@ def _start_new_chat() -> None:
     st.session_state.messages = []
     st.session_state.loaded_chat_id = new_id
     st.session_state.history_stats = {
-        "total_messages": int(
-            st.session_state.get("history_stats", {}).get("total_messages", 0)
-        ),
-        "total_chunks": int(
-            st.session_state.get("history_stats", {}).get("total_chunks", 0)
-        ),
+        **st.session_state.get("history_stats", {}),
         "active_chunk_count": 0,
+        "active_chunk_number": 0,
     }
 
 
@@ -1190,12 +1186,21 @@ def _render_drive_sync_status(folder_id: str, api_keys: list[str]) -> None:
 @st.fragment(run_every="1s")
 def _render_device_uid_wait() -> None:
     get_device_uid(polling=True)
-    if (
-        st.session_state.get("_device_uid_browser_resolved")
-        or st.session_state.get("_device_uid_wait_timed_out")
-    ):
+    if st.session_state.get("_device_uid_browser_resolved"):
         st.rerun(scope="app")
-    st.caption("Memeriksa ID perangkat di browser...")
+    if st.session_state.get("_device_uid_wait_timed_out"):
+        st.caption("ID alat teu acan kapendak; riwayat can tiasa disimpen.")
+        if st.button("Coba deui", key="device_uid_retry"):
+            for key in (
+                "_device_uid_wait_started",
+                "_device_uid_wait_attempts",
+                "_device_uid_waiting",
+                "_device_uid_wait_timed_out",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
+        return
+    st.caption("Antosan, nuju mariksa ID alat supados riwayat tiasa disimpen.")
 
 
 st.session_state.setdefault("chat_api_key_override", "")
@@ -1212,26 +1217,13 @@ try:
 except StreamlitSecretNotFoundError:
     pass
 if not DEVICE_ID_FINAL and not IS_GUEST:
-    st.warning("ID alat teu acan dikenal; paguneman can tiasa dimimitian.")
     _render_guest_access(
         get_runtime_config(None),
         key_prefix="guest_unrecognized_id",
         guest_code_hash=GUEST_CODE_HASH,
     )
 DEVICE_FIRESTORE_CLIENT = None
-if not IS_GUEST and st.session_state.get("_device_uid_wait_timed_out"):
-    st.caption("Riwayat teu acan tiasa disimpen kumargi ID alat can sayogi.")
-    if st.button("Coba lagi", key="device_uid_retry"):
-        for key in (
-            "_device_uid_wait_started",
-            "_device_uid_wait_attempts",
-            "_device_uid_waiting",
-            "_device_uid_wait_timed_out",
-        ):
-            st.session_state.pop(key, None)
-        st.rerun()
-elif not IS_GUEST and st.session_state.get("_device_uid_waiting"):
-    st.caption("Riwayat teu acan tiasa disimpen; nuju mariksa ID alat.")
+if not IS_GUEST and not DEVICE_ID_FINAL:
     _render_device_uid_wait()
 if _PERF_ENABLED and not IS_GUEST:
     status_label = "final" if DEVICE_ID_FINAL else "sementara"

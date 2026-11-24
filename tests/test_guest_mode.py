@@ -98,6 +98,84 @@ class GuestModeAppTests(unittest.TestCase):
         self.assertIn("Nami", [item.label for item in app.text_input])
         self.assertTrue(app.chat_input[0].disabled)
 
+    def test_saving_chat_keeps_saved_name_and_profile_state(self):
+        uid = "0123456789abcdef"
+        chat_id = "abcdef012345"
+        app = AppTest.from_file(str(_APP_PATH))
+        app.query_params["chat"] = chat_id
+        app.session_state["device_uid"] = uid
+        app.session_state["_device_uid_browser_resolved"] = True
+        app.session_state["chat_id"] = chat_id
+        app.session_state["loaded_chat_id"] = chat_id
+        app.session_state["_loaded_chat_uid"] = uid
+        app.session_state["messages"] = [
+            {"role": "user", "content": "Patarosan"},
+            {"role": "assistant", "content": "Waleran"},
+        ]
+        app.session_state["history_stats"] = {
+            "name": "Asep",
+            "total_messages": 2,
+            "total_chunks": 1,
+            "active_chunk_count": 2,
+            "blocked": True,
+            "day_count": 4,
+        }
+
+        with (
+            self._firestore_isolation(app),
+            patch.object(firestore_store, "get_saved_chats", return_value=[]),
+            patch.object(
+                firestore_store,
+                "save_named_chat",
+                return_value=[{"chat_id": chat_id, "name": "Paguneman"}],
+            ),
+        ):
+            app.run(timeout=60)
+            self.assertEqual(len(app.exception), 0)
+            next(
+                item
+                for item in app.text_input
+                if item.label == "Ngaran riwayat"
+            ).set_value("Paguneman")
+            next(
+                button
+                for button in app.form_submit_button
+                if button.label == "Simpan Paguneman"
+            ).click().run(timeout=60)
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.session_state["history_stats"]["name"], "Asep")
+        self.assertTrue(app.session_state["history_stats"]["blocked"])
+        self.assertEqual(app.session_state["history_stats"]["day_count"], 4)
+        self.assertFalse(app.chat_input[0].disabled)
+        self.assertNotIn("Nami", [item.label for item in app.text_input])
+
+        reloaded_app = AppTest.from_file(str(_APP_PATH))
+        reloaded_app.query_params["chat"] = app.session_state["chat_id"]
+        reloaded_app.session_state["device_uid"] = uid
+        reloaded_app.session_state["_device_uid_browser_resolved"] = True
+        with (
+            self._firestore_isolation(reloaded_app),
+            patch.object(
+                firestore_store,
+                "load_chat_history",
+                return_value=(
+                    [],
+                    {
+                        "name": "Asep",
+                        "total_messages": 2,
+                        "total_chunks": 1,
+                    },
+                ),
+            ),
+            patch.object(firestore_store, "get_saved_chats", return_value=[]),
+        ):
+            reloaded_app.run(timeout=60)
+
+        self.assertEqual(len(reloaded_app.exception), 0)
+        self.assertFalse(reloaded_app.chat_input[0].disabled)
+        self.assertNotIn("Nami", [item.label for item in reloaded_app.text_input])
+
     def test_correct_guest_code_activates_chat_and_avoids_firestore_reads(self):
         app = AppTest.from_file(str(_APP_PATH))
         app.session_state["_guest_code_form_open"] = True

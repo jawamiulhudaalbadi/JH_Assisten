@@ -71,4 +71,17 @@ Dashboard Admin → **Kontrol lain**).
 Katup darurat **Buka mode tamu tanpa sandi** berada di menu yang sama. Katup
 bawaan mati dan berlaku paling lama enam jam sejak dibuka. Gunakan hanya
 sementara; dashboard dan banner pengguna menampilkan status serta sisa waktu.
+
+## Nama dan akses obrolan
+
+Nama disimpan pada profil Firestore `users/{uid}`, bukan pada masing-masing
+obrolan. Setelah nama berhasil disimpan, pengguna dengan ID perangkat yang sama
+tidak perlu memasukkannya lagi saat membuat obrolan baru atau memuat ulang
+aplikasi. Kolom chat tetap nonaktif sampai ID perangkat terverifikasi dan nama
+berhasil disimpan. Saat ID masih diperiksa, tunggu hingga proses selesai;
+aplikasi terus memeriksa ID dan akan menghapus pesan coba lagi setelah ID
+ditemukan.
+
+Mode tamu tetap tersedia untuk pengguna yang mengetahui sandinya. Mode ini
+tidak menyimpan nama maupun riwayat obrolan.
                                                                                                                   
