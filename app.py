@@ -1333,12 +1333,16 @@ def _restore_admin_session() -> None:
         KEY_SECRETS,
     )
     if valid:
-        st.session_state["admin_authenticated"] = True
+        st.session_state["admin_device_verified"] = True
         st.session_state["_admin_session_token"] = token
         st.session_state["_admin_auth_method"] = "token"
+        # Only auto-open dashboard if user hasn't manually exited
+        if not st.session_state.get("admin_exited_manually", False):
+            st.session_state["admin_authenticated"] = True
         return
     if auth_method == "token" or not st.session_state.get("admin_authenticated"):
         st.session_state["admin_authenticated"] = False
+        st.session_state["admin_device_verified"] = False
         st.session_state.pop("_admin_session_token", None)
         st.session_state.pop("_admin_auth_method", None)
 
@@ -1905,7 +1909,13 @@ with st.sidebar:
     st.divider()
     if not IS_GUEST:
         if st.button("Admin", key="admin_access_trigger", use_container_width=True):
-            register_admin_button_click(st.session_state)
+            # If device already verified, open dashboard instantly without password
+            if st.session_state.get("admin_device_verified", False):
+                st.session_state["admin_authenticated"] = True
+                st.session_state["admin_exited_manually"] = False
+                st.rerun(scope="app")
+            else:
+                register_admin_button_click(st.session_state)
         remaining_admin_clicks = 3 - int(
             st.session_state.get("_admin_button_clicks", 0)
         )
@@ -1954,7 +1964,11 @@ def _render_admin_login_prompt() -> None:
             )
             if authenticated:
                 _persist_admin_session()
-                st.rerun()
+                st.session_state["admin_device_verified"] = True
+                st.session_state["admin_exited_manually"] = False
+                st.session_state["admin_authenticated"] = True
+                st.session_state["_admin_login_prompt_open"] = False
+                st.rerun(scope="app")
 
             notice = st.session_state.pop("_admin_login_notice", None)
             if notice:

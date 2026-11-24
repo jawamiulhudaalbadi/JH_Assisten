@@ -1367,6 +1367,7 @@ def _render_dashboard_fragment(
     st.title("Dashboard Admin")
     if st.button("Keluar", key="admin_dashboard_exit"):
         st.session_state["admin_authenticated"] = False
+        st.session_state["admin_exited_manually"] = True
         st.rerun(scope="app")
 
     section = st.radio(

@@ -174,6 +174,23 @@
   langsung terautentikasi tanpa diminta sandi ulang. Hanya **Cabut semua sesi
   admin** (increment epoch di `config/admin_session`) yang benar-benar mencabut
   token di semua perangkat.
+- **Perbaiki bug "Keluar" yang auto-reopen:** dipisahkan status menjadi dua:
+  a) `admin_device_verified` — perangkat/cookie `jh_adm` sudah terverifikasi
+  valid (tetap `True` meskipun keluar dari tampilan admin, hanya dicabut oleh
+  "Cabut semua sesi admin").
+  b) `admin_authenticated` / `admin_panel_open` — dashboard admin sedang dibuka
+  di layar.
+  Saat tombol **Keluar** ditekan: set `admin_authenticated = False` dan
+  `admin_exited_manually = True`, lalu `st.rerun(scope="app")` agar langsung
+  kembali ke halaman utama. `_restore_admin_session()` pada reload hanya
+  menyetel `admin_device_verified = True` dan **tidak** memaksa buka dashboard
+  jika `admin_exited_manually = True`.
+- **Masuk admin instan tanpa minta sandi ulang:** saat user menekan tombol
+  **Admin** (atau `/admin`): cek `admin_device_verified` terlebih dahulu. Jika
+  valid, langsung set `admin_authenticated = True`, `admin_exited_manually =
+  False`, dan tampilkan dashboard **tanpa dialog sandi** dan **tanpa query
+  Firestore berulang**. Validasi epoch token `jh_adm` menggunakan cache memori
+  (TTL 5 menit) di `services/admin_session.py`.
 - **Tampilkan nama pengguna di header:** nama pengguna aktif ditampilkan di
   bagian paling atas menu utama (di bawah judul aplikasi) setelah ID final dan
   nama disimpan.
@@ -204,25 +221,17 @@
 
 ### Cara tes manual Fase 4D
 
-1. **Sesi admin permanen:** login admin via `/admin <kode>` atau tombol Admin
-   3x, reload halaman → dashboard terbuka otomatis. Klik **Keluar** → dashboard
-   tertutup. Masuk mode admin lagi (klik Admin 3x atau `/admin`) → **langsung
-   masuk tanpa sandi**. Tutup browser, buka lagi → **langsung masuk**. Gunakan
-   **Cabut semua sesi admin** dari perangkat lain → token tidak valid, minta
-   sandi ulang.
-2. **Tampil nama di header:** simpan nama pengguna, periksa header paling atas
-   menampilkan "Pengguna: {nama}".
-3. **Statistik guest:** masuk mode guest (via sandi atau emergency valve),
-   ajukan beberapa pertanyaan, buka Dashboard Admin → Statistik. Verifikasi
-   tabel harian menampilkan kolom "Pertanyaan tamu" > 0, "Total perangkat
-   (terdaftar)" tidak berubah, dan "Pertanyaan pengguna" terpisah dari
-   "Pertanyaan tamu".
-4. **Hapus semua tanpa nama:** buka Dashboard Admin → tab **Pengguna**, klik
-   tombol **"Hapus semua tanpa nama"** di sebelah "Segarkan". Konfirmasi dialog
-   akan muncul menampilkan jumlah kandidat. Klik **"Konfirmasi hapus semua
-   pengguna tanpa nama"** untuk menghapus. Verifikasi: pengguna bernama tidak
-   terhapus, `total_devices` di Statistik terhitung ulang, dan pengguna tanpa
-   nama (termasuk yang punya riwayat chat) terhapus.
+1. **Sesi admin permanen & perbaikan tombol Keluar:**
+   - Login admin via `/admin <kode>` atau tombol Admin 3x, reload halaman → dashboard terbuka otomatis.
+   - Klik **Keluar** → dashboard tertutup **seketika** (tidak auto-reopen).
+   - Masuk mode admin lagi (klik Admin 1x atau `/admin`) → **langsung masuk tanpa sandi** (instan, tidak lelet).
+   - Tutup browser, buka lagi → **langsung masuk** (otomatis buka dashboard karena `admin_device_verified = True` dan `admin_exited_manually = False`).
+   - Klik **Keluar**, lalu reload halaman → dashboard **tidak** terbuka otomatis (karena `admin_exited_manually = True`).
+   - Klik tombol **Admin** 1x → **langsung masuk tanpa sandi**.
+   - Gunakan **Cabut semua sesi admin** dari perangkat lain → token tidak valid, minta sandi ulang.
+2. **Tampil nama di header:** simpan nama pengguna, periksa header paling atas menampilkan "Pengguna: {nama}".
+3. **Statistik guest:** masuk mode guest (via sandi atau emergency valve), ajukan beberapa pertanyaan, buka Dashboard Admin → Statistik. Verifikasi tabel harian menampilkan kolom "Pertanyaan tamu" > 0, "Total perangkat (terdaftar)" tidak berubah, dan "Pertanyaan pengguna" terpisah dari "Pertanyaan tamu".
+4. **Hapus semua tanpa nama:** buka Dashboard Admin → tab **Pengguna**, klik tombol **"Hapus semua tanpa nama"** di sebelah "Segarkan". Konfirmasi dialog akan muncul menampilkan jumlah kandidat. Klik **"Konfirmasi hapus semua pengguna tanpa nama"** untuk menghapus. Verifikasi: pengguna bernama tidak terhapus, `total_devices` di Statistik terhitung ulang, dan pengguna tanpa nama (termasuk yang punya riwayat chat) terhapus.
 
 ### Cara tes manual Fase 4A
 
