@@ -1401,24 +1401,6 @@ if not IS_GUEST:
     _admin_session_epoch_unavailable = _restore_admin_session()
 else:
     _admin_session_epoch_unavailable = False
-if st.query_params.get("dbg") == "1":
-    import base64, time as _t
-    _tok = st.context.cookies.get("jh_adm") or ""
-    _info = "tidak_ada"
-    if _tok:
-        try:
-            _raw = base64.urlsafe_b64decode(_tok + "=" * (-len(_tok) % 4)).decode()
-            _u, _exp, _sig = _raw.split("|", 2)
-            _info = f"uid_cocok={_u == DEVICE_UID} sisa_detik={int(float(_exp) - _t.time())}"
-        except Exception as _e:
-            _info = f"format_salah:{type(_e).__name__}"
-    st.info(
-        f"DBG cookie_adm={bool(_tok)} token[{_info}] "
-        f"adm_ls={bool(local_cache.hydrated_admin_token())} "
-        f"dev_ver={st.session_state.get('admin_device_verified')} "
-        f"metode={st.session_state.get('_admin_auth_method')} "
-        f"epoch_blok={_admin_session_epoch_unavailable}"
-    )
 if st.session_state.get("_admin_session_store_pending"):
     _render_admin_session_storage()
 if st.session_state.get("admin_authenticated"):
