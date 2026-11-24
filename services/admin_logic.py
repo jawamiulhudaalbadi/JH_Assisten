@@ -20,6 +20,10 @@ _PROCESS_ADMIN_FAILED_ATTEMPTS_BY_UID: dict[str, int] = {}
 _PROCESS_ADMIN_LOCKED_UNTIL_BY_UID: dict[str, float] = {}
 _PROCESS_ADMIN_FAILED_ATTEMPTS = 0
 _PROCESS_ADMIN_LOCKED_UNTIL = 0.0
+_PROCESS_GUEST_FAILED_ATTEMPTS_BY_UID: dict[str, int] = {}
+_PROCESS_GUEST_LOCKED_UNTIL_BY_UID: dict[str, float] = {}
+_PROCESS_GUEST_FAILED_ATTEMPTS = 0
+_PROCESS_GUEST_LOCKED_UNTIL = 0.0
 
 
 def verify_admin_code(code: str, encoded_hash: str) -> bool:
@@ -151,6 +155,83 @@ def process_admin_login(
         return False
 
 
+def process_guest_login(
+    code: str,
+    encoded_hash: str,
+    session_state: MutableMapping[str, object],
+    now: float,
+    uid: str,
+) -> bool:
+    """Validate guest access with lockout counters isolated from admin login."""
+    global _PROCESS_GUEST_FAILED_ATTEMPTS, _PROCESS_GUEST_LOCKED_UNTIL
+
+    with _PROCESS_ADMIN_LOCK:
+        session_locked_until = float(session_state.get("guest_locked_until", 0))
+        uid_locked_until = _PROCESS_GUEST_LOCKED_UNTIL_BY_UID.get(uid, 0.0)
+        if now >= uid_locked_until and uid_locked_until:
+            _PROCESS_GUEST_LOCKED_UNTIL_BY_UID.pop(uid, None)
+            _PROCESS_GUEST_FAILED_ATTEMPTS_BY_UID.pop(uid, None)
+            uid_locked_until = 0.0
+        if now >= _PROCESS_GUEST_LOCKED_UNTIL and _PROCESS_GUEST_LOCKED_UNTIL:
+            _PROCESS_GUEST_LOCKED_UNTIL = 0.0
+            _PROCESS_GUEST_FAILED_ATTEMPTS = 0
+        if now >= session_locked_until and session_locked_until:
+            session_state["guest_failed_attempts"] = 0
+            session_state.pop("guest_locked_until", None)
+            session_locked_until = 0.0
+
+        locked_until = max(
+            session_locked_until,
+            uid_locked_until,
+            _PROCESS_GUEST_LOCKED_UNTIL,
+        )
+        if now < locked_until:
+            remaining = ceil(locked_until - now)
+            session_state["_guest_login_notice"] = (
+                f"Mode tamu terkunci. Coba deui dina {remaining} detik."
+            )
+            return False
+        if not code or not encoded_hash:
+            session_state["_guest_login_notice"] = (
+                "Sandi mode tamu teu leres."
+            )
+            return False
+        if verify_admin_code(code, encoded_hash):
+            _PROCESS_GUEST_FAILED_ATTEMPTS_BY_UID.pop(uid, None)
+            _PROCESS_GUEST_LOCKED_UNTIL_BY_UID.pop(uid, None)
+            _PROCESS_GUEST_FAILED_ATTEMPTS = 0
+            _PROCESS_GUEST_LOCKED_UNTIL = 0.0
+            session_state["guest_failed_attempts"] = 0
+            session_state.pop("guest_locked_until", None)
+            session_state.pop("_guest_login_notice", None)
+            return True
+
+        uid_attempts = _PROCESS_GUEST_FAILED_ATTEMPTS_BY_UID.get(uid, 0) + 1
+        global_attempts = _PROCESS_GUEST_FAILED_ATTEMPTS + 1
+        _PROCESS_GUEST_FAILED_ATTEMPTS_BY_UID[uid] = uid_attempts
+        _PROCESS_GUEST_FAILED_ATTEMPTS = global_attempts
+        attempts = max(
+            int(session_state.get("guest_failed_attempts", 0)) + 1,
+            uid_attempts,
+            global_attempts,
+        )
+        if attempts >= 5:
+            lockout_until = now + 15 * 60
+            session_state["guest_failed_attempts"] = 5
+            session_state["guest_locked_until"] = lockout_until
+            _PROCESS_GUEST_LOCKED_UNTIL_BY_UID[uid] = lockout_until
+            _PROCESS_GUEST_LOCKED_UNTIL = lockout_until
+            session_state["_guest_login_notice"] = (
+                "Lima percobaan gagal. Mode tamu terkunci salila 15 menit."
+            )
+        else:
+            session_state["guest_failed_attempts"] = attempts
+            session_state["_guest_login_notice"] = (
+                f"Sandi mode tamu teu leres ({attempts}/5)."
+            )
+        return False
+
+
 def register_admin_button_click(
     session_state: MutableMapping[str, object],
 ) -> bool:
@@ -173,7 +254,12 @@ def question_is_allowed(
     """Check cached per-session block and WIB daily-limit fields."""
     if bool(user_data.get("blocked", False)):
         return False, "Perangkat ini diblokir oleh administrator."
-    if daily_question_limit <= 0:
+    try:
+        user_limit = int(user_data.get("daily_question_limit", 0))
+    except (TypeError, ValueError):
+        user_limit = 0
+    effective_limit = user_limit if user_limit > 0 else daily_question_limit
+    if effective_limit <= 0:
         return True, ""
 
     current_time = now or datetime.now(_WIB)
@@ -187,9 +273,9 @@ def question_is_allowed(
         )
     except (TypeError, ValueError):
         questions_today = 0
-    if questions_today >= daily_question_limit:
+    if questions_today >= effective_limit:
         return (
             False,
-            f"Batas pertanyaan hari ini ({daily_question_limit}) telah tercapai.",
+            f"Batas pertanyaan hari ini ({effective_limit}) telah tercapai.",
         )
     return True, ""

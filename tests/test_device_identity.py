@@ -140,9 +140,8 @@ class DeviceIdentityTests(unittest.TestCase):
                 self.assertFalse(state["_device_uid_browser_resolved"])
                 self.assertTrue(state["_device_uid_waiting"])
 
-    def test_prefers_request_cookie_and_supports_uid_query_parameter(self) -> None:
+    def test_cookie_is_final_and_skips_javascript_on_every_rerun(self) -> None:
         cookie_uid = "abcdef0123456789"
-        query_uid = "fedcba9876543210"
         state = _SessionState()
         query_params = {}
         with (
@@ -156,11 +155,31 @@ class DeviceIdentityTests(unittest.TestCase):
             patch.object(device_identity, "st_javascript") as javascript,
         ):
             self.assertEqual(device_identity.get_device_uid(), cookie_uid)
-            query_params["uid"] = query_uid
-            self.assertEqual(device_identity.get_device_uid(), query_uid)
+            self.assertEqual(device_identity.get_device_uid(), cookie_uid)
 
         javascript.assert_not_called()
         self.assertNotIn("uid", query_params)
+        self.assertEqual(state["_device_uid_source"], "cookie")
+
+    def test_query_uid_is_supported_before_identity_becomes_final(self) -> None:
+        query_uid = "fedcba9876543210"
+        state = _SessionState()
+        query_params = {"uid": query_uid}
+        with (
+            patch.object(device_identity.st, "session_state", state),
+            patch.object(device_identity.st, "query_params", query_params),
+            patch.object(
+                device_identity.st,
+                "context",
+                SimpleNamespace(cookies={}),
+            ),
+            patch.object(device_identity, "st_javascript") as javascript,
+        ):
+            self.assertEqual(device_identity.get_device_uid(), query_uid)
+
+        javascript.assert_not_called()
+        self.assertEqual(state["_device_uid_source"], "url")
+        self.assertTrue(state["_device_uid_browser_resolved"])
 
     def test_uses_browser_uid_and_marks_it_resolved(self) -> None:
         uid = "0123456789abcdef"
@@ -184,6 +203,31 @@ class DeviceIdentityTests(unittest.TestCase):
             self.assertEqual(device_identity.get_device_uid(), uid)
 
         self.assertEqual(state["device_uid"], uid)
+        self.assertTrue(state["_device_uid_browser_resolved"])
+
+    def test_created_uid_is_reported_as_new_and_final(self) -> None:
+        uid = "0123456789abcdef"
+        state = _SessionState()
+        with (
+            patch.object(device_identity.st, "session_state", state),
+            patch.object(device_identity.st, "query_params", {}),
+            patch.object(
+                device_identity.st,
+                "context",
+                SimpleNamespace(cookies={}),
+            ),
+            patch.object(
+                device_identity,
+                "st_javascript",
+                side_effect=[
+                    {"status": "empty"},
+                    {"status": "found", "uid": uid},
+                ],
+            ),
+        ):
+            self.assertEqual(device_identity.get_device_uid(), uid)
+
+        self.assertEqual(state["_device_uid_source"], "baru")
         self.assertTrue(state["_device_uid_browser_resolved"])
 
     def test_resolves_browser_uid_on_a_later_rerun_after_error(self) -> None:

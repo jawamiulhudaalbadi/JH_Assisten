@@ -51,4 +51,24 @@ berkas lama di `chat_history/`.
                                                                                                                   `users/{uid}/chats/{chat_id}/chunks/`. Pengguna dapat menghapus semua riwayat
                                                                                                                   perangkatnya dari sidebar. Penghapusan tersebut tidak menghapus berkas lama
                                                                                                                   `chat_history/`.
+
+## Mode tamu berkode
+
+Mode tamu tidak terbuka otomatis. Tambahkan `GUEODE_HASH` ke Streamlit
+Secrets dST_Cengan hash PBKDF2 atau scrypt; biarkan kosong untuk menyembunyikan
+tombol mode tamu. Buat hash PBKDF2 secara lokal, lalu salin hasilnya ke secret:
+
+```sh
+python -c 'import getpass, hashlib, secrets; p=getpass.getpass("Sandi mode tamu: ").encode(); s=secrets.token_hex(16); d=hashlib.pbkdf2_hmac("sha256", p, s.encode(), 200000).hex(); print(f"pbkdf2_sha256$200000${s}${d}")'
+```
+
+Tambahkan `ADMIN_SESSION_SECRET` sesuai kebutuhan sesi admin; gunakan nilai
+rahasia acak yang terpisah dari kode admin. Saat masuk, pengguna tanpa ID final
+atau nama dapat memilih **Mode tamu** lalu memasukkan sandi tersebut. Riwayat
+tidak disimpan; pertanyaan dibatasi 10 per hari dalam sesi (dapat diubah dari
+Dashboard Admin → **Kontrol lain**).
+
+Katup darurat **Buka mode tamu tanpa sandi** berada di menu yang sama. Katup
+bawaan mati dan berlaku paling lama enam jam sejak dibuka. Gunakan hanya
+sementara; dashboard dan banner pengguna menampilkan status serta sisa waktu.
                                                                                                                   

@@ -39,6 +39,10 @@ _CACHE_LOCK = threading.RLock()
 _KEY_CACHE: dict[str, tuple[float, tuple["ManagedKey", ...]]] = {}
 _MODEL_ORDER_CACHE: tuple[float, dict[str, Any]] | None = None
 _SEED_DISABLED: dict[str, bool] = {group: False for group in KEY_GROUPS}
+_KEY_REFRESHING: set[str] = set()
+_KEY_REFRESH_GENERATION = {group: 0 for group in KEY_GROUPS}
+_MODEL_ORDER_REFRESHING = False
+_MODEL_ORDER_REFRESH_GENERATION = 0
 
 
 class KeyPoolError(ValueError):
@@ -75,6 +79,58 @@ def get_seed_key(group: str, secrets: Mapping[str, Any]) -> str:
     ).strip()
 
 
+def _read_key_group(
+    group: str,
+    client: Any,
+    secrets: Mapping[str, Any],
+    timeout: float,
+) -> tuple[tuple[ManagedKey, ...], bool]:
+    snapshot = (
+        client.collection("config")
+        .document(KEY_DOCUMENTS[group])
+        .get(timeout=timeout, retry=None)
+    )
+    data = snapshot.to_dict() or {}
+    stored_records = data.get("keys", [])
+    records = _decode_records(stored_records, secrets)
+    seed_disabled = bool(data.get("seed_disabled", False)) or bool(stored_records)
+    return records, seed_disabled
+
+
+def _refresh_key_group(
+    group: str,
+    client: Any,
+    secrets: Mapping[str, Any],
+    generation: int,
+) -> None:
+    try:
+        records, seed_disabled = _read_key_group(
+            group,
+            client,
+            secrets,
+            FIRESTORE_KEY_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        _trip_circuit(error, f"pembacaan kelompok key {group}")
+        logger.warning(
+            "API key group read failed group=%s error_class=%s",
+            group,
+            type(error).__name__,
+        )
+    else:
+        seed = _seed_record(group, get_seed_key(group, secrets))
+        if not records and not seed_disabled and seed is not None:
+            records = (seed,)
+        with _CACHE_LOCK:
+            if _KEY_REFRESH_GENERATION[group] == generation:
+                _KEY_CACHE[group] = (time.monotonic(), records)
+                _SEED_DISABLED[group] = seed_disabled
+    finally:
+        with _CACHE_LOCK:
+            if _KEY_REFRESH_GENERATION[group] == generation:
+                _KEY_REFRESHING.discard(group)
+
+
 def get_keys(
     group: str,
     client: Any | None,
@@ -93,6 +149,31 @@ def get_keys(
     cached_records = cached[1] if cached else ()
 
     seed = _seed_record(group, get_seed_key(group, secrets))
+    if (
+        client is not None
+        and not admin
+        and not refresh
+        and firestore_status()["connected"]
+    ):
+        should_refresh = False
+        with _CACHE_LOCK:
+            seed_disabled = _SEED_DISABLED[group]
+            if group not in _KEY_REFRESHING:
+                _KEY_REFRESHING.add(group)
+                _KEY_CACHE[group] = (now, cached_records)
+                should_refresh = True
+            generation = _KEY_REFRESH_GENERATION[group]
+        if should_refresh:
+            threading.Thread(
+                target=_refresh_key_group,
+                args=(group, client, dict(secrets), generation),
+                name=f"firestore-key-refresh-{group}",
+                daemon=True,
+            ).start()
+        if not cached_records and not seed_disabled:
+            return (seed,) if seed is not None else ()
+        return cached_records
+
     records: tuple[ManagedKey, ...] = ()
     seed_disabled = False
     loaded = False
@@ -100,21 +181,15 @@ def get_keys(
         admin or firestore_status()["connected"]
     ):
         try:
-            timeout = (
-                FIRESTORE_ADMIN_TIMEOUT_SECONDS
-                if admin
-                else FIRESTORE_KEY_TIMEOUT_SECONDS
-            )
-            snapshot = (
-                client.collection("config")
-                .document(KEY_DOCUMENTS[group])
-                .get(timeout=timeout, retry=None)
-            )
-            data = snapshot.to_dict() or {}
-            stored_records = data.get("keys", [])
-            records = _decode_records(stored_records, secrets)
-            seed_disabled = bool(data.get("seed_disabled", False)) or bool(
-                stored_records
+            records, seed_disabled = _read_key_group(
+                group,
+                client,
+                secrets,
+                (
+                    FIRESTORE_ADMIN_TIMEOUT_SECONDS
+                    if admin
+                    else FIRESTORE_KEY_TIMEOUT_SECONDS
+                ),
             )
             loaded = True
         except Exception as error:
@@ -307,19 +382,8 @@ def get_key_status(
     return "aktif"
 
 
-def get_model_order(
-    client: Any | None,
-    secrets: Mapping[str, Any],
-    *,
-    admin: bool = False,
-) -> dict[str, Any]:
-    global _MODEL_ORDER_CACHE
-    now = time.monotonic()
-    with _CACHE_LOCK:
-        if _MODEL_ORDER_CACHE and now - _MODEL_ORDER_CACHE[0] < KEY_CACHE_SECONDS:
-            return dict(_MODEL_ORDER_CACHE[1])
-
-    result: dict[str, Any] = {
+def _default_model_order(secrets: Mapping[str, Any]) -> dict[str, Any]:
+    return {
         "mode": "automatic",
         "models": [],
         "secrets_models": _parse_model_list(
@@ -327,40 +391,115 @@ def get_model_order(
             or os.getenv("GEMINI_CHAT_MODELS", "")
         ),
     }
-    if client is not None and (admin or firestore_status()["connected"]):
+
+
+def _read_model_order(
+    client: Any,
+    secrets: Mapping[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
+    result = _default_model_order(secrets)
+    snapshot = (
+        client.collection("config")
+        .document("model_order")
+        .get(timeout=timeout, retry=None)
+    )
+    data = snapshot.to_dict() or {}
+    mode = data.get("mode")
+    models = data.get("models")
+    if mode in {"automatic", "manual"} and isinstance(models, list):
+        result.update(
+            mode=mode,
+            models=[str(model) for model in models if str(model).strip()],
+        )
+    return result
+
+
+def _refresh_model_order(
+    client: Any,
+    secrets: Mapping[str, Any],
+    generation: int,
+) -> None:
+    global _MODEL_ORDER_CACHE, _MODEL_ORDER_REFRESHING
+    try:
+        result = _read_model_order(
+            client,
+            secrets,
+            FIRESTORE_KEY_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        _trip_circuit(error, "pembacaan urutan model")
+        logger.warning(
+            "Model order read failed error_class=%s",
+            type(error).__name__,
+        )
+    else:
+        with _CACHE_LOCK:
+            if _MODEL_ORDER_REFRESH_GENERATION == generation:
+                _MODEL_ORDER_CACHE = (time.monotonic(), result)
+    finally:
+        with _CACHE_LOCK:
+            if _MODEL_ORDER_REFRESH_GENERATION == generation:
+                _MODEL_ORDER_REFRESHING = False
+
+
+def get_model_order(
+    client: Any | None,
+    secrets: Mapping[str, Any],
+    *,
+    admin: bool = False,
+) -> dict[str, Any]:
+    global _MODEL_ORDER_CACHE, _MODEL_ORDER_REFRESHING
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        cached = _MODEL_ORDER_CACHE
+        if cached and now - cached[0] < KEY_CACHE_SECONDS:
+            return dict(cached[1])
+
+    if (
+        client is not None
+        and not admin
+        and firestore_status()["connected"]
+    ):
+        should_refresh = False
+        with _CACHE_LOCK:
+            if not _MODEL_ORDER_REFRESHING:
+                _MODEL_ORDER_REFRESHING = True
+                _MODEL_ORDER_CACHE = (
+                    now,
+                    dict(cached[1]) if cached else _default_model_order(secrets),
+                )
+                should_refresh = True
+            generation = _MODEL_ORDER_REFRESH_GENERATION
+            result = dict(_MODEL_ORDER_CACHE[1])
+        if should_refresh:
+            threading.Thread(
+                target=_refresh_model_order,
+                args=(client, dict(secrets), generation),
+                name="firestore-model-order-refresh",
+                daemon=True,
+            ).start()
+        return result
+
+    if cached:
+        with _CACHE_LOCK:
+            _MODEL_ORDER_CACHE = (now, cached[1])
+        return dict(cached[1])
+
+    result = _default_model_order(secrets)
+    if client is not None and admin and firestore_status()["connected"]:
         try:
-            snapshot = (
-                client.collection("config")
-                .document("model_order")
-                .get(
-                    timeout=(
-                        FIRESTORE_ADMIN_TIMEOUT_SECONDS
-                        if admin
-                        else FIRESTORE_KEY_TIMEOUT_SECONDS
-                    ),
-                    retry=None,
-                )
+            result = _read_model_order(
+                client,
+                secrets,
+                FIRESTORE_ADMIN_TIMEOUT_SECONDS,
             )
-            data = snapshot.to_dict() or {}
-            mode = data.get("mode")
-            models = data.get("models")
-            if mode in {"automatic", "manual"} and isinstance(models, list):
-                result.update(
-                    mode=mode,
-                    models=[str(model) for model in models if str(model).strip()],
-                )
         except Exception as error:
-            if admin:
-                raise KeyPoolError(
-                    "Pembacaan urutan model gagal "
-                    f"({type(error).__name__}): "
-                    f"{_safe_admin_error(error, 'model_order', secrets)}"
-                ) from error
-            _trip_circuit(error, "pembacaan urutan model")
-            logger.warning(
-                "Model order read failed error_class=%s",
-                type(error).__name__,
-            )
+            raise KeyPoolError(
+                "Pembacaan urutan model gagal "
+                f"({type(error).__name__}): "
+                f"{_safe_admin_error(error, 'model_order', secrets)}"
+            ) from error
     with _CACHE_LOCK:
         _MODEL_ORDER_CACHE = (time.monotonic(), dict(result))
     return result
@@ -371,7 +510,8 @@ def save_model_order(
     mode: str,
     models: Sequence[str],
 ) -> None:
-    global _MODEL_ORDER_CACHE
+    global _MODEL_ORDER_CACHE, _MODEL_ORDER_REFRESHING
+    global _MODEL_ORDER_REFRESH_GENERATION
     if client is None:
         raise KeyPoolError("Firestore teu sayogi pikeun nyimpen urutan model.")
     if mode not in {"automatic", "manual"}:
@@ -389,6 +529,8 @@ def save_model_order(
             f"{_safe_admin_error(error, 'model_order', {})}"
         ) from error
     with _CACHE_LOCK:
+        _MODEL_ORDER_REFRESH_GENERATION += 1
+        _MODEL_ORDER_REFRESHING = False
         _MODEL_ORDER_CACHE = (time.monotonic(), data)
 
 
@@ -429,14 +571,22 @@ def clear_session_chat_override(session_state: Any) -> None:
 
 
 def invalidate_cache(group: str | None = None) -> None:
-    global _MODEL_ORDER_CACHE
+    global _MODEL_ORDER_CACHE, _MODEL_ORDER_REFRESHING
+    global _MODEL_ORDER_REFRESH_GENERATION
     with _CACHE_LOCK:
         if group is None:
             _KEY_CACHE.clear()
             _MODEL_ORDER_CACHE = None
+            _KEY_REFRESHING.clear()
+            _MODEL_ORDER_REFRESHING = False
+            for key_group in KEY_GROUPS:
+                _KEY_REFRESH_GENERATION[key_group] += 1
+            _MODEL_ORDER_REFRESH_GENERATION += 1
         else:
             _validate_group(group)
             _KEY_CACHE.pop(group, None)
+            _KEY_REFRESHING.discard(group)
+            _KEY_REFRESH_GENERATION[group] += 1
 
 
 def _save_group(
@@ -493,6 +643,8 @@ def _save_group(
             f"{_safe_admin_error(error, group, secrets, *sensitive_keys)}"
         ) from error
     with _CACHE_LOCK:
+        _KEY_REFRESH_GENERATION[group] += 1
+        _KEY_REFRESHING.discard(group)
         _KEY_CACHE[group] = (time.monotonic(), tuple(records))
         _SEED_DISABLED[group] = disabled
 

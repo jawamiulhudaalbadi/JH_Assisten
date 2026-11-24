@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from contextlib import contextmanager
 import html
 import json
 import os
@@ -20,6 +21,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from streamlit_javascript import st_javascript
 from streamlit.errors import StreamlitSecretNotFoundError
 from PIL import Image
 from google.api_core.exceptions import GoogleAPIError
@@ -47,10 +49,17 @@ from services.gdrive_service import (
 )
 from services.device_identity import get_device_uid
 from services.admin_logic import (
+    process_guest_login,
     process_admin_login,
     question_is_allowed,
     register_admin_button_click,
     verify_admin_code,
+)
+from services.admin_session import (
+    build_admin_session_store_script,
+    create_admin_session_token,
+    get_admin_session_epoch,
+    verify_admin_session_token,
 )
 from services.firestore_store import (
     HISTORY_WARNING_CHUNKS,
@@ -62,6 +71,7 @@ from services.firestore_store import (
     credentials_json_from_secrets,
     delete_all_user_chats,
     delete_user_chat,
+    enqueue_guest_question,
     enqueue_question_answer,
     get_saved_chats,
     get_active_chat_id,
@@ -70,6 +80,8 @@ from services.firestore_store import (
     get_runtime_config,
     load_chat_history,
     save_named_chat,
+    save_user_name,
+    submit_answer_feedback,
 )
 from services.key_pool import (
     KeyPoolError,
@@ -83,7 +95,9 @@ from services.key_pool import (
     redact_secrets,
     set_session_chat_override,
 )
+from services.perf_monitor import record_run as record_perf_run
 from services.sync_manager import DriveSyncManager
+from services.user_profile import USER_NAME_ERROR, needs_user_name, validate_user_name
 
 
 APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "app_icon.png"
@@ -92,6 +106,163 @@ st.set_page_config(
     page_icon=APP_ICON_PATH,
     layout="centered",
 )
+
+_PERF_ENABLED = (
+    st.query_params.get("debug") == "1"
+    or bool(st.session_state.get("admin_authenticated"))
+)
+_PERF_RUN_STARTED = time.perf_counter()
+_PERF_BLOCKS: dict[str, float] = {}
+
+
+@contextmanager
+def _measure_perf(block_name: str):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        if _PERF_ENABLED:
+            _PERF_BLOCKS[block_name] = _PERF_BLOCKS.get(block_name, 0.0) + (
+                time.perf_counter() - started
+            )
+
+
+def _start_perf_block() -> float | None:
+    return time.perf_counter() if _PERF_ENABLED else None
+
+
+def _finish_perf_block(block_name: str, started: float | None) -> None:
+    if started is not None:
+        _PERF_BLOCKS[block_name] = _PERF_BLOCKS.get(block_name, 0.0) + (
+            time.perf_counter() - started
+        )
+
+
+def _guest_emergency_seconds(runtime: dict[str, object]) -> int:
+    if not runtime.get("guest_emergency_enabled"):
+        return 0
+    try:
+        expiry = datetime.fromisoformat(
+            str(runtime.get("guest_emergency_expires_at", ""))
+        )
+    except ValueError:
+        return 0
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return max(0, ceil((expiry - datetime.now(timezone.utc)).total_seconds()))
+
+
+def _enable_guest_session(emergency: bool = False) -> None:
+    if st.session_state.get("admin_authenticated"):
+        return
+    st.session_state["guest_mode"] = True
+    st.session_state["guest_mode_via_emergency"] = emergency
+    st.session_state["guest_questions_day"] = ""
+    st.session_state["guest_questions_count"] = 0
+    st.session_state["guest_chat_id"] = uuid.uuid4().hex[:12]
+    st.session_state["chat_id"] = st.session_state["guest_chat_id"]
+    st.session_state["messages"] = []
+    st.session_state["history_stats"] = {}
+    st.session_state["loaded_chat_id"] = st.session_state["guest_chat_id"]
+    st.session_state["_guest_loaded"] = True
+    st.session_state.pop("_admin_login_prompt_open", None)
+    st.session_state.pop("_admin_session_store_pending", None)
+    st.session_state.pop("delete_all_chats_confirmation", None)
+    st.session_state.pop("clear_active_chat_confirmation", None)
+    for key in (
+        "_loaded_chat_uid",
+        "_saved_chats_uid",
+        "_saved_chats",
+        "_saved_chats_error",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _submit_guest_code(input_key: str, encoded_hash: str, uid: str) -> None:
+    code = str(st.session_state.pop(input_key, "") or "")
+    if process_guest_login(
+        code,
+        encoded_hash,
+        st.session_state,
+        time.monotonic(),
+        uid,
+    ):
+        _enable_guest_session()
+    else:
+        st.session_state["_guest_code_form_open"] = True
+
+
+def _render_guest_access(
+    runtime: dict[str, object],
+    *,
+    key_prefix: str,
+    guest_code_hash: str,
+) -> None:
+    if st.session_state.get("admin_authenticated"):
+        return
+    emergency_seconds = _guest_emergency_seconds(runtime)
+    if emergency_seconds:
+        if st.button(
+            "Mode tamu",
+            key=f"{key_prefix}_emergency_guest",
+            type="tertiary",
+            help="Katup darurat dibuka ku admin.",
+            on_click=_enable_guest_session,
+            args=(True,),
+        ):
+            return
+    elif guest_code_hash:
+        if not st.session_state.get("_guest_code_form_open"):
+            st.button(
+                "Mode tamu",
+                key=f"{key_prefix}_open_guest",
+                type="tertiary",
+                on_click=lambda: st.session_state.__setitem__(
+                    "_guest_code_form_open", True
+                ),
+            )
+        else:
+            input_key = f"{key_prefix}_guest_code"
+            with st.form(f"{key_prefix}_guest_code_form", clear_on_submit=True):
+                st.text_input(
+                    "Sandi mode tamu",
+                    type="password",
+                    key=input_key,
+                )
+                st.form_submit_button(
+                    "Buka mode tamu",
+                    on_click=_submit_guest_code,
+                    args=(input_key, guest_code_hash, str(st.session_state.device_uid)),
+                )
+    notice = st.session_state.pop("_guest_login_notice", None)
+    if notice:
+        st.error(notice)
+    if emergency_seconds:
+        total_minutes = ceil(emergency_seconds / 60)
+        hours, minutes = divmod(total_minutes, 60)
+        st.caption(
+            f"Katup darurat aktif; sésana {hours} jam {minutes} menit."
+        )
+
+
+def _record_app_perf() -> None:
+    if not _PERF_ENABLED:
+        return
+    total_seconds = time.perf_counter() - _PERF_RUN_STARTED
+    measured_seconds = sum(_PERF_BLOCKS.values())
+    durations = {
+        name: _PERF_BLOCKS.get(name, 0.0)
+        for name in (
+            "identity",
+            "configuration",
+            "key_pool",
+            "index_loading",
+            "history_loading",
+        )
+    }
+    durations["render"] = max(0.0, total_seconds - measured_seconds)
+    record_perf_run(durations, total_seconds)
+
 
 PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.json"
 CUSTOM_LOGO_PATH = PRIVATE_CONFIG_PATH.parent / ".app_custom_logo.png"
@@ -619,6 +790,95 @@ def _render_source_links(sources: list[dict[str, str]], key: str) -> None:
                 )
 
 
+def _render_answer_feedback(
+    *,
+    answer_id: str | None,
+    question: str,
+    answer: str,
+    chat_id: str,
+    quality_metrics: dict[str, object],
+    sources: list[dict[str, object]],
+) -> None:
+    if not isinstance(answer_id, str) or not re.fullmatch(r"[a-f0-9]{32}", answer_id):
+        return
+    state_key = f"_feedback_submitted_{answer_id}"
+    if st.session_state.get(state_key):
+        st.caption("Hatur nuhun kana peunteunna.")
+        return
+
+    pending_key = f"_feedback_pending_{answer_id}"
+    pending_feedback = bool(st.session_state.get(pending_key))
+    positive_column, negative_column = st.columns([1, 1])
+    if positive_column.button(
+        "Cocog",
+        key=f"feedback_positive_{answer_id}",
+        disabled=pending_feedback,
+    ):
+        try:
+            saved = submit_answer_feedback(
+                DEVICE_FIRESTORE_CLIENT,
+                uid=DEVICE_UID,
+                name=str(st.session_state.get("history_stats", {}).get("name", "")),
+                chat_id=chat_id,
+                answer_id=answer_id,
+                question=question,
+                answer=answer,
+                rating="Cocog",
+                reason=None,
+                quality_metrics=quality_metrics,
+                sources=sources,
+            )
+        except (RuntimeError, ValueError) as error:
+            st.warning(f"Eupan balik teu tiasa disimpen: {error}")
+        else:
+            st.session_state[state_key] = True
+            st.caption(
+                "Peunteun parantos kacatet."
+                if saved
+                else "Jawaban ieu parantos kantos dipeunteun."
+            )
+    if negative_column.button(
+        "Teu cocog",
+        key=f"feedback_negative_{answer_id}",
+        disabled=pending_feedback,
+    ):
+        st.session_state[pending_key] = True
+
+    if st.session_state.get(pending_key):
+        with st.form(f"feedback_reason_form_{answer_id}"):
+            reason_label = st.selectbox(
+                "Alesan (opsional)",
+                ("Tanpa alesan", "Kaluar tina kontéks", "Salah", "Teu lengkep"),
+                key=f"feedback_reason_{answer_id}",
+            )
+            submit = st.form_submit_button("Kirim peunteun")
+        if submit:
+            try:
+                saved = submit_answer_feedback(
+                    DEVICE_FIRESTORE_CLIENT,
+                    uid=DEVICE_UID,
+                    name=str(st.session_state.get("history_stats", {}).get("name", "")),
+                    chat_id=chat_id,
+                    answer_id=answer_id,
+                    question=question,
+                    answer=answer,
+                    rating="Teu cocog",
+                    reason=None if reason_label == "Tanpa alesan" else reason_label,
+                    quality_metrics=quality_metrics,
+                    sources=sources,
+                )
+            except (RuntimeError, ValueError) as error:
+                st.warning(f"Eupan balik teu tiasa disimpen: {error}")
+            else:
+                st.session_state[state_key] = True
+                st.session_state.pop(f"_feedback_pending_{answer_id}", None)
+                st.caption(
+                    "Peunteun parantos kacatet."
+                    if saved
+                    else "Jawaban ieu parantos kantos dipeunteun."
+                )
+
+
 @st.cache_resource
 def _get_drive_sync_manager() -> DriveSyncManager:
     return DriveSyncManager()
@@ -940,9 +1200,27 @@ def _render_device_uid_wait() -> None:
 
 st.session_state.setdefault("chat_api_key_override", "")
 st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
-DEVICE_UID = get_device_uid()
-if st.session_state.get("_device_uid_wait_timed_out"):
-    st.caption("Riwayat belum tersimpan karena ID perangkat belum tersedia.")
+with _measure_perf("identity"):
+    DEVICE_UID = get_device_uid()
+    DEVICE_ID_FINAL = bool(
+        st.session_state.get("_device_uid_browser_resolved")
+    )
+IS_GUEST = bool(st.session_state.get("guest_mode"))
+GUEST_CODE_HASH = ""
+try:
+    GUEST_CODE_HASH = str(st.secrets.get("GUEST_CODE_HASH", "") or "")
+except StreamlitSecretNotFoundError:
+    pass
+if not DEVICE_ID_FINAL and not IS_GUEST:
+    st.warning("ID alat teu acan dikenal; paguneman can tiasa dimimitian.")
+    _render_guest_access(
+        get_runtime_config(None),
+        key_prefix="guest_unrecognized_id",
+        guest_code_hash=GUEST_CODE_HASH,
+    )
+DEVICE_FIRESTORE_CLIENT = None
+if not IS_GUEST and st.session_state.get("_device_uid_wait_timed_out"):
+    st.caption("Riwayat teu acan tiasa disimpen kumargi ID alat can sayogi.")
     if st.button("Coba lagi", key="device_uid_retry"):
         for key in (
             "_device_uid_wait_started",
@@ -952,26 +1230,37 @@ if st.session_state.get("_device_uid_wait_timed_out"):
         ):
             st.session_state.pop(key, None)
         st.rerun()
-elif st.session_state.get("_device_uid_waiting"):
+elif not IS_GUEST and st.session_state.get("_device_uid_waiting"):
+    st.caption("Riwayat teu acan tiasa disimpen; nuju mariksa ID alat.")
     _render_device_uid_wait()
-if st.query_params.get("debug") == "1":
+if _PERF_ENABLED and not IS_GUEST:
+    status_label = "final" if DEVICE_ID_FINAL else "sementara"
+    source_label = st.session_state.get("_device_uid_source", "temporary")
+    uid_prefix = st.session_state.get("_device_uid_prefix", "")
     st.caption(
-        "Diagnostik ID perangkat: "
-        f"sumber={st.session_state.get('_device_uid_source', 'temporary')}; "
-        f"status={st.session_state.get('_device_uid_status', 'belum_balas')}; "
-        f"tipe nilai={st.session_state.get('_device_uid_raw_type', 'NoneType')}; "
-        f"UID awal={st.session_state.get('_device_uid_prefix', '')}"
+        f"ID alat · sumber: {source_label} · status: {status_label} · "
+        f"awalan: {uid_prefix}"
     )
-try:
-    firestore_credentials_json = credentials_json_from_secrets(st.secrets)
-except StreamlitSecretNotFoundError:
-    firestore_credentials_json = None
-FIRESTORE_CLIENT = get_firestore_client(firestore_credentials_json)
-DEVICE_FIRESTORE_CLIENT = get_device_firestore_client(FIRESTORE_CLIENT)
-try:
-    KEY_SECRETS = dict(st.secrets)
-except StreamlitSecretNotFoundError:
-    KEY_SECRETS = {}
+with _measure_perf("configuration"):
+    try:
+        firestore_credentials_json = credentials_json_from_secrets(st.secrets)
+    except StreamlitSecretNotFoundError:
+        firestore_credentials_json = None
+    if IS_GUEST:
+        GUEST_STATS_CLIENT = get_firestore_client(firestore_credentials_json)
+        FIRESTORE_CLIENT = None
+    else:
+        FIRESTORE_CLIENT = get_firestore_client(firestore_credentials_json)
+        GUEST_STATS_CLIENT = None
+    DEVICE_FIRESTORE_CLIENT = (
+        None
+        if IS_GUEST
+        else get_device_firestore_client(FIRESTORE_CLIENT)
+    )
+    try:
+        KEY_SECRETS = dict(st.secrets)
+    except StreamlitSecretNotFoundError:
+        KEY_SECRETS = {}
 try:
     SETTINGS_PASSWORD = str(st.secrets.get("SETTINGS_PASSWORD", "") or "")
     ADMIN_CODE_HASH = str(st.secrets.get("ADMIN_CODE_HASH", "") or "")
@@ -979,13 +1268,109 @@ except StreamlitSecretNotFoundError:
     SETTINGS_PASSWORD = ""
     ADMIN_CODE_HASH = ""
 
+
+def _persist_admin_session() -> None:
+    if not DEVICE_ID_FINAL:
+        st.error("Sesi admin teu tiasa disimpen sateuacan ID alat final.")
+        return
+    epoch = get_admin_session_epoch(FIRESTORE_CLIENT)
+    if epoch is None:
+        st.session_state.pop("_admin_session_token", None)
+        st.session_state["_admin_auth_method"] = "code"
+        st.warning(
+            "Kode leres, nanging sesi admin teu tiasa dipupuskeun ka alat ieu "
+            "kumargi Firestore teu sayogi."
+        )
+        return
+    try:
+        token = create_admin_session_token(DEVICE_UID, epoch, KEY_SECRETS)
+    except (ValueError, RuntimeError) as error:
+        st.session_state.pop("_admin_session_token", None)
+        st.session_state["_admin_auth_method"] = "code"
+        st.warning(
+            "Kode leres, nanging sesi admin teu tiasa disimpen "
+            f"({type(error).__name__})."
+        )
+        return
+    st.session_state["_admin_session_token"] = token
+    st.session_state["_admin_auth_method"] = "token"
+    st.session_state["_admin_session_store_pending"] = True
+
+
+def _render_admin_session_storage() -> None:
+    token = st.session_state.get("_admin_session_token")
+    if not isinstance(token, str):
+        st.session_state.pop("_admin_session_store_pending", None)
+        return
+    try:
+        result = st_javascript(
+            build_admin_session_store_script(token),
+            key="write_admin_session_token",
+        )
+    except (ValueError, RuntimeError) as error:
+        result = "error"
+        error_class = type(error).__name__
+    else:
+        error_class = ""
+    if result == "stored":
+        st.session_state.pop("_admin_session_store_pending", None)
+    elif result == "error":
+        st.session_state.pop("_admin_session_store_pending", None)
+        st.warning(
+            "Kode leres. Panyimpenan sesi dina panyungsi teu sayogi; "
+            "anjeun tiasa kedah lebet deui saatos muka ulang aplikasi."
+        )
+        if error_class:
+            st.caption(f"Rincian: {error_class}")
+
+
+def _restore_admin_session() -> None:
+    if not DEVICE_ID_FINAL:
+        return
+    session_token = st.session_state.get("_admin_session_token")
+    auth_method = st.session_state.get("_admin_auth_method")
+    browser_token = st.context.cookies.get("jh_adm", "")
+    token = session_token if isinstance(session_token, str) else browser_token
+    if not token:
+        return
+    epoch = get_admin_session_epoch(FIRESTORE_CLIENT)
+    valid = epoch is not None and verify_admin_session_token(
+        token,
+        DEVICE_UID,
+        epoch,
+        KEY_SECRETS,
+    )
+    if valid:
+        st.session_state["admin_authenticated"] = True
+        st.session_state["_admin_session_token"] = token
+        st.session_state["_admin_auth_method"] = "token"
+        return
+    if auth_method == "token" or not st.session_state.get("admin_authenticated"):
+        st.session_state["admin_authenticated"] = False
+        st.session_state.pop("_admin_session_token", None)
+        st.session_state.pop("_admin_auth_method", None)
+
+
+if not IS_GUEST:
+    _restore_admin_session()
+if st.session_state.get("_admin_session_store_pending"):
+    _render_admin_session_storage()
+if st.session_state.get("admin_authenticated"):
+    _PERF_ENABLED = True
+
+
 def _process_admin_command(command: str) -> bool:
     """Consume admin login commands before chat history, AI, or statistics."""
     if not re.match(r"^/admin(?:\s|$)", command, flags=re.IGNORECASE):
         return False
 
+    if not DEVICE_ID_FINAL:
+        st.session_state["_admin_login_notice"] = (
+            "ID alat can final; cobian deui saatos ID alat dikenal."
+        )
+        return True
     code = command[len("/admin") :].strip()
-    process_admin_login(
+    authenticated = process_admin_login(
         code,
         ADMIN_CODE_HASH,
         st.session_state,
@@ -993,6 +1378,8 @@ def _process_admin_command(command: str) -> bool:
         DEVICE_UID,
         empty_code_notice="Gunakan format /admin <kode>.",
     )
+    if authenticated:
+        _persist_admin_session()
     return True
 
 
@@ -1389,13 +1776,24 @@ def _build_app_css(theme: dict[str, str], font: dict[str, str]) -> str:
     )
 
 
+@st.cache_data(show_spinner=False, max_entries=50)
+def _build_selected_app_css(theme_id: str, font_id: str) -> str:
+    return _build_app_css(APP_THEMES[theme_id], APP_FONTS[font_id])
+
+
 theme = APP_THEMES[APP_THEME_ID]
-st.markdown(_build_app_css(theme, APP_FONTS[APP_FONT_ID]), unsafe_allow_html=True)
-runtime_config = get_runtime_config(FIRESTORE_CLIENT)
+st.markdown(
+    _build_selected_app_css(APP_THEME_ID, APP_FONT_ID),
+    unsafe_allow_html=True,
+)
+with _measure_perf("configuration"):
+    runtime_config = get_runtime_config(FIRESTORE_CLIENT)
 settings_password_hash = str(runtime_config.get("settings_password_hash", ""))
 settings_password_valid = False
 
 with st.sidebar:
+    if IS_GUEST:
+        st.success("Tamu")
     st.divider()
     st.subheader("KITAB RUJUKAN")
     folder_id = st.session_state.google_drive_folder_id
@@ -1513,17 +1911,18 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    if st.button("Admin", key="admin_access_trigger", use_container_width=True):
-        register_admin_button_click(st.session_state)
-    remaining_admin_clicks = 3 - int(
-        st.session_state.get("_admin_button_clicks", 0)
-    )
-    if remaining_admin_clicks < 3 and not st.session_state.get(
-        "_admin_login_prompt_open"
-    ):
-        st.caption(
-            f"Klik Admin {remaining_admin_clicks} kali lagi untuk membuka login."
+    if not IS_GUEST:
+        if st.button("Admin", key="admin_access_trigger", use_container_width=True):
+            register_admin_button_click(st.session_state)
+        remaining_admin_clicks = 3 - int(
+            st.session_state.get("_admin_button_clicks", 0)
         )
+        if remaining_admin_clicks < 3 and not st.session_state.get(
+            "_admin_login_prompt_open"
+        ):
+            st.caption(
+                f"Klik Admin {remaining_admin_clicks} kali deui pikeun muka login."
+            )
 
 
 def _render_header() -> None:
@@ -1546,7 +1945,7 @@ def _render_admin_login_prompt() -> None:
         st.subheader("Login dashboard admin")
         with st.form("admin_sidebar_login_form", clear_on_submit=True):
             code = st.text_input("Kode admin", type="password")
-            submitted = st.form_submit_button("Masuk")
+            submitted = st.form_submit_button("Masuk", disabled=not DEVICE_ID_FINAL)
 
         if submitted:
             authenticated = process_admin_login(
@@ -1557,6 +1956,7 @@ def _render_admin_login_prompt() -> None:
                 DEVICE_UID,
             )
             if authenticated:
+                _persist_admin_session()
                 st.rerun()
 
             notice = st.session_state.pop("_admin_login_notice", None)
@@ -1573,30 +1973,35 @@ _render_header()
 if (
     st.session_state.get("_admin_login_prompt_open")
     and not st.session_state.get("admin_authenticated")
+    and not IS_GUEST
 ):
     _render_admin_login_prompt()
 
-CHAT_KEY_RECORDS = get_available_keys("chat", FIRESTORE_CLIENT, KEY_SECRETS)
-INDEX_KEY_RECORDS = get_available_keys("indexing", FIRESTORE_CLIENT, KEY_SECRETS)
-chat_api_key_override = str(
-    st.session_state.get("chat_api_key_override", "")
-).strip()
-chat_api_keys = (
-    [chat_api_key_override]
-    if chat_api_key_override
-    else [item.key for item in CHAT_KEY_RECORDS]
-)
-index_api_keys = [item.key for item in INDEX_KEY_RECORDS]
-api_key = chat_api_keys[0] if chat_api_keys else ""
-index_api_key = index_api_keys[0] if index_api_keys else ""
-index_cache_key = index_api_key or "indexing-key-unavailable"
-model_order_settings = get_model_order(FIRESTORE_CLIENT, KEY_SECRETS)
-chat_model_names = (
-    ordered_models(get_available_chat_models(api_key), model_order_settings)
-    if api_key
-    else []
-)
-_chat_key_by_value = {item.key: item for item in CHAT_KEY_RECORDS}
+with _measure_perf("key_pool"):
+    CHAT_KEY_RECORDS = get_available_keys("chat", FIRESTORE_CLIENT, KEY_SECRETS)
+    INDEX_KEY_RECORDS = get_available_keys("indexing", FIRESTORE_CLIENT, KEY_SECRETS)
+    chat_api_key_override = str(
+        st.session_state.get("chat_api_key_override", "")
+    ).strip()
+    chat_api_keys = (
+        [chat_api_key_override]
+        if chat_api_key_override
+        else [item.key for item in CHAT_KEY_RECORDS]
+    )
+    index_api_keys = [item.key for item in INDEX_KEY_RECORDS]
+    api_key = chat_api_keys[0] if chat_api_keys else ""
+    index_api_key = index_api_keys[0] if index_api_keys else ""
+    index_cache_key = index_api_key or "indexing-key-unavailable"
+    model_order_settings = get_model_order(FIRESTORE_CLIENT, KEY_SECRETS)
+    chat_model_names = (
+        ordered_models(
+            get_available_chat_models(api_key, background=True),
+            model_order_settings,
+        )
+        if api_key
+        else []
+    )
+    _chat_key_by_value = {item.key: item for item in CHAT_KEY_RECORDS}
 
 
 def _chat_model_filter(key: str, models: list[str] | tuple[str, ...]) -> list[str]:
@@ -1626,6 +2031,7 @@ else:
 if not folder_id:
     st.info("Atur GOOGLE_DRIVE_FOLDER_ID untuk menghubungkan memori Google Drive.")
 
+_index_loading_started = _start_perf_block()
 drive_authorized = False
 if folder_id:
     try:
@@ -1703,6 +2109,8 @@ if folder_id:
         except (GoogleAuthError, OSError, ValueError) as error:
             st.error(f"Tidak dapat memulai izin Google Drive: {error}")
 
+_finish_perf_block("index_loading", _index_loading_started)
+
 if index_api_keys and folder_id and drive_authorized:
     try:
         with st.sidebar:
@@ -1711,18 +2119,46 @@ if index_api_keys and folder_id and drive_authorized:
     except (GoogleAPIError, GoogleAuthError, HttpError, OSError, ValueError) as error:
         st.warning(f"Sinkronisasi Drive berjalan di latar belakang; indeks lokal tetap digunakan bila tersedia. {error}")
 
+_history_loading_started = _start_perf_block()
 requested_chat_id = _safe_chat_id(st.query_params.get("chat"))
-if (
-    "chat_id" not in st.session_state
-    or (requested_chat_id and requested_chat_id != st.session_state.chat_id)
-):
-    st.session_state.chat_id = _get_or_create_chat_id(
-        DEVICE_UID,
-        DEVICE_FIRESTORE_CLIENT,
+if DEVICE_ID_FINAL:
+    if IS_GUEST:
+        st.session_state.setdefault("guest_chat_id", uuid.uuid4().hex[:12])
+        st.session_state.chat_id = st.session_state["guest_chat_id"]
+    else:
+        if (
+            "chat_id" not in st.session_state
+            or st.session_state.get("_chat_uid") != DEVICE_UID
+            or (requested_chat_id and requested_chat_id != st.session_state.chat_id)
+        ):
+            st.session_state.chat_id = _get_or_create_chat_id(
+                DEVICE_UID,
+                DEVICE_FIRESTORE_CLIENT,
+            )
+        st.session_state["_chat_uid"] = DEVICE_UID
+elif "chat_id" not in st.session_state:
+    st.session_state.chat_id = (
+        st.session_state.get("guest_chat_id")
+        if IS_GUEST
+        else uuid.uuid4().hex[:12]
     )
 chat_id = st.session_state.chat_id
 
-if st.session_state.get("loaded_chat_id") != chat_id:
+if IS_GUEST:
+    if not st.session_state.get("_guest_loaded"):
+        st.session_state.messages = []
+        st.session_state.history_stats = {}
+        st.session_state["_guest_loaded"] = True
+    st.session_state.loaded_chat_id = chat_id
+elif not DEVICE_ID_FINAL:
+    st.session_state.messages = []
+    st.session_state.history_stats = {}
+    st.session_state.loaded_chat_id = chat_id
+    st.session_state.pop("_loaded_chat_uid", None)
+elif (
+    st.session_state.get("loaded_chat_id") != chat_id
+    or st.session_state.get("_loaded_chat_uid") != DEVICE_UID
+):
     loaded_messages, history_stats = load_chat_history(
         DEVICE_FIRESTORE_CLIENT,
         DEVICE_UID,
@@ -1731,14 +2167,20 @@ if st.session_state.get("loaded_chat_id") != chat_id:
     st.session_state.messages = loaded_messages
     st.session_state.history_stats = history_stats
     st.session_state.loaded_chat_id = chat_id
+    st.session_state["_loaded_chat_uid"] = DEVICE_UID
+_finish_perf_block("history_loading", _history_loading_started)
 if runtime_config["announcement"]:
     st.info(runtime_config["announcement"])
 
 admin_login_notice = st.session_state.pop("_admin_login_notice", None)
 if admin_login_notice:
     st.warning(admin_login_notice)
+admin_session_warning = st.session_state.pop("_admin_session_clear_warning", None)
+if admin_session_warning:
+    st.warning(admin_session_warning)
 
 if st.session_state.get("admin_authenticated"):
+    _record_app_perf()
     admin_dashboard = import_module("services.admin_dashboard")
     admin_dashboard.render_dashboard(
         FIRESTORE_CLIENT,
@@ -1750,14 +2192,67 @@ if st.session_state.get("admin_authenticated"):
     )
     st.stop()
 
-try:
-    saved_chats = get_saved_chats(DEVICE_FIRESTORE_CLIENT, DEVICE_UID)
-    saved_chats_error = ""
-except ChatStoreError as error:
-    saved_chats = []
-    saved_chats_error = str(error)
+if IS_GUEST:
+    st.markdown(
+        '<div style="background:#5b2c83;color:#fff;padding:0.85rem 1rem;'
+        'border-radius:0.6rem;font-weight:700;">'
+        "MODE TAMU - riwayat teu disimpen</div>",
+        unsafe_allow_html=True,
+    )
+    emergency_seconds = _guest_emergency_seconds(runtime_config)
+    if emergency_seconds:
+        total_minutes = ceil(emergency_seconds / 60)
+        hours, minutes = divmod(total_minutes, 60)
+        st.error(
+            "Katup darurat mode tamu keur dibuka "
+            f"(sésana {hours} jam {minutes} menit)."
+        )
 
 history_stats = st.session_state.get("history_stats", {})
+profile_name = str(history_stats.get("name", "") or "")
+if not IS_GUEST and needs_user_name(DEVICE_ID_FINAL, profile_name):
+    st.subheader("Sampurasun! Mangga tulis nami heula")
+    st.text(
+        "Nami dipaké supados gampil dipaluruh upami aya kasalahan atanapi pamundut "
+        "bantosan. Cekap nami panggilan."
+    )
+    with st.form("required_user_name_form", clear_on_submit=True):
+        requested_name = st.text_input("Nami", max_chars=30)
+        submit_name = st.form_submit_button("Simpen nami")
+    if submit_name:
+        try:
+            clean_name = validate_user_name(requested_name)
+            save_user_name(DEVICE_FIRESTORE_CLIENT, DEVICE_UID, clean_name)
+        except (ChatStoreError, ValueError) as error:
+            st.error(str(error) or USER_NAME_ERROR)
+        else:
+            updated_history_stats = dict(history_stats)
+            updated_history_stats["name"] = clean_name
+            st.session_state.history_stats = updated_history_stats
+            st.rerun()
+    _render_guest_access(
+        runtime_config,
+        key_prefix="guest_missing_name",
+        guest_code_hash=GUEST_CODE_HASH,
+    )
+
+if DEVICE_ID_FINAL and profile_name:
+    if st.session_state.get("_saved_chats_uid") != DEVICE_UID:
+        try:
+            cached_saved_chats = get_saved_chats(DEVICE_FIRESTORE_CLIENT, DEVICE_UID)
+            cached_saved_chats_error = ""
+        except ChatStoreError as error:
+            cached_saved_chats = []
+            cached_saved_chats_error = str(error)
+        st.session_state["_saved_chats_uid"] = DEVICE_UID
+        st.session_state["_saved_chats"] = cached_saved_chats
+        st.session_state["_saved_chats_error"] = cached_saved_chats_error
+    saved_chats = st.session_state.get("_saved_chats", [])
+    saved_chats_error = str(st.session_state.get("_saved_chats_error", ""))
+else:
+    saved_chats = []
+    saved_chats_error = ""
+
 if (
     int(history_stats.get("total_messages", 0)) > HISTORY_WARNING_MESSAGES
     or int(history_stats.get("total_chunks", 0)) > HISTORY_WARNING_CHUNKS
@@ -1776,10 +2271,30 @@ with st.sidebar:
     if st.session_state.pop("_all_chats_deleted_notice", False):
         st.success(TEKS["delete_all_history_done"])
 
+    if settings_password_valid and DEVICE_ID_FINAL and profile_name:
+        st.text("Nami ayeuna:")
+        st.text(profile_name)
+        with st.form("edit_user_name_form", clear_on_submit=True):
+            replacement_name = st.text_input("Ganti nami", max_chars=30)
+            save_replacement_name = st.form_submit_button("Simpen nami")
+        if save_replacement_name:
+            try:
+                clean_name = validate_user_name(replacement_name)
+                save_user_name(DEVICE_FIRESTORE_CLIENT, DEVICE_UID, clean_name)
+            except (ChatStoreError, ValueError) as error:
+                st.error(str(error) or USER_NAME_ERROR)
+            else:
+                updated_history_stats = dict(
+                    st.session_state.get("history_stats", {})
+                )
+                updated_history_stats["name"] = clean_name
+                st.session_state.history_stats = updated_history_stats
+                st.rerun()
+
     current_chat_is_saved = any(
         item["chat_id"] == chat_id for item in saved_chats
     )
-    save_disabled = (
+    save_disabled = IS_GUEST or (
         not st.session_state.messages
         or (len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved)
     )
@@ -1792,10 +2307,10 @@ with st.sidebar:
         st.caption("Simpen paguneman ieu kalayan nami, tuluy muka obrolan anyar.")
         save_chat = st.form_submit_button(
             "Simpan Paguneman",
-            disabled=save_disabled,
+            disabled=save_disabled or IS_GUEST,
             use_container_width=True,
         )
-    if save_disabled:
+    if save_disabled and not IS_GUEST:
         if not st.session_state.messages:
             st.caption("Ajukan patarosan heula saméméh nyimpen paguneman.")
         elif len(saved_chats) >= SAVED_CHAT_LIMIT and not current_chat_is_saved:
@@ -1805,7 +2320,7 @@ with st.sidebar:
             )
     if save_chat:
         try:
-            save_named_chat(
+            updated_saved_chats = save_named_chat(
                 DEVICE_FIRESTORE_CLIENT,
                 DEVICE_UID,
                 chat_id,
@@ -1817,11 +2332,17 @@ with st.sidebar:
             st.error(f"Paguneman teu tiasa disimpen: {error}")
         else:
             st.session_state._chat_saved_notice = True
+            st.session_state["_saved_chats"] = updated_saved_chats
             _start_new_chat()
             st.rerun()
 
-    st.markdown(f"**Paguneman disimpen ({len(saved_chats)}/{SAVED_CHAT_LIMIT})**")
-    st.caption("Pencét ngaran pikeun muka deui.")
+    if IS_GUEST:
+        st.caption("Mode tamu: riwayat paguneman teu disimpen.")
+    else:
+        st.markdown(
+            f"**Paguneman disimpen ({len(saved_chats)}/{SAVED_CHAT_LIMIT})**"
+        )
+        st.caption("Pencét ngaran pikeun muka deui.")
     for saved_chat in saved_chats:
         saved_chat_id = saved_chat["chat_id"]
         label = saved_chat["name"]
@@ -1835,7 +2356,11 @@ with st.sidebar:
             st.query_params["chat"] = saved_chat_id
             st.rerun()
 
-    if st.button(TEKS["delete_all_history"], key="delete_all_chats"):
+    if st.button(
+        TEKS["delete_all_history"],
+        key="delete_all_chats",
+        disabled=IS_GUEST,
+    ):
         st.session_state.delete_all_chats_confirmation = True
     if st.session_state.get("delete_all_chats_confirmation"):
         st.warning(TEKS["delete_all_history_confirm"])
@@ -1859,6 +2384,7 @@ with st.sidebar:
                     }
                 )
                 st.session_state.history_stats = history_stats
+                st.session_state["_saved_chats"] = []
                 st.session_state.delete_all_chats_confirmation = False
                 st.session_state._all_chats_deleted_notice = True
                 _start_new_chat()
@@ -1870,7 +2396,7 @@ with st.sidebar:
             st.session_state.delete_all_chats_confirmation = False
             st.rerun()
 
-for message in st.session_state.messages:
+for message_index, message in enumerate(st.session_state.messages):
     if message["role"] == "assistant":
         message["content"] = _clean_legacy_assistant_message(message["content"])
     with st.chat_message(message["role"]):
@@ -1892,11 +2418,38 @@ for message in st.session_state.messages:
                 message["content"],
                 f"history_copy_{len(st.session_state.messages)}_{id(message)}",
             )
+            previous_question = next(
+                (
+                    str(item.get("content", ""))
+                    for item in reversed(st.session_state.messages[:message_index])
+                    if item.get("role") == "user"
+                ),
+                "",
+            )
+            stored_metrics = message.get("quality_metrics", {})
+            feedback_sources = message.get("source_context", [])
+            if not isinstance(feedback_sources, list):
+                feedback_sources = message.get("sources", [])
+            if not IS_GUEST:
+                _render_answer_feedback(
+                    answer_id=message.get("answer_id"),
+                    question=previous_question,
+                    answer=str(message.get("content", "")),
+                    chat_id=chat_id,
+                    quality_metrics=(
+                        stored_metrics if isinstance(stored_metrics, dict) else {}
+                    ),
+                    sources=feedback_sources,
+                )
 
-if st.session_state.pop("_chat_deleted_notice", False):
+if not IS_GUEST and st.session_state.pop("_chat_deleted_notice", False):
     st.success(TEKS["clear_history_done"])
 
-if st.button(TEKS["clear_history"], key="clear_active_chat"):
+if st.button(
+    TEKS["clear_history"],
+    key="clear_active_chat",
+    disabled=IS_GUEST,
+):
     st.session_state.clear_active_chat_confirmation = True
 if st.session_state.get("clear_active_chat_confirmation"):
     st.warning(TEKS["clear_history_confirm"])
@@ -1964,16 +2517,58 @@ def _santri_status(message: str) -> str:
     if m == "Pencarian gagal":
         return "Punten, KITABNA TEU KAPENDAK."
     return message
+
+
+guest_today = datetime.now(_WIB_TIMEZONE).strftime("%Y%m%d")
+if IS_GUEST and st.session_state.get("guest_questions_day") != guest_today:
+    st.session_state["guest_questions_day"] = guest_today
+    st.session_state["guest_questions_count"] = 0
+guest_question_limit = max(
+    1, int(runtime_config.get("guest_daily_question_limit", 10))
+)
+guest_limit_reached = IS_GUEST and int(
+    st.session_state.get("guest_questions_count", 0)
+) >= guest_question_limit
+if guest_limit_reached:
+    st.warning(
+        f"Mode tamu parantos ngahontal wates {guest_question_limit} "
+        "patarosan sapoé dina sesi ieu."
+    )
+
 chat_submission = st.chat_input(
     "Taroskeun ku Seratan, rekam suanten, tanapi lampirkan gambar...",
     accept_file="multiple",
     file_type=["png", "jpg", "jpeg", "webp"],
     accept_audio=True,
     max_upload_size=10,
+    disabled=(
+        guest_limit_reached
+        or (
+            not IS_GUEST
+            and (
+                not DEVICE_ID_FINAL
+                or needs_user_name(
+                    DEVICE_ID_FINAL,
+                    st.session_state.get("history_stats", {}).get("name", ""),
+                )
+            )
+        )
+    ),
 )
 if chat_submission is not None:
+    if not IS_GUEST and (
+        not DEVICE_ID_FINAL
+        or needs_user_name(
+            DEVICE_ID_FINAL,
+            st.session_state.get("history_stats", {}).get("name", ""),
+        )
+    ):
+        st.warning("Mangga simpen nami heula sateuacan ngamimitian paguneman.")
+        st.stop()
+    if guest_limit_reached:
+        st.stop()
     typed_question = chat_submission.text.strip()
-    if _process_admin_command(typed_question):
+    if not IS_GUEST and _process_admin_command(typed_question):
         st.rerun()
     if runtime_config["maintenance"]:
         st.warning(
@@ -1983,7 +2578,7 @@ if chat_submission is not None:
         st.stop()
     allowed, policy_notice = (
         (True, "")
-        if chat_api_key_override
+        if IS_GUEST or chat_api_key_override
         else question_is_allowed(
             st.session_state.get("history_stats", {}),
             int(runtime_config["daily_question_limit"]),
@@ -2060,6 +2655,22 @@ if chat_submission is not None:
     if audio_preview is not None:
         user_message["audio"] = audio_preview
     st.session_state.messages.append(user_message)
+
+    response_started = time.perf_counter()
+    answer_id = uuid.uuid4().hex
+    quality_metrics: dict[str, object] = {
+        "latency_ms": 0,
+        "source_count": 0,
+        "top_score": None,
+        "fallback": False,
+        "model_used": None,
+        "source_context": [],
+    }
+    quality_metadata_state = {"captured": False}
+
+    def capture_quality_metadata(metadata: dict[str, object]) -> None:
+        quality_metrics.update(metadata)
+        quality_metadata_state["captured"] = True
 
     with st.chat_message("user"):
         _render_message_content(displayed_question)
@@ -2157,6 +2768,8 @@ if chat_submission is not None:
                 key_rotation_options["session_key_override"] = bool(
                     chat_api_key_override
                 )
+            if "on_metadata" in answer_parameters:
+                key_rotation_options["on_metadata"] = capture_quality_metadata
             try:
                 if supports_search_progress and supports_answer_streaming:
                     response_text, response_sources = answer_question(
@@ -2204,6 +2817,29 @@ if chat_submission is not None:
                 search_status.update(label=_santri_status("Selesai"), state="complete")
                 _render_message_content(response_text)
                 _render_source_links(response_sources, "answer_source")
+        if not quality_metadata_state["captured"]:
+            quality_metrics["latency_ms"] = max(
+                0, round((time.perf_counter() - response_started) * 1000)
+            )
+            quality_metrics["source_count"] = len(response_sources)
+            quality_metrics["source_context"] = [
+                {
+                    "name": source.get("name", "Dokumen"),
+                    "excerpt": "",
+                }
+                for source in response_sources[:3]
+            ]
+        if not IS_GUEST:
+            _render_answer_feedback(
+                answer_id=answer_id,
+                question=displayed_question,
+                answer=response_text,
+                chat_id=chat_id,
+                quality_metrics=quality_metrics,
+                sources=quality_metrics.get("source_context", [])
+                if isinstance(quality_metrics.get("source_context"), list)
+                else [],
+            )
         _render_copy_button(response_text, "current_answer_copy")
 
     st.session_state.messages.append(
@@ -2211,35 +2847,57 @@ if chat_submission is not None:
             "role": "assistant",
             "content": response_text,
             "sources": response_sources,
+            "answer_id": answer_id,
+            "quality_metrics": quality_metrics,
+            "source_context": quality_metrics.get("source_context", []),
         }
     )
-    enqueue_question_answer(
-        DEVICE_FIRESTORE_CLIENT,
-        DEVICE_UID,
-        chat_id,
-        displayed_question,
-        response_text,
-        response_sources,
-        count_for_daily_limit=not bool(chat_api_key_override),
-    )
-    updated_stats = dict(st.session_state.get("history_stats", {}))
-    active_chunk_count = int(updated_stats.get("active_chunk_count", 0))
-    if active_chunk_count + 2 > MAX_MESSAGES_PER_CHUNK:
-        updated_stats["active_chunk_count"] = 2
-        updated_stats["total_chunks"] = int(updated_stats.get("total_chunks", 0)) + 1
+    if IS_GUEST:
+        enqueue_guest_question(GUEST_STATS_CLIENT)
+        st.session_state["guest_questions_day"] = guest_today
+        st.session_state["guest_questions_count"] = int(
+            st.session_state.get("guest_questions_count", 0)
+        ) + 1
     else:
-        updated_stats["active_chunk_count"] = active_chunk_count + 2
-        updated_stats.setdefault("total_chunks", 0)
-    updated_stats["total_messages"] = (
-        int(updated_stats.get("total_messages", 0)) + 2
-    )
-    if not chat_api_key_override:
-        today_wib = datetime.now(_WIB_TIMEZONE).strftime("%Y%m%d")
-        current_day_count = (
-            int(updated_stats.get("day_count", 0))
-            if updated_stats.get("day") == today_wib
-            else 0
+        enqueue_question_answer(
+            DEVICE_FIRESTORE_CLIENT,
+            DEVICE_UID,
+            chat_id,
+            displayed_question,
+            response_text,
+            response_sources,
+            count_for_daily_limit=not bool(chat_api_key_override),
+            answer_id=answer_id,
+            quality_metrics=quality_metrics,
+            model_used=(
+                str(quality_metrics["model_used"])
+                if quality_metrics.get("model_used")
+                else None
+            ),
         )
-        updated_stats["day"] = today_wib
-        updated_stats["day_count"] = current_day_count + 1
-    st.session_state.history_stats = updated_stats
+        updated_stats = dict(st.session_state.get("history_stats", {}))
+        active_chunk_count = int(updated_stats.get("active_chunk_count", 0))
+        if active_chunk_count + 2 > MAX_MESSAGES_PER_CHUNK:
+            updated_stats["active_chunk_count"] = 2
+            updated_stats["total_chunks"] = (
+                int(updated_stats.get("total_chunks", 0)) + 1
+            )
+        else:
+            updated_stats["active_chunk_count"] = active_chunk_count + 2
+            updated_stats.setdefault("total_chunks", 0)
+        updated_stats["total_messages"] = (
+            int(updated_stats.get("total_messages", 0)) + 2
+        )
+        if not chat_api_key_override:
+            today_wib = datetime.now(_WIB_TIMEZONE).strftime("%Y%m%d")
+            current_day_count = (
+                int(updated_stats.get("day_count", 0))
+                if updated_stats.get("day") == today_wib
+                else 0
+            )
+            updated_stats["day"] = today_wib
+            updated_stats["day_count"] = current_day_count + 1
+        st.session_state.history_stats = updated_stats
+
+
+_record_app_perf()

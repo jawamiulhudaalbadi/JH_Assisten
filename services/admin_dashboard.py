@@ -2,26 +2,39 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import re
 import time
 from collections.abc import Sequence
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from streamlit_javascript import st_javascript
 
 from services.admin_logic import hash_settings_password
-from services.ai_service import get_available_chat_models, summarize_faq_questions
+from services.ai_service import (
+    evaluate_answer_samples,
+    get_available_chat_models,
+    summarize_faq_questions,
+)
+from services.admin_session import (
+    build_admin_session_clear_script,
+    revoke_all_admin_sessions,
+)
+
 from services.firestore_store import (
     export_admin_users_csv,
     firestore_status,
     firestore_write_health,
     flush_recent_errors,
+    get_admin_user_page,
     get_admin_chat_history,
     get_admin_faq,
+    get_answer_quality_page,
+    get_answer_quality_summary,
+    get_answer_reviews,
     get_admin_recent_errors,
     get_admin_statistics,
     get_admin_user_chats,
@@ -30,8 +43,9 @@ from services.firestore_store import (
     get_empty_user_uids,
     get_runtime_config,
     save_settings_password_hash,
-    set_user_blocked,
+    save_answer_reviews,
     update_runtime_config,
+    update_admin_user_policy,
 )
 from services.key_pool import (
     KEY_GROUPS,
@@ -49,12 +63,16 @@ from services.key_pool import (
     set_key_enabled,
 )
 from services.model_router import router
+from services.perf_monitor import (
+    record_admin_menu_run,
+    recent_admin_menu_runs,
+    recent_runs,
+)
 
 _WIB = ZoneInfo("Asia/Jakarta")
-_USER_ID_RE = re.compile(r"^[a-f0-9]{16,32}$")
 
 
-def _cached(key: str, loader: Callable[[], Any], ttl: float = 30) -> Any:
+def _cached(key: str, loader: Callable[[], Any], ttl: float = 60) -> Any:
     state_key = f"_admin_cache_{key}"
     cached = st.session_state.get(state_key)
     if cached and time.monotonic() - cached["at"] < ttl:
@@ -64,9 +82,54 @@ def _cached(key: str, loader: Callable[[], Any], ttl: float = 30) -> Any:
     return value
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_admin_statistics(client_key: str, _client: Any) -> dict[str, Any]:
+    return get_admin_statistics(_client)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_quality_summary(client_key: str, _client: Any) -> dict[str, Any]:
+    return get_answer_quality_summary(_client)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_quality_page(
+    client_key: str,
+    filter_type: str,
+    filter_value: str,
+    cursor: Any | None,
+    _client: Any,
+) -> dict[str, Any]:
+    return get_answer_quality_page(
+        _client,
+        filter_type=filter_type,
+        filter_value=filter_value,
+        start_after=cursor,
+        page_size=25,
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_user_page(
+    client_key: str,
+    name_query: str,
+    cursor: tuple[str, str] | None,
+    _client: Any,
+) -> dict[str, Any]:
+    return get_admin_user_page(
+        _client,
+        name_query=name_query,
+        start_after=cursor,
+        page_size=25,
+    )
+
+
 def _render_statistics(client: Any | None) -> None:
     st.subheader("Statistik")
-    statistics = _cached("statistics", lambda: get_admin_statistics(client))
+    if st.button("Segarkan", key="admin_statistics_refresh"):
+        _cached_admin_statistics.clear()
+    client_key = str(id(client)) if client is not None else "unavailable"
+    statistics = _cached_admin_statistics(client_key, client)
     columns = st.columns(4)
     columns[0].metric("Total perangkat", statistics["total_devices"])
     columns[1].metric("Aktif sekitar 1 jam", statistics["active_last_hour"])
@@ -94,71 +157,546 @@ def _render_statistics(client: Any | None) -> None:
 
 def _render_history(client: Any | None) -> None:
     st.subheader("Riwayat chat pengguna")
-    users = _cached("users", lambda: get_admin_users(client))
+    if not _admin_firestore_ready(client):
+        return
+    client_key = str(id(client)) if client is not None else "unavailable"
+    if st.button("Segarkan", key="admin_history_refresh"):
+        _cached_user_page.clear()
+        st.session_state.pop("_admin_history_page_query", None)
+        for key in list(st.session_state):
+            if key.startswith(("_admin_cache_chats_", "_admin_cache_history_")):
+                st.session_state.pop(key, None)
+    name_query = st.text_input(
+        "Cari pangguna dumasar nami",
+        key="admin_history_name_search",
+    ).casefold().strip()
+    if st.session_state.get("_admin_history_page_query") != name_query:
+        st.session_state["_admin_history_page_query"] = name_query
+        st.session_state["_admin_history_page_cursors"] = [None]
+        st.session_state["_admin_history_page_number"] = 0
+    cursors = st.session_state.get("_admin_history_page_cursors", [None])
+    page_number = int(st.session_state.get("_admin_history_page_number", 0))
+    cursor = cursors[page_number] if page_number < len(cursors) else None
+    user_page = _cached_user_page(client_key, name_query, cursor, client)
+    users = user_page["items"]
     if not users:
         st.info("Daftar pengguna belum tersedia.")
         return
 
-    page_key = "_admin_user_page"
-    page_count = max(1, (len(users) + 9) // 10)
-    page = min(int(st.session_state.get(page_key, 0)), page_count - 1)
-    start = page * 10
-    columns = st.columns([1, 1, 4])
-    if columns[0].button("Sebelumnya", disabled=page == 0, key="admin_users_prev"):
-        st.session_state[page_key] = max(0, page - 1)
-        st.rerun()
-    if columns[1].button(
-        "Berikutnya",
-        disabled=page >= page_count - 1,
-        key="admin_users_next",
+    previous_column, page_column, next_column = st.columns([1, 2, 1])
+    page_column.caption(f"Halaman {page_number + 1}")
+    if previous_column.button(
+        "Sateuacanna",
+        disabled=page_number == 0,
+        key="admin_history_previous_users",
     ):
-        st.session_state[page_key] = min(page_count - 1, page + 1)
-        st.rerun()
-    columns[2].caption(f"Halaman {page + 1}/{page_count} · {len(users)} perangkat")
+        st.session_state["_admin_history_page_number"] = page_number - 1
+        st.rerun(scope="fragment")
+    next_cursor = user_page.get("next_cursor")
+    if next_column.button(
+        "Salajengna",
+        disabled=next_cursor is None,
+        key="admin_history_next_users",
+    ):
+        cursors = list(cursors)
+        if len(cursors) == page_number + 1:
+            cursors.append(next_cursor)
+        st.session_state["_admin_history_page_cursors"] = cursors
+        st.session_state["_admin_history_page_number"] = page_number + 1
+        st.rerun(scope="fragment")
     st.dataframe(
         [
             {
+                "Nama": user["name"] or "Tanpa nama",
+                "Nama ganda": user["duplicate_name"],
                 "ID pendek": user["short_id"],
                 "Pertanyaan": user["total_questions"],
-                "Pertanyaan hari ini": user["day_count"],
                 "Diblokir": user["blocked"],
             }
-            for user in users[start : start + 10]
+            for user in users
         ],
         use_container_width=True,
         hide_index=True,
     )
 
     labels = {
-        f"{user['short_id']} · {user['total_questions']} pertanyaan": user["uid"]
+        f"{user['name'] or 'Tanpa nama'} · {user['short_id']}": user
         for user in users
     }
-    selected_label = st.selectbox("Buka satu pengguna", list(labels))
-    uid = labels[selected_label]
-    chats = _cached(f"chats_{uid}", lambda: get_admin_user_chats(client, uid))
-    chat_options = {"Semua chat": None}
-    chat_options.update(
-        {
-            f"{chat['short_id']}": chat["chat_id"]
-            for chat in chats
-        }
+    selected_label = st.selectbox(
+        "Buka hiji pangguna",
+        list(labels),
+        key="admin_history_selected_user",
     )
-    selected_chat = st.selectbox("Chat", list(chat_options))
+    selected_user = labels[selected_label]
+    uid = selected_user["uid"]
+    st.caption(
+        f"Riwayat milik {selected_user['name'] or 'Tanpa nama'} · "
+        f"ID {selected_user['short_id']}"
+    )
+    chats = _cached(f"chats_{uid}", lambda: get_admin_user_chats(client, uid))
+    if not chats:
+        st.info("Pamaké ieu teu acan gaduh paguneman.")
+        return
+    chat_options = {
+        f"Paguneman · {chat['short_id']}": chat["chat_id"]
+        for chat in chats
+    }
+    selected_chat = st.selectbox(
+        "Paguneman",
+        list(chat_options),
+        key=f"admin_history_chat_{uid}",
+    )
     keyword = st.text_input("Cari kata kunci", key="admin_history_keyword")
     if st.button("Cari riwayat", key="admin_search_history"):
         chat_id = chat_options[selected_chat]
-        result = get_admin_chat_history(client, uid, chat_id, keyword)
+        result = _cached(
+            f"history_{uid}_{chat_id}_{keyword.casefold().strip()}",
+            lambda: get_admin_chat_history(client, uid, chat_id, keyword),
+            ttl=60,
+        )
         st.session_state["_admin_history_result"] = result
-        st.session_state["_admin_history_query"] = (uid, chat_id, keyword)
+        st.session_state["_admin_history_query"] = (
+            uid,
+            chat_id,
+            keyword.casefold().strip(),
+        )
+        st.session_state["_admin_history_message_page"] = 0
     result = st.session_state.get("_admin_history_result")
+    query = (uid, chat_options[selected_chat], keyword.casefold().strip())
+    if st.session_state.get("_admin_history_query") != query:
+        result = None
     if result is not None:
         if not result:
             st.info("Tidak ada pesan yang cocok.")
-        for message in result:
-            timestamp = message["timestamp"]
-            st.markdown(
-                f"**{message['role']} · {timestamp}**  \n{message['content']}"
+        message_page = int(st.session_state.get("_admin_history_message_page", 0))
+        page_count = max(1, (len(result) + 24) // 25)
+        message_page = min(message_page, page_count - 1)
+        message_columns = st.columns([1, 2, 1])
+        message_columns[1].caption(
+            f"Halaman pesen {message_page + 1}/{page_count} · "
+            f"{len(result)} pesen dimuat"
+        )
+        if message_columns[0].button(
+            "Pesen saméméhna",
+            disabled=message_page == 0,
+            key="admin_history_previous_messages",
+        ):
+            st.session_state["_admin_history_message_page"] = message_page - 1
+            st.rerun(scope="fragment")
+        if message_columns[2].button(
+            "Pesen salajengna",
+            disabled=message_page + 1 >= page_count,
+            key="admin_history_next_messages",
+        ):
+            st.session_state["_admin_history_message_page"] = message_page + 1
+            st.rerun(scope="fragment")
+        for message in result[message_page * 25 : (message_page + 1) * 25]:
+            st.caption(
+                f"{message['role']} · {_format_admin_timestamp(message['timestamp'])}"
             )
+            st.text(message["content"])
+
+
+def _format_admin_timestamp(value: Any) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=_WIB)
+        return value.astimezone(_WIB).strftime("%d-%m-%Y %H:%M WIB")
+    return str(value or "-")
+
+
+def _admin_firestore_ready(client: Any | None) -> bool:
+    if client is None:
+        st.error("Firestore henteu sayogi; data admin teu dimuat.")
+        return False
+    status = firestore_status()
+    if status["circuit_open"]:
+        st.warning("Firestore keur teu sayogi; data nu nembongan tiasa kadaluwarsa.")
+    return True
+
+
+def _render_users(client: Any | None) -> None:
+    st.subheader("Pengguna")
+    if not _admin_firestore_ready(client):
+        return
+    client_key = str(id(client)) if client is not None else "unavailable"
+    refresh_column, search_column = st.columns([1, 4])
+    if refresh_column.button("Segarkan", key="admin_users_refresh"):
+        _cached_user_page.clear()
+        st.session_state.pop("_admin_users_page_query", None)
+    name_query = search_column.text_input(
+        "Cari berdasarkan nama",
+        key="admin_user_name_search",
+    ).casefold().strip()
+    if st.session_state.get("_admin_users_page_query") != name_query:
+        st.session_state["_admin_users_page_query"] = name_query
+        st.session_state["_admin_users_page_cursors"] = [None]
+        st.session_state["_admin_users_page_number"] = 0
+
+    cursors = st.session_state.get("_admin_users_page_cursors", [None])
+    page_number = int(st.session_state.get("_admin_users_page_number", 0))
+    cursor = cursors[page_number] if page_number < len(cursors) else None
+    page = _cached_user_page(client_key, name_query, cursor, client)
+    users = page["items"]
+    if not users:
+        st.info("Teu aya pangguna anu cocog.")
+        return
+    today_key = datetime.now(_WIB).strftime("%Y%m%d")
+    st.dataframe(
+        [
+            {
+                "Nama": user["name"] or "Tanpa nama",
+                "ID": user["short_id"],
+                "First seen": _format_admin_timestamp(user["first_seen"]),
+                "Last active": _format_admin_timestamp(user["last_active"]),
+                "Total pertanyaan": user["total_questions"],
+                "Patarosan dinten ieu": (
+                    user["day_count"] if user["day"] == today_key else 0
+                ),
+                "Blokir": user["blocked"],
+                "Batas harian": user["daily_question_limit"],
+                "Tanda": " · ".join(
+                    label
+                    for key, label in (
+                        ("duplicate_name", "Nama ganda"),
+                        ("no_questions", "Belum bertanya"),
+                        ("question_spike", "Lonjakan ≥20/hari"),
+                    )
+                    if user[key]
+                ),
+            }
+            for user in users
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+    previous_column, page_column, next_column = st.columns([1, 2, 1])
+    previous_column.caption(f"Halaman {page_number + 1}")
+    if previous_column.button(
+        "Sateuacanna",
+        key="admin_users_previous_page",
+        disabled=page_number == 0,
+    ):
+        st.session_state["_admin_users_page_number"] = page_number - 1
+        st.rerun(scope="fragment")
+    next_cursor = page.get("next_cursor")
+    if next_column.button(
+        "Salajengna",
+        key="admin_users_next_page",
+        disabled=next_cursor is None,
+    ):
+        cursors = list(cursors)
+        if len(cursors) == page_number + 1:
+            cursors.append(next_cursor)
+        st.session_state["_admin_users_page_cursors"] = cursors
+        st.session_state["_admin_users_page_number"] = page_number + 1
+        st.rerun(scope="fragment")
+
+    labels = {
+        f"{user['name'] or 'Tanpa nama'} · {user['short_id']}": user
+        for user in users
+    }
+    selected_label = st.selectbox(
+        "Atur kawijakan pangguna",
+        list(labels),
+        key="admin_user_policy_select",
+    )
+    selected_user = labels[selected_label]
+    with st.form(f"admin_user_policy_form_{selected_user['uid']}"):
+        blocked = st.checkbox(
+            "Blokir pangguna",
+            value=selected_user["blocked"],
+            key=f"admin_user_blocked_{selected_user['uid']}",
+        )
+        daily_limit = st.number_input(
+            "Batas harian (0 = turutan setelan umum)",
+            min_value=0,
+            max_value=10_000,
+            step=1,
+            value=selected_user["daily_question_limit"],
+            key=f"admin_user_daily_limit_{selected_user['uid']}",
+        )
+        update_policy = st.form_submit_button("Simpan kawijakan")
+    if update_policy:
+        try:
+            update_admin_user_policy(
+                client,
+                selected_user["uid"],
+                blocked=blocked,
+                daily_question_limit=int(daily_limit),
+            )
+        except (RuntimeError, ValueError) as error:
+            st.error(str(error))
+        else:
+            _cached_user_page.clear()
+            st.session_state["_admin_user_policy_saved"] = True
+            st.rerun(scope="fragment")
+    if st.session_state.pop("_admin_user_policy_saved", False):
+        st.success("Kawijakan pangguna parantos disimpen.")
+
+
+def _render_answer_quality(
+    client: Any | None,
+    secrets: dict[str, Any],
+) -> None:
+    st.subheader("Kualitas jawaban")
+    if not _admin_firestore_ready(client):
+        return
+    client_key = str(id(client)) if client is not None else "unavailable"
+    if st.button("Segarkan", key="admin_quality_refresh"):
+        _cached_quality_summary.clear()
+        _cached_quality_page.clear()
+        st.session_state.pop("_admin_quality_filter_key", None)
+    summary = _cached_quality_summary(client_key, client)
+    feedback_count = int(summary.get("feedback_count", 0) or 0)
+    no_source_count = int(summary.get("without_sources_count", 0) or 0)
+    fallback_count = int(summary.get("fallback_count", 0) or 0)
+    latency_count = int(summary.get("latency_count", 0) or 0)
+    latency_total = int(summary.get("latency_total_ms", 0) or 0)
+    columns = st.columns(5)
+    columns[0].metric("Cocog", int(summary.get("positive_count", 0) or 0))
+    columns[1].metric("Teu cocog", int(summary.get("negative_count", 0) or 0))
+    columns[2].metric(
+        "Tanpa sumber",
+        f"{100 * no_source_count / feedback_count:.1f}%"
+        if feedback_count
+        else "—",
+    )
+    columns[3].metric(
+        "Fallback tanpa AI",
+        f"{100 * fallback_count / feedback_count:.1f}%"
+        if feedback_count
+        else "—",
+    )
+    columns[4].metric(
+        "Rata-rata latensi",
+        f"{latency_total / latency_count:.0f} ms" if latency_count else "—",
+    )
+    st.caption(
+        "Métrik sumber, fallback, jeung laténsi dumasar kana jawaban anu geus dipeunteun."
+    )
+    model_stats = summary.get("models", {})
+    if isinstance(model_stats, dict) and model_stats:
+        st.markdown("**Per model**")
+        st.dataframe(
+            [
+                {
+                    "Model": value.get("name", key),
+                    "Jumlah": int(value.get("feedback_count", 0) or 0),
+                    "Rata-rata latensi (ms)": (
+                        round(
+                            int(value.get("latency_total_ms", 0) or 0)
+                            / int(value.get("latency_count", 0) or 1)
+                        )
+                    ),
+                }
+                for key, value in model_stats.items()
+                if isinstance(value, dict)
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    try:
+        admin_keys = [
+            item.key for item in get_available_keys("admin", client, secrets)
+        ]
+    except KeyPoolError as error:
+        admin_keys = []
+        st.warning(f"Kelompok key admin teu tiasa dibaca: {error}")
+    if not admin_keys:
+        st.caption("Sadaya key admin teu sayogi; penilaian AI dinonaktipkeun.")
+    if st.button(
+        "Nilai sampel dengan AI",
+        key="admin_quality_ai_evaluate",
+        disabled=not admin_keys,
+    ):
+        sample_page = _cached_quality_page(
+            client_key,
+            "Sadayana",
+            "",
+            None,
+            client,
+        )
+        sample_rows = sample_page["items"][:25]
+        existing_reviews = get_answer_reviews(
+            client,
+            [str(item.get("answer_id", "")) for item in sample_rows],
+        )
+        samples = [
+            {
+                **item,
+                "sources": item.get("sources", []),
+            }
+            for item in sample_rows
+            if not existing_reviews.get(str(item.get("answer_id", "")), {}).get(
+                "ai_label"
+            )
+        ][:20]
+        if not samples:
+            st.info("Teu aya sampel anyar anu tiasa dinilai.")
+        else:
+            try:
+                model_names = get_available_chat_models(admin_keys[0])
+                evaluations = evaluate_answer_samples(
+                    samples,
+                    admin_keys,
+                    model_names=model_names,
+                    on_key_quota=lambda key, error: record_quota(
+                        "admin", client, secrets, key, error
+                    ),
+                )
+                save_answer_reviews(
+                    client,
+                    [
+                        {
+                            "answer_id": item["answer_id"],
+                            "ai_label": item["label"],
+                            "ai_rationale": item["rationale"],
+                        }
+                        for item in evaluations
+                    ],
+                )
+            except (KeyPoolError, RuntimeError, ValueError) as error:
+                st.error(f"Penilaian AI gagal: {error}")
+            else:
+                _cached_quality_page.clear()
+                st.success(f"{len(evaluations)} sampel parantos dinilai.")
+                st.rerun(scope="fragment")
+
+    filters = (
+        "Sadayana",
+        "Teu cocog",
+        "Tanpa sumber",
+        "Fallback tanpa AI",
+        "Per model",
+        "Per nama",
+    )
+    filter_type = st.selectbox(
+        "Filter kualitas",
+        filters,
+        key="admin_quality_filter",
+    )
+    filter_value = ""
+    models = [
+        str(value.get("name", ""))
+        for value in model_stats.values()
+        if isinstance(value, dict) and value.get("name")
+    ] if isinstance(model_stats, dict) else []
+    if filter_type == "Per model" and models:
+        filter_value = st.selectbox(
+            "Model",
+            sorted(set(models)),
+            key="admin_quality_model_filter",
+        )
+    elif filter_type == "Per nama":
+        filter_value = st.text_input(
+            "Awalan nami",
+            key="admin_quality_name_filter",
+        ).strip()
+    normalized_filter = f"{filter_type}|{filter_value.casefold()}"
+    if st.session_state.get("_admin_quality_filter_key") != normalized_filter:
+        st.session_state["_admin_quality_filter_key"] = normalized_filter
+        st.session_state["_admin_quality_cursors"] = [None]
+        st.session_state["_admin_quality_page_number"] = 0
+    cursors = st.session_state.get("_admin_quality_cursors", [None])
+    page_number = int(st.session_state.get("_admin_quality_page_number", 0))
+    cursor = cursors[page_number] if page_number < len(cursors) else None
+    page = _cached_quality_page(
+        client_key,
+        filter_type,
+        filter_value,
+        cursor,
+        client,
+    )
+    items = page["items"]
+    reviews = get_answer_reviews(
+        client, [str(item.get("answer_id", "")) for item in items]
+    )
+    if not items:
+        st.info("Can data eupan balik anu cocog sareng filter ieu.")
+    for item in items:
+        answer_id = str(item.get("answer_id", ""))
+        review = reviews.get(answer_id, {})
+        display_name = str(item.get("name", "") or "Tanpa nama")
+        with st.expander(
+            f"{display_name} · {item.get('rating', '')} · "
+            f"{_format_admin_timestamp(item.get('created_at'))}"
+        ):
+            st.caption(f"ID · {str(item.get('uid', ''))[:6]}")
+            st.text("Patarosan")
+            st.text(str(item.get("question", "")))
+            st.text("Jawaban")
+            st.text(str(item.get("answer", "")))
+            st.caption(
+                f"Sumber: {int(item.get('source_count', 0) or 0)} · "
+                f"Fallback tanpa AI: {bool(item.get('fallback', False))} · "
+                f"Model: {item.get('model_used') or 'teu aya'}"
+            )
+            for source in item.get("sources", [])[:3]:
+                st.text(
+                    f"{source.get('name', 'Dokumen')}: "
+                    f"{source.get('excerpt', '')}"
+                )
+            if item.get("reason"):
+                st.caption(f"Alesan pamaké: {item['reason']}")
+            if review.get("ai_label"):
+                st.text(
+                    f"Penilaian AI: {review['ai_label']} · "
+                    f"{review.get('ai_rationale', '')}"
+                )
+            current_label = review.get("label", "Sesuai")
+            selected_label = st.selectbox(
+                "Tandaan admin",
+                ("Sesuai", "Kaluar kontéks", "Salah", "Perlu sumber"),
+                index=(
+                    ("Sesuai", "Kaluar kontéks", "Salah", "Perlu sumber").index(
+                        current_label
+                    )
+                    if current_label in {
+                        "Sesuai",
+                        "Kaluar kontéks",
+                        "Salah",
+                        "Perlu sumber",
+                    }
+                    else 0
+                ),
+                key=f"admin_review_label_{answer_id}",
+            )
+            if st.button("Simpen tandaan", key=f"admin_save_review_{answer_id}"):
+                try:
+                    save_answer_reviews(
+                        client,
+                        [{"answer_id": answer_id, "label": selected_label}],
+                    )
+                except (RuntimeError, ValueError) as error:
+                    st.error(str(error))
+                else:
+                    st.success("Tandaan parantos disimpen.")
+                    st.rerun(scope="fragment")
+
+    previous_column, page_column, next_column = st.columns([1, 2, 1])
+    previous_column.caption(f"Halaman {page_number + 1}")
+    if previous_column.button(
+        "Sateuacanna",
+        key="admin_quality_previous_page",
+        disabled=page_number == 0,
+    ):
+        st.session_state["_admin_quality_page_number"] = page_number - 1
+        st.rerun(scope="fragment")
+    next_cursor = page.get("next_cursor")
+    if next_column.button(
+        "Salajengna",
+        key="admin_quality_next_page",
+        disabled=next_cursor is None,
+    ):
+        cursors = list(cursors)
+        if len(cursors) == page_number + 1:
+            cursors.append(next_cursor)
+        st.session_state["_admin_quality_cursors"] = cursors
+        st.session_state["_admin_quality_page_number"] = page_number + 1
+        st.rerun(scope="fragment")
 
 
 def _read_faq_summary(client: Any | None, fingerprint: str) -> str:
@@ -467,9 +1005,50 @@ def _render_drive_sync(
                 st.rerun()
 
 
-def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
+def _render_controls(client: Any | None) -> None:
     st.subheader("Kontrol lain")
     runtime = get_runtime_config(client)
+    expiry_value = str(runtime["guest_emergency_expires_at"] or "")
+    try:
+        expiry = datetime.fromisoformat(expiry_value) if expiry_value else None
+        if expiry is not None and expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+    except ValueError:
+        expiry = datetime.min.replace(tzinfo=timezone.utc)
+    if (
+        not runtime["guest_emergency_enabled"]
+        and expiry is not None
+        and expiry <= datetime.now(timezone.utc)
+    ):
+        st.session_state["admin_guest_emergency_toggle"] = False
+    st.toggle(
+        "Buka mode tamu tanpa sandi",
+        value=bool(runtime["guest_emergency_enabled"]),
+        key="admin_guest_emergency_toggle",
+        on_change=_save_guest_emergency_toggle,
+        args=(client,),
+    )
+    emergency_notice = st.session_state.pop("_guest_emergency_notice", None)
+    if emergency_notice:
+        st.error(emergency_notice)
+    if runtime["guest_emergency_enabled"]:
+        try:
+            expires_at = datetime.fromisoformat(
+                str(runtime["guest_emergency_expires_at"])
+            )
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            remaining = max(
+                0, int((expires_at - datetime.now(timezone.utc)).total_seconds())
+            )
+        except ValueError:
+            remaining = 0
+        total_minutes = (remaining + 59) // 60
+        st.error(
+            "Mode tamu tanpa sandi keur dibuka "
+            f"(sésana {total_minutes // 60} jam "
+            f"{total_minutes % 60} menit)."
+        )
     with st.form("admin_runtime_settings"):
         maintenance = st.toggle(
             "Mode perawatan",
@@ -486,6 +1065,13 @@ def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
             step=1,
             value=int(runtime["daily_question_limit"]),
         )
+        guest_daily_limit = st.number_input(
+            "Batas pertanyaan harian per sesi tamu",
+            min_value=1,
+            max_value=10_000,
+            step=1,
+            value=int(runtime["guest_daily_question_limit"]),
+        )
         save_runtime = st.form_submit_button("Simpan kontrol")
     if save_runtime:
         try:
@@ -494,11 +1080,59 @@ def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
                 maintenance=maintenance,
                 announcement=announcement,
                 daily_question_limit=int(daily_limit),
+                guest_daily_question_limit=int(guest_daily_limit),
             )
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             st.error(str(error))
         else:
             st.success("Kontrol disimpan dan berlaku di proses ini.")
+
+    if st.button("Cabut semua sesi admin", key="revoke_all_admin_sessions"):
+        try:
+            revoke_all_admin_sessions(client)
+        except RuntimeError as error:
+            st.error(str(error))
+        else:
+            st.session_state["_admin_revoke_clear_pending"] = True
+            st.rerun(scope="fragment")
+
+    if st.session_state.get("_admin_revoke_clear_pending"):
+        clear_result = st_javascript(
+            build_admin_session_clear_script(),
+            key="clear_admin_session_after_revoke",
+        )
+        if clear_result in {"cleared", "cookie-cleared", "error"}:
+            if clear_result != "cleared":
+                st.session_state["_admin_session_clear_warning"] = (
+                    "Token sesi parantos dicabut. Panyimpenan lokal panyungsi "
+                    "teu tiasa dipupus sadayana."
+                )
+            st.session_state["admin_authenticated"] = False
+            st.session_state.pop("_admin_session_token", None)
+            st.session_state.pop("_admin_auth_method", None)
+            st.session_state.pop("_admin_revoke_clear_pending", None)
+            st.rerun(scope="app")
+        st.caption("Nuju mupus sesi admin dina alat ieu...")
+
+
+def _save_guest_emergency_toggle(client: Any | None) -> None:
+    enabled = bool(st.session_state.get("admin_guest_emergency_toggle", False))
+    expires_at = (
+        (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+        if enabled
+        else ""
+    )
+    try:
+        update_runtime_config(
+            client,
+            guest_emergency_enabled=enabled,
+            guest_emergency_expires_at=expires_at,
+        )
+    except (RuntimeError, ValueError) as error:
+        st.session_state["admin_guest_emergency_toggle"] = not enabled
+        st.session_state["_guest_emergency_notice"] = (
+            f"Katup darurat teu tiasa dirobah: {error}"
+        )
 
     if st.button("Bersihkan pengguna kosong", key="admin_preview_empty_users"):
         try:
@@ -544,36 +1178,26 @@ def _render_controls(client: Any | None, users: list[dict[str, Any]]) -> None:
             st.session_state.pop("_empty_user_cleanup_candidates", None)
             st.session_state.pop("_empty_user_cleanup_confirmation", None)
 
-    selectable_users = {
-        user["short_id"]: user["uid"]
-        for user in users
-        if _USER_ID_RE.fullmatch(user["uid"])
-    }
-    if selectable_users:
-        with st.form("admin_block_user"):
-            selected = st.selectbox("ID pengguna", list(selectable_users))
-            blocked = st.checkbox("Blokir perangkat ini")
-            save_block = st.form_submit_button("Simpan blokir")
-        if save_block:
-            try:
-                set_user_blocked(client, selectable_users[selected], blocked)
-            except RuntimeError as error:
-                st.error(str(error))
-            else:
-                st.success("Perubahan blokir berhasil disimpan.")
-
     if st.button("Bersihkan cache aplikasi", key="admin_clear_cache"):
         st.cache_data.clear()
         st.session_state.pop("_admin_cache_users", None)
         st.session_state.pop("_admin_cache_statistics", None)
         st.session_state.pop("_admin_cache_faq", None)
         st.success("Cache aplikasi dibersihkan.")
-    st.download_button(
-        "Ekspor pengguna ke CSV",
-        data=export_admin_users_csv(users),
-        file_name="pengguna_jh_asisten.csv",
-        mime="text/csv",
-    )
+    if st.button("Siapkan ekspor pengguna", key="admin_prepare_users_export"):
+        st.session_state["_admin_users_export"] = _cached(
+            "users_export",
+            lambda: export_admin_users_csv(get_admin_users(client)),
+            ttl=60,
+        )
+    csv_export = st.session_state.get("_admin_users_export")
+    if isinstance(csv_export, str):
+        st.download_button(
+            "Unduh CSV pengguna",
+            data=csv_export,
+            file_name="pengguna_jh_asisten.csv",
+            mime="text/csv",
+        )
 
 
 def _render_health(client: Any | None) -> None:
@@ -604,6 +1228,28 @@ def _render_health(client: Any | None) -> None:
         "Baca konfigurasi runtime dilewati karena timeout anggaran: "
         f"{write_health['runtime_config_skipped_timeouts']}"
     )
+    performance_runs = recent_runs()
+    st.markdown("**Performa halaman utama (30 rerun terakhir)**")
+    if performance_runs:
+        st.dataframe(
+            list(reversed(performance_runs)),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption(
+            "Belum aya pangukuran. Tambahkan ?debug=1 atawa buka aplikasi salaku admin."
+        )
+    menu_runs = recent_admin_menu_runs()
+    st.markdown("**Performa menu dashboard admin (30 interaksi terakhir)**")
+    if menu_runs:
+        st.dataframe(
+            list(reversed(menu_runs)),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("Can aya interaksi menu admin anu diukur.")
     if write_health["breaker_open_until"]:
         st.caption(f"Sirkuit dibuka hingga: {write_health['breaker_open_until']}")
     errors_by_kind = write_health["last_error_by_kind"]
@@ -660,7 +1306,8 @@ def _render_settings_password(client: Any | None) -> None:
             st.success("Sandi Pengaturan berhasil diperbarui.")
 
 
-def render_dashboard(
+@st.fragment
+def _render_dashboard_fragment(
     client: Any | None,
     manager: Any,
     folder_id: str,
@@ -668,31 +1315,42 @@ def render_dashboard(
     drive_authorized: bool,
     secrets: dict[str, Any],
 ) -> None:
+    started_at = time.perf_counter()
     st.title("Dashboard Admin")
     if st.button("Keluar", key="admin_dashboard_exit"):
-        st.session_state["admin_authenticated"] = False
-        st.rerun()
-    chat_keys = [
-        item.key for item in get_available_keys("chat", client, secrets)
-    ]
-    admin_keys = [
-        item.key for item in get_available_keys("admin", client, secrets)
-    ]
-    try:
-        model_settings = get_model_order(client, secrets, admin=True)
-    except KeyPoolError as error:
-        st.error(str(error))
-        model_settings = {"mode": "automatic", "models": [], "secrets_models": []}
-    available_models = (
-        get_available_chat_models(chat_keys[0]) if chat_keys else []
-    )
-    model_names = ordered_models(available_models, model_settings)
+        st.session_state["_admin_logout_clear_pending"] = True
+        st.rerun(scope="fragment")
+    if st.session_state.get("_admin_logout_clear_pending"):
+        result = st_javascript(
+            build_admin_session_clear_script(),
+            key="clear_admin_session_on_logout",
+        )
+        if result == "error":
+            st.session_state.pop("_admin_logout_clear_pending", None)
+            st.error(
+                "Sesi dina panyungsi teu tiasa dipupus; dashboard tetep kabuka."
+            )
+            return
+        if result in {"cleared", "cookie-cleared"}:
+            if result == "cookie-cleared":
+                st.session_state["_admin_session_clear_warning"] = (
+                    "Cookie parantos dipupus, nanging panyimpenan lokal "
+                    "panyungsi teu tiasa dipupus."
+                )
+            st.session_state["admin_authenticated"] = False
+            st.session_state.pop("_admin_session_token", None)
+            st.session_state.pop("_admin_auth_method", None)
+            st.session_state.pop("_admin_logout_clear_pending", None)
+            st.rerun(scope="app")
+        st.caption("Nuju kaluar tina dashboard admin...")
 
     section = st.radio(
         "Menu dashboard",
         (
             "Statistik",
             "Riwayat chat",
+            "Pengguna",
+            "Kualitas jawaban",
             "Pertanyaan sering",
             "Sinkron Drive",
             "Sandi Pengaturan",
@@ -703,13 +1361,28 @@ def render_dashboard(
         ),
         horizontal=True,
         label_visibility="collapsed",
+        key="admin_dashboard_section",
     )
     if section == "Statistik":
         _render_statistics(client)
     elif section == "Riwayat chat":
         _render_history(client)
+    elif section == "Pengguna":
+        _render_users(client)
+    elif section == "Kualitas jawaban":
+        _render_answer_quality(client, secrets)
     elif section == "Pertanyaan sering":
-        _render_faq(client, secrets, admin_keys, model_names)
+        try:
+            admin_keys = [
+                item.key for item in get_available_keys("admin", client, secrets)
+            ]
+            model_names = (
+                get_available_chat_models(admin_keys[0]) if admin_keys else []
+            )
+        except KeyPoolError as error:
+            st.error(f"Kelompok key admin teu tiasa dibaca: {error}")
+        else:
+            _render_faq(client, secrets, admin_keys, model_names)
     elif section == "Sinkron Drive":
         _render_drive_sync(
             manager,
@@ -722,11 +1395,51 @@ def render_dashboard(
     elif section == "Sandi Pengaturan":
         _render_settings_password(client)
     elif section == "API Key":
-        _render_api_keys(client, secrets, model_names)
+        try:
+            chat_keys = [
+                item.key for item in get_available_keys("chat", client, secrets)
+            ]
+            available_models = (
+                get_available_chat_models(chat_keys[0]) if chat_keys else []
+            )
+            model_settings = get_model_order(client, secrets, admin=True)
+        except KeyPoolError as error:
+            st.error(str(error))
+        else:
+            _render_api_keys(
+                client,
+                secrets,
+                ordered_models(available_models, model_settings),
+            )
     elif section == "Urutan model":
-        _render_model_order(client, secrets, chat_keys)
+        try:
+            chat_keys = [
+                item.key for item in get_available_keys("chat", client, secrets)
+            ]
+        except KeyPoolError as error:
+            st.error(str(error))
+        else:
+            _render_model_order(client, secrets, chat_keys)
     elif section == "Kontrol lain":
-        users = _cached("users", lambda: get_admin_users(client))
-        _render_controls(client, users)
+        _render_controls(client)
     else:
         _render_health(client)
+    record_admin_menu_run(section, time.perf_counter() - started_at)
+
+
+def render_dashboard(
+    client: Any | None,
+    manager: Any,
+    folder_id: str,
+    index_keys: Sequence[str],
+    drive_authorized: bool,
+    secrets: dict[str, Any],
+) -> None:
+    _render_dashboard_fragment(
+        client,
+        manager,
+        folder_id,
+        index_keys,
+        drive_authorized,
+        secrets,
+    )

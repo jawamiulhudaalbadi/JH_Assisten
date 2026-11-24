@@ -24,10 +24,10 @@
   menampilkan breaker, timeout konfigurasi yang dilewati, dan error tulis
   terakhir per jenis.
 - **Perbaikan tulis Firestore:** pasangan riwayat disimpan atomik bersama
-  dokumen pengguna. Statistik harian dan FAQ dikirim terpisah; statistik jam
-  dan jumlah perangkat untuk UID baru tersimpan dalam transaksi pasangan chat.
-  Antrean tulis memori mempertahankan pekerjaan saat sirkuit terbuka dan
-  menjadwalkan ulang error sementara.
+  dokumen pengguna yang sudah dibuat. Statistik harian dan FAQ dikirim
+  terpisah; statistik jam disimpan dalam transaksi pasangan chat. Antrean tulis
+  memori mempertahankan pekerjaan saat sirkuit terbuka dan menjadwalkan ulang
+  error sementara.
 - **Perbaikan ID perangkat produksi:** penyebab UID berubah adalah respons
   kosong sementara dari komponen JavaScript dianggap sebagai UID browser yang
   rusak. Jalur perbaikan lalu membuat UID server dan menandainya final, walau
@@ -48,14 +48,201 @@
   pengguna dapat menekan **Coba lagi**. UID sementara tidak disimpan di
   browser dan tidak membuka akses Firestore.
 - **Pembuatan pengguna malas:** halaman yang hanya dibuka tidak lagi menulis
-  aktivitas atau membuat dokumen pengguna. Transaksi pertama yang menyimpan
-  pasangan pertanyaan-jawaban membuat `users/{uid}`, menaikkan
-  `stats/global.total_devices` hanya untuk UID baru, dan memperbarui statistik
-  per jam secara atomik.
+  aktivitas atau membuat dokumen pengguna. Setelah ID final, pengguna wajib
+  menyimpan nama; transaksi itu membuat `users/{uid}` dan menaikkan
+  `stats/global.total_devices` tepat satu kali untuk dokumen baru. Penulisan
+  pasangan pertanyaan hanya memperbarui profil yang sudah ada.
 - **Pembersihan pengguna kosong:** menu **Kontrol lain** menampilkan jumlah
   calon sebelum konfirmasi. Hanya dokumen dengan `total_questions` tepat 0 dan
   tanpa chunk yang dapat dihapus; setelahnya `total_devices` dihitung ulang
   dari dokumen pengguna tersisa.
+
+## Fase 4A — selesai
+
+- **Diagnosis UID:** akar masalah yang tercatat pada perubahan sebelumnya
+  adalah newline setelah `return` pada skrip yang dibungkus oleh
+  `streamlit_javascript` 0.1.5. Automatic semicolon insertion membuat JavaScript
+  berhenti sebelum membaca/menulis localStorage dan cookie; komponen lalu
+  mengembalikan nilai awal `0`. Perubahan sebelumnya memangkas kedua skrip dan
+  tes Node menjalankannya melalui pembungkus `eval` yang sama. Tes memastikan
+  nilai kosong tidak dianggap UID final. Kode produksi/deployment atau sesi
+  Android WebView tidak tersedia di workspace ini, jadi cookie yang benar-benar
+  terkirim setelah refresh belum dapat dibuktikan di deployment tersebut.
+  Komponen tidak diganti: bukti yang ada menunjuk ke kesalahan sintaks/ASI pada
+  payload, bukan ketidakcocokan Python 3.14; tes Node memakai pembungkus
+  komponen yang sama. Ini belum menggantikan tes browser nyata.
+- **Identitas:** cookie `jh_uid` dan `?uid=` diproses sebelum komponen. Setelah
+  ID final tersimpan di session state, rerun tidak membaca ulang cookie/query
+  dan tidak merender komponen. Komponen hanya dipakai jika belum final.
+  Diagnostik kecil hanya tampil untuk `?debug=1` atau sesi admin; isinya sumber,
+  status final/sementara, dan empat karakter awal. UID sementara tidak membuka
+  akses operasi Firestore perangkat. Streamlit 1.67.0/Python 3.14.2 lokal
+  menyediakan `st.context.cookies` dan `st.fragment`.
+- **Nama pengguna:** prompt Sunda hanya muncul bagi ID final tanpa `name`.
+  Pemeriksaan nama memakai data dari pembacaan dokumen pengguna yang sudah ada
+  pada pemuatan riwayat. Profil baru dibuat saat tombol **Simpen nami** ditekan;
+  nama divalidasi (2–30 karakter, karakter yang diizinkan, tanpa URL/kontrol)
+  dan ditampilkan sebagai teks biasa. Nama kembar diizinkan dan diberi tanda
+  pada tabel riwayat admin. Pengguna tanpa nama tidak dapat mengirim chat.
+  Perubahan nama dari Pengaturan menulis profil satu kali.
+- **Performa:** pengukuran opt-in menyimpan 30 rerun terakhir per proses dan
+  mencatat rerun di atas 1,5 detik ke log tanpa UID. Kesehatan sistem
+  menampilkan waktu identitas, konfigurasi, key pool, pemuatan indeks,
+  pemuatan riwayat, render, dan total. AppTest lokal tanpa Secrets, Firestore,
+  API key, atau indeks, dengan UID final dan debug aktif, mengukur dua rerun
+  **11,9 ms lalu 5,3 ms** (rerun kedua: identity 0,0; configuration 0,4;
+  key pool 0,0; index 0,0; history 0,1; render 4,8 ms). Itu bukan pembanding
+  produksi. Perubahan I/O yang dapat dihitung: pemuatan
+  daftar chat tersimpan berubah dari satu baca Firestore per rerun menjadi satu
+  baca per sesi/UID (N rerun menjadi 1; menghemat N−1 baca); refresh key chat,
+  key indexing, urutan model, dan daftar model tidak lagi menunggu I/O sinkron
+  pada jalur pengguna. Cache key/urutan model tetap 60 detik; refresh saat
+  kedaluwarsa berjalan di thread latar. CSS yang sama dihitung sekali per
+  pasangan tema/font dalam proses.
+- **Batas verifikasi:** AppTest membuktikan form nama tampil untuk ID final
+  tanpa nama dan chat tetap nonaktif, sementara sesi tanpa ID final tidak
+  menampilkan form. Pengujian browser produksi dan Android WebView tetap perlu
+  dilakukan; hasil lokal tidak mewakili latensi jaringan Firestore atau
+  perangkat.
+- **Fase 4B — selesai:** sesi admin bertanda tangan berlaku 30 hari, terikat
+  pada UID dan epoch pencabutan di `config/admin_session`; epoch dibaca hanya
+  ketika ada token, di-cache 5 menit, dan autentikasi gagal-aman bila Firestore
+  tidak tersedia. Kunci HMAC diturunkan dengan konteks khusus dari
+  `ADMIN_SESSION_SECRET` atau `ENCRYPTION_KEY`, bukan dari
+  `ADMIN_CODE_HASH`. Cookie `jh_adm` dan localStorage ditulis setelah proses
+  login selesai dirender oleh komponen browser; token tidak masuk log.
+  **Keluar** menghapus sesi lokal, sedangkan **Cabut semua sesi admin**
+  menaikkan epoch agar semua token tidak berlaku.
+- **Kualitas jawaban:** metadata latensi, jumlah sumber, skor teratas bila ada,
+  fallback, model, dan maksimal tiga kutipan sumber disimpan bersama chunk
+  jawaban. Umpan balik disimpan sekali per jawaban dan memperbarui dokumen
+  ringkasan pada transaksi yang sama; penandaan admin dan penilaian AI hanya
+  menulis saat tombol ditekan, dan penilaian AI dibatasi 20 item per klik.
+  Ringkasan metrik sumber/fallback/latensi dihitung dari jawaban yang telah
+  diberi umpan balik, bukan semua jawaban; keterangan ini ditampilkan di menu
+  agar persentasenya tidak disalahartikan. Kualitas jawaban menampilkan nama,
+  menyediakan filter/paginasi, dan menyimpan label tinjauan terpisah.
+- **Pengguna dan performa admin:** menu **Pengguna** memakai proyeksi field,
+  halaman maksimal 25 baris, pencarian nama, penanda nama ganda/pengguna tanpa
+  pertanyaan/lonjakan harian, serta kontrol blokir dan batas per pengguna.
+  Dashboard hanya merender menu yang dipilih di dalam `st.fragment`; data
+  ringkasan/halaman memakai cache 60 detik dengan tombol **Segarkan**.
+  Riwayat rinci dibaca hanya saat dibuka. Modul dashboard admin tetap tidak
+  diimpor oleh pengguna biasa.
+- **Pengukuran dashboard:** sebelum refaktor, waktu rerun menu penuh pada
+  AppTest lokal sekitar **108,8–166 ms**. Sesudah refaktor, pengukuran badan
+  fragment lokal sekitar **0,6–25,6 ms** per menu; rerun AppTest penuh sekitar
+  **188–290 ms**, tetapi AppTest menjalankan ulang aplikasi secara penuh dan
+  bukan simulasi interaksi fragment di browser. Karena itu angka tersebut
+  tidak sebanding langsung dan bukan klaim latensi produksi. Firestore,
+  API key, dan layanan produksi tidak tersedia saat pengukuran.
+- **Verifikasi Fase 4B:** 84 tes terarah dan 3 tes metadata/evaluator AI lulus;
+  `py_compile` dan `git diff --check` lulus. Tes menggunakan fake Firestore
+  dan AppTest tanpa kredensial produksi. Peramban nyata, indeks Firestore,
+  ketersediaan layanan, dan persistensi cookie Android WebView tetap harus
+  diuji manual.
+
+## Fase 4C — mode tamu berkode
+
+- **Akses ketat:** chat tetap nonaktif bila ID belum final atau nama belum
+  disimpan. Pengguna hanya dapat melewati syarat tersebut setelah memasukkan
+  kode yang diverifikasi dari `GUEST_CODE_HASH`, atau ketika katup darurat admin
+  sedang berlaku. Secret kosong menyembunyikan tombol. Hash PBKDF2/scrypt
+  diperiksa dengan `hmac.compare_digest`; kegagalan guest memakai penguncian
+  5 kali/15 menit yang terpisah dari login admin.
+- **Privasi tamu:** mode hanya berada di `st.session_state`; tidak memuat atau
+  menyimpan profil, riwayat, chat tersimpan, umpan balik, FAQ, statistik
+  perangkat, maupun statistik pengguna. Tiap pertanyaan hanya menaikkan
+  `guest_questions` pada dokumen `stats/daily_YYYYMMDD` lewat penulisan statistik
+  harian yang sudah ada. Hitungan batas tamu (bawaan 10/hari) hanya di memori
+  sesi dan dapat diubah dari dashboard.
+- **Katup darurat:** menu **Kontrol lain** menyimpan `guest_emergency_enabled`
+  dan `guest_emergency_expires_at` di `settings/runtime`. Katup bawaan mati,
+  berlaku enam jam, dan dianggap mati setelah waktu kedaluwarsa. Dashboard dan
+  sesi tamu menampilkan peringatan merah dengan sisa waktu saat katup aktif.
+- **Verifikasi lokal:** tes unit mencakup validasi hash, penguncian yang terpisah,
+  kadaluarsa katup, dan bentuk penulisan statistik tamu. AppTest memeriksa
+  keadaan identitas/nama dan bahwa sesi tamu tidak membaca Firestore. Uji
+  deployment dan tampilan browser tetap perlu dilakukan manual.
+
+### Cara tes manual Fase 4A
+
+1. Pada browser uji, buka aplikasi dengan `?debug=1`. Dengan cookie `jh_uid`
+   tersedia, pastikan lencana menunjukkan `sumber: cookie`, `status: final`,
+   dan empat karakter awal yang sama sebelum/sesudah refresh. Pastikan refresh
+   cookie tidak memanggil JavaScript (tes unit memverifikasi komponen tidak
+   dipanggil pada jalur cookie).
+2. Pada perangkat uji baru, hapus cookie dan localStorage situs lalu buka
+   aplikasi. Pastikan identitas menjadi final dengan sumber `baru`, kemudian
+   refresh dan pastikan sumber berganti menjadi `cookie` dengan awalan yang
+   sama. Tanyakan sesuatu lalu refresh; riwayat harus tetap muncul.
+3. Blokir JavaScript/penyimpanan browser pada lingkungan uji. Setelah empat
+   detik pastikan ID berstatus sementara, keterangan riwayat belum tersimpan
+   dan tombol **Coba lagi** tampil. Pastikan halaman tidak membuat dokumen
+   pengguna atau mengirim UID sementara ke Firestore.
+4. Untuk ID final tanpa nama, pastikan formulir nama tampil dan chat nonaktif.
+   Uji nama terlalu pendek, URL, newline, dan markup; simpan nama yang valid,
+   pastikan profil dan penghitung `total_devices` dibuat sekali, lalu muat
+   ulang dan pastikan formulir tidak muncul. Uji nama kembar dan ganti nama
+   lewat Pengaturan.
+5. Di Android WebView, ulangi langkah 1–4, termasuk tutup dan buka kembali APK.
+   Pastikan WebView mengizinkan cookie untuk host aplikasi. Jika awalan/sumber
+   berubah, periksa kebijakan cookie dan data situs WebView; jangan
+   mengasumsikan localStorage atau cookie tetap tersimpan.
+6. Untuk pengukuran, buka **Kesehatan sistem** sebagai admin atau gunakan
+   `?debug=1`, kemudian periksa 30 rerun terakhir. Hapus `?debug=1` setelah
+   selesai.
+
+### Cara tes manual Fase 4B
+
+Lakukan pengujian dengan proyek Firestore uji dan akun/perangkat uji.
+
+1. Pastikan `ADMIN_CODE_HASH` dan salah satu `ADMIN_SESSION_SECRET` atau
+   `ENCRYPTION_KEY` tersedia di Secrets. Masuk dengan `/admin <kode>`, muat
+   ulang, lalu tutup dan buka kembali aplikasi. Pastikan cookie `jh_adm` ada
+   dan admin tidak diminta memasukkan kode lagi. Jangan menyalin token ke log,
+   tangkapan layar, atau tiket.
+2. Tekan **Keluar**; pastikan dashboard tertutup. Masuk kembali pada dua
+   perangkat uji, lalu gunakan **Cabut semua sesi admin** dari salah satunya.
+   Pastikan token lama tidak lagi memulihkan sesi. Uji juga saat Firestore
+   tidak tersedia; token tidak boleh memulihkan sesi.
+3. Kirim beberapa pertanyaan dengan dan tanpa sumber. Beri jawaban penilaian
+   **Cocog** dan **Teu cocog**, termasuk alasan opsional. Pastikan tombol
+   terkunci setelah satu penilaian, ringkasan mencerminkan penilaian, dan
+   metadata jawaban tersimpan. Periksa filter, nama, sumber, paginasi, label
+   tinjauan, serta tombol AI (maksimal 20 item per klik).
+4. Di menu **Pengguna**, cari nama, periksa ID pendek, waktu aktivitas,
+   penghitung pertanyaan, penanda nama kembar/tanpa pertanyaan/lonjakan, lalu
+   uji blokir dan batas harian per pengguna.
+5. Ulangi login, refresh, keluar, dan pencabutan sesi pada Android WebView.
+   Cookie dan localStorage dapat dihapus oleh pembungkus APK; jika login tidak
+   bertahan, periksa pengaturan cookie/WebView dan gunakan login kode. Uji
+   bahwa pencabutan tetap berlaku setelah aplikasi dibuka ulang.
+
+### Cara tes manual mode tamu
+
+1. Atur `GUEST_CODE_HASH` di Secrets dengan hash PBKDF2/scrypt. Gunakan perintah
+   berikut untuk membuat hash PBKDF2 secara lokal:
+
+   ```sh
+   python -c 'import getpass, hashlib, secrets; p=getpass.getpass("Sandi mode tamu: ").encode(); s=secrets.token_hex(16); d=hashlib.pbkdf2_hmac("sha256", p, s.encode(), 200000).hex(); print(f"pbkdf2_sha256$200000${s}${d}")'
+   ```
+
+2. Dengan ID browser belum final, pastikan chat nonaktif dan tombol **Mode
+   tamu** muncul. Ulangi untuk ID final tanpa nama; formulir nama dan chat
+   nonaktif, lalu gunakan sandi benar untuk masuk. Banner harus berbunyi
+   **MODE TAMU - riwayat teu disimpen** dan sidebar menampilkan **Tamu**.
+3. Uji sandi salah lima kali; pastikan terkunci 15 menit. Periksa log dan pesan
+   galat agar sandi teks biasa tidak muncul. Pastikan penghitung admin tidak
+   ikut berubah.
+4. Di **Dashboard Admin → Kontrol lain**, uji katup tanpa sandi. Pastikan
+   peringatan merah tampil dan sisa waktu mendekati enam jam; matikan katup dan
+   pastikan akses kembali memerlukan sandi. Uji juga waktu kedaluwarsa yang
+   sudah lewat.
+5. Kirim pertanyaan tamu dan pastikan riwayat, profil, `total_devices`, serta
+   statistik pengguna tidak berubah. Hanya `guest_questions` pada statistik
+   harian boleh bertambah. Pastikan limit sesi 10 pertanyaan (atau nilai yang
+   diatur admin) memblokir pertanyaan berikutnya.
 
 ## Cara tes manual Fase 3
 
@@ -85,16 +272,8 @@
    app.py services/*.py`, lalu buka aplikasi dengan Streamlit AppTest. Tes tidak
    memerlukan kredensial layanan produksi; tes integrasi manual sebaiknya
    memakai proyek uji.
-7. Untuk menguji identitas browser, buka aplikasi pada browser uji dengan
-   penyimpanan lokal dan cookie aktif, lalu pastikan caption pemeriksaan hilang
-   dan riwayat tetap tersedia setelah muat ulang. Uji juga browser yang tidak
-   merespons: setelah 4 detik harus muncul keterangan riwayat belum tersimpan
-   dan tombol **Coba lagi**, tanpa UID sementara di Firestore atau storage
-   browser. Tambahkan `?debug=1` untuk melihat sumber, status, tipe nilai
-   komponen, dan hanya empat karakter awal UID; hapus parameter itu setelah
-   pengujian. Tes otomatis mengeksekusi kedua skrip dengan pembungkus
-   `streamlit_javascript` melalui Node.js (dilewati otomatis bila Node tidak
-   tersedia).
+7. Pengujian identitas browser diperbarui pada bagian **Cara tes manual Fase
+   4A** di atas.
 
 ## Cara tes manual Fase 2
 
@@ -125,45 +304,69 @@ tidak disimpan di Firestore.
 
 ## Berkas yang diubah atau ditambahkan
 
-- `app.py` — login admin sebelum jalur percakapan, penerapan kebijakan sesi,
-  tampilan pengumuman, polling UID browser dengan timeout, dan pemindahan
-  kontrol mulai/jeda/lanjut/coba ulang Drive.
+- `app.py` — login admin sebelum jalur percakapan, gerbang ID/nama, mode tamu
+  berkode, hitungan sesi, banner privasi, polling UID berbatas waktu, lencana
+  diagnostik/performa, cache riwayat, serta kontrol sinkronisasi Drive.
 - `services/device_identity.py` — prioritas UID URL/cookie, pembacaan browser
   yang tidak menganggap respons kosong sebagai nilai tersimpan, skrip JavaScript
   yang aman dari ASI pada pembungkus komponen, diagnostik terbatas, serta
   penulisan cookie dan localStorage setelah konfirmasi.
+- `services/user_profile.py` — validasi nama pengguna dan syarat prompt setelah
+  ID final.
+- `services/perf_monitor.py` — ringkasan 30 rerun terakhir di memori proses.
+- `services/admin_session.py` — token admin HMAC, pemeriksaan epoch fail-closed,
+  cache epoch lima menit, dan skrip tulis/hapus cookie serta localStorage.
 - `services/firestore_store.py` — batas waktu dan circuit breaker Firestore,
   antrean tulis latar, ringkasan statistik WIB, FAQ, konfigurasi admin,
-  riwayat, statistik perangkat lazy, pembersihan pengguna kosong, serta status
-  kesehatan. Pembacaan konfigurasi runtime tidak menunggu Firestore pada jalur
-  render; perubahan dashboard admin memakai timeout 10 detik yang terpisah dari
-  breaker chat.
-- `services/admin_logic.py` — verifikasi hash admin, pengelolaan autentikasi
-  dan penguncian login, serta pemeriksaan blokir dan batas harian.
-- `services/admin_dashboard.py` — dasbor statistik, riwayat, FAQ, sinkron
-  Drive, kontrol, dan kesehatan sistem; modul dimuat setelah login berhasil.
-- `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin.
+  riwayat, pembuatan profil/nama transaksional, statistik perangkat lazy,
+  pembersihan pengguna kosong, serta status kesehatan. Pembacaan konfigurasi
+  runtime tidak menunggu Firestore pada jalur render; perubahan dashboard admin
+  memakai timeout 10 detik yang terpisah dari breaker chat.
+- `services/key_pool.py` dan `services/ai_service.py` — refresh key, urutan
+  model, dan daftar model chat di latar supaya permintaan halaman pengguna tidak
+  menunggu Firestore atau penemuan model.
+- `services/admin_logic.py` — verifikasi hash admin/tamu, penguncian login
+  terpisah, serta pemeriksaan blokir dan batas harian.
+- `services/admin_dashboard.py` — dasbor statistik, riwayat bernama, pengguna,
+  kualitas jawaban, FAQ, sinkron Drive, kontrol katup darurat tamu, dan
+  kesehatan sistem; menu dirender dalam fragment dan modul hanya dimuat setelah
+  login berhasil.
+- `services/firestore_store.py` — konfigurasi batas harian tamu/katup darurat
+  dan penulisan `guest_questions` pada statistik harian.
+- `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin
+  serta tamu.
 - `tests/test_firestore_store.py` — uji kegagalan dan batas waktu riwayat
   Firestore, konfigurasi runtime asinkron, penolakan UID perangkat invalid,
-  transaksi chunk dengan retry, pembuatan pengguna saat pertanyaan pertama,
+  transaksi profil/nama, penghitung perangkat, transaksi chunk dengan retry,
   serta pembersihan pengguna kosong.
 - `tests/test_device_identity.py` — uji respons komponen kosong sebelum UID
   localStorage tersedia, pemulihan UID melalui cookie, dukungan `?uid=`, serta
   eksekusi skrip UID melalui Node.js dengan pembungkus komponen yang sama.
 - `tests/test_admin_logic.py` — uji normalisasi FAQ, blokir, batas WIB,
-  verifikasi PBKDF2, dan penguncian login.
+  verifikasi PBKDF2, dan penguncian login admin/tamu terpisah.
+- `tests/test_guest_mode.py` — AppTest gerbang ID/nama, sandi/katup darurat,
+  banner tamu, batas pertanyaan, dan isolasi Firestore.
+- `tests/test_admin_session.py`, `tests/test_admin_firestore.py`, dan
+  `tests/test_admin_dashboard_isolation.py` — uji token/epoch, umpan balik,
+  paginasi/penandaan admin, serta isolasi menu dashboard.
 - `CATATAN_PROYEK.md` — catatan fase, struktur data, keputusan, dan pekerjaan
   terbuka.
 
 ## Struktur data Firestore
 
 - `users/{uid}` — aktivitas, penghitung, status blokir, hari dan jumlah
-  pertanyaan, `active_chat_id`, daftar `chat_ids`, serta `saved_chats` berisi
-  maksimal lima ID dan nama percakapan tersimpan.
-- `users/{uid}/chats/{chat_id}/chunks/{chunk_id}` — pesan per potongan.
+  pertanyaan, nama dan `name_lower`, batas harian opsional,
+  `active_chat_id`, daftar `chat_ids`, serta `saved_chats` berisi maksimal lima
+  ID dan nama percakapan tersimpan.
+- `users/{uid}/chats/{chat_id}/chunks/{chunk_id}` — pesan per potongan;
+  jawaban menyimpan `answer_id`, `latency_ms`, `source_count`, `top_score`,
+  `fallback`, `model_used`, dan maksimal tiga kutipan sumber.
 - `stats/global` — jumlah perangkat.
+- `stats/quality` — agregat umpan balik, sumber/fallback/latensi dan per model
+  untuk jawaban yang telah dinilai.
 - `stats/daily_YYYYMMDD` — jumlah pertanyaan dan UID perangkat aktif yang
-  di-hash untuk hari WIB.
+  di-hash untuk hari WIB; pertanyaan tamu dihitung terpisah pada
+  `guest_questions`.
 - `stats/hourly_YYYYMMDDHH` — UID yang di-hash dan peta `active_at` untuk
   aktivitas per jam.
 - `faq/{sha256_pertanyaan_normalisasi}` — pertanyaan yang dinormalisasi,
@@ -172,9 +375,14 @@ tidak disimpan di Firestore.
   kelompok. Key disimpan terenkripsi Fernet, bersama ID sidik jari pendek,
   label, status aktif, cooldown, dan penanda error aman.
 - `config/model_order` — mode dan daftar urutan model yang dipilih admin.
+- `config/admin_session` — epoch pencabutan seluruh sesi admin.
 - `admin_cache/faq_summary` — ringkasan FAQ terakhir beserta fingerprint FAQ.
+- `feedback/{answer_id}` — umpan balik sekali untuk satu jawaban, nama, cuplikan
+  pertanyaan/jawaban, sumber, fallback, model, alasan opsional, dan waktu.
+- `reviews/{answer_id}` — label tinjauan admin dan hasil evaluasi AI.
 - `settings/runtime` — mode pemeliharaan, pengumuman, batas pertanyaan harian,
-  serta hash sandi menu Pengaturan yang diatur admin.
+  batas harian tamu, katup darurat beserta waktu kedaluwarsa, serta hash sandi
+  menu Pengaturan yang diatur admin.
 - `system_health/errors` — maksimal 20 catatan kesalahan terakhir dalam satu
   dokumen.
 
@@ -186,6 +394,12 @@ tidak disimpan di Firestore.
 - `ADMIN_CODE_HASH` — hash kode admin, dengan format
   `pbkdf2_sha256$iterasi$salt$hex_digest` atau `scrypt$salt$hex_digest`.
   Jangan menyimpan kode admin dalam teks biasa di kode sumber atau repositori.
+- `ADMIN_SESSION_SECRET` — secret opsional khusus untuk menurunkan kunci sesi
+  admin; bila tidak diatur, `ENCRYPTION_KEY` digunakan dengan konteks HMAC
+  terpisah. Jangan gunakan `ADMIN_CODE_HASH` sebagai kunci tanda tangan.
+- `GUEST_CODE_HASH` — hash sandi mode tamu dengan format
+  `pbkdf2_sha256$iterasi$salt$hex_digest` atau `scrypt$salt$hex_digest`.
+  Kosongkan untuk menyembunyikan pilihan mode tamu.
 - `GOOGLE_API_KEY`, `GOOGLE_API_KEY_INDEX`, `GOOGLE_API_KEY_ADMIN` — seed key
   untuk kelompok chat, indexing, dan admin secara terpisah. Key dari satu
   kelompok tidak pernah dipinjam kelompok lain.
@@ -207,6 +421,8 @@ python -c 'import getpass, hashlib, secrets; p=getpass.getpass("Kode admin: ").e
 ```
 
 Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
+Untuk sandi mode tamu, gunakan perintah yang sama dengan prompt
+`Sandi mode tamu:` lalu simpan hasilnya sebagai `GUEST_CODE_HASH`.
 
 ## Keputusan desain
 
@@ -226,13 +442,13 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   tenggat 10 detik dan tidak menahan pekerja antrean saat operasi melampaui
   tenggat.
 - Setiap pertanyaan mengantrekan satu transaksi `@firestore.transactional`
-  untuk membaca dan memperbarui chunk serta dokumen pengguna. Retry antrean
-  membuat objek transaksi baru; transaksi tidak dibagikan antar-thread.
-  UID yang belum terkonfirmasi tidak dipakai untuk membaca atau menulis riwayat.
-  Transaksi pertama menyimpan pertanyaan juga membuat dokumen pengguna,
-  menaikkan `stats/global.total_devices` jika dokumen belum ada, dan mencatat
-  UID ter-hash pada `stats/hourly_YYYYMMDDHH`. Pembukaan halaman saja tidak
-  membuat dokumen statistik atau pengguna.
+  untuk membaca dan memperbarui chunk serta dokumen pengguna yang sudah ada.
+  Retry antrean membuat objek transaksi baru; transaksi tidak dibagikan
+  antar-thread. UID yang belum terkonfirmasi tidak dipakai untuk membaca atau
+  menulis riwayat. Profil baru dibuat oleh transaksi simpan nama yang menaikkan
+  `stats/global.total_devices` hanya jika dokumen belum ada. Transaksi
+  pertanyaan mencatat UID ter-hash pada `stats/hourly_YYYYMMDDHH`; pembukaan
+  halaman saja tidak membuat dokumen statistik atau pengguna.
   Penulisan `stats/daily.questions` dan FAQ terpisah (FAQ hanya jika pertanyaan
   hasil normalisasi tidak kosong).
   Menu Kesehatan sistem menampilkan `writes_ok`, `writes_failed`,
@@ -268,6 +484,10 @@ Pilih kode admin yang panjang dan unik, bukan kode angka pendek.
   menit. Hitungan global diatur ulang setelah login berhasil, sedangkan hitungan
   UID lain tetap tersimpan. Status ini bertahan setelah halaman dimuat ulang, tetapi tidak
   setelah proses dimulai ulang dan tidak dibagikan antarproses.
+- Login kode tamu memakai kunci session/UID/global 5 kali/15 menit yang terpisah
+  dari penghitung login admin. Guest tidak menyentuh data profil/riwayat; satu-
+  satunya tulis Firestore yang diizinkan adalah increment `guest_questions`
+  pada statistik harian.
 - Admin cukup mengetik sandi menu Pengaturan di dasbor; aplikasi membuat
   hash PBKDF2 sebelum menyimpannya. Hash konfigurasi aktif diprioritaskan
   daripada `SETTINGS_PASSWORD` lama. Pengguna biasa tetap harus memasukkan

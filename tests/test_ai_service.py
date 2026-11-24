@@ -1,5 +1,7 @@
 from collections.abc import Callable
+import hashlib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from langchain_community.vectorstores import FAISS
@@ -27,11 +29,13 @@ from services.ai_service import (
     _make_embedding_batches,
     _to_langchain_documents,
     answer_question,
+    evaluate_answer_samples,
     is_embedding_daily_quota_error,
     is_embedding_quota_error,
     transcribe_audio,
     update_search_index,
 )
+from services import ai_service
 from services.gdrive_service import DriveDocument
 
 
@@ -41,6 +45,94 @@ class _DeterministicEmbeddings(Embeddings):
 
     def embed_query(self, text: str) -> list[float]:
         return [float(len(text)), float(sum(map(ord, text)) % 997)]
+
+
+class ChatModelDiscoveryTests(unittest.TestCase):
+    def test_background_model_discovery_returns_fallback_without_network_wait(self):
+        api_key = "background-model-test-key"
+        cache_key = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        with ai_service._CHAT_MODEL_CACHE_LOCK:
+            ai_service._CHAT_MODEL_CACHE.pop(cache_key, None)
+            ai_service._CHAT_MODEL_REFRESHING.discard(cache_key)
+        try:
+            with (
+                patch("services.ai_service.threading.Thread") as thread,
+                patch("services.ai_service.genai.Client") as client_factory,
+            ):
+                initial_models = ai_service.get_available_chat_models(
+                    api_key,
+                    background=True,
+                )
+                self.assertTrue(initial_models)
+                client_factory.assert_not_called()
+
+                fake_client = Mock()
+                fake_client.models.list.return_value = [
+                    SimpleNamespace(
+                        supported_actions=["generateContent"],
+                        name="models/gemini-test-flash",
+                    )
+                ]
+                client_factory.return_value = fake_client
+                worker = thread.call_args.kwargs
+                worker["target"](*worker["args"])
+
+                refreshed_models = ai_service.get_available_chat_models(
+                    api_key,
+                    background=True,
+                )
+                self.assertIn("gemini-test-flash", refreshed_models)
+                client_factory.assert_called_once_with(api_key=api_key)
+        finally:
+            with ai_service._CHAT_MODEL_CACHE_LOCK:
+                ai_service._CHAT_MODEL_CACHE.pop(cache_key, None)
+                ai_service._CHAT_MODEL_REFRESHING.discard(cache_key)
+
+    def test_answer_metadata_reports_latency_and_empty_sources(self):
+        captured = []
+
+        answer, sources = answer_question(
+            None,
+            "Pertanyaan tanpa indeks",
+            api_key="test-key",
+            on_metadata=captured.append,
+        )
+
+        self.assertIn("belum menemukan", answer)
+        self.assertEqual(sources, [])
+        self.assertEqual(len(captured), 1)
+        self.assertGreaterEqual(captured[0]["latency_ms"], 0)
+        self.assertEqual(captured[0]["source_count"], 0)
+        self.assertFalse(captured[0]["fallback"])
+        self.assertIsNone(captured[0]["model_used"])
+
+    def test_quality_evaluator_accepts_only_requested_valid_labels(self):
+        samples = [
+            {
+                "answer_id": "a" * 32,
+                "question": "Question",
+                "answer": "Answer",
+                "sources": [{"name": "Kitab", "excerpt": "Petikan"}],
+            }
+        ]
+        ai_result = '[{"answer_id":"' + ("a" * 32) + '","label":"Sesuai","rationale":"Didukung."}]'
+        with patch(
+            "services.ai_service._generate_with_failover",
+            return_value=(ai_result, "gemini-test"),
+        ) as generate:
+            result = evaluate_answer_samples(samples, ["admin-key"])
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "answer_id": "a" * 32,
+                    "label": "Sesuai",
+                    "rationale": "Didukung.",
+                }
+            ],
+        )
+        self.assertEqual(generate.call_count, 1)
 
 
 class UpdateSearchIndexTests(unittest.TestCase):

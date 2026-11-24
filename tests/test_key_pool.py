@@ -103,9 +103,36 @@ class KeyPoolTests(unittest.TestCase):
         self.assertNotIn("admin-secret-123456789", repr(added))
 
         key_pool.invalidate_cache("admin")
-        loaded = key_pool.get_keys("admin", self.client, self.secrets)
+        loaded = key_pool.get_keys("admin", self.client, self.secrets, admin=True)
         self.assertEqual(loaded[0].key, "admin-secret-123456789")
         self.assertEqual(key_pool.mask_key(loaded[0].key), "admi…6789")
+
+    def test_user_key_and_model_order_reads_are_nonblocking(self):
+        with patch("services.key_pool.threading.Thread") as thread:
+            keys = key_pool.get_keys("chat", self.client, self.secrets)
+            self.assertEqual([item.key for item in keys], ["chat-secret-key"])
+            self.assertEqual(self.client.timeouts, [])
+            thread.assert_called_once()
+            worker = thread.call_args.kwargs
+            worker["target"](*worker["args"])
+            self.assertEqual(
+                [item.key for item in key_pool.get_keys("chat", self.client, self.secrets)],
+                ["chat-secret-key"],
+            )
+
+        key_pool.invalidate_cache()
+        self.client.timeouts.clear()
+        with patch("services.key_pool.threading.Thread") as thread:
+            order = key_pool.get_model_order(self.client, self.secrets)
+            self.assertEqual(order["mode"], "automatic")
+            self.assertEqual(self.client.timeouts, [])
+            thread.assert_called_once()
+            worker = thread.call_args.kwargs
+            worker["target"](*worker["args"])
+            self.assertEqual(
+                key_pool.get_model_order(self.client, self.secrets)["mode"],
+                "automatic",
+            )
 
     def test_daily_model_quota_cools_only_that_model_and_uses_pacific_reset(self):
         key_pool.get_keys("chat", None, self.secrets)

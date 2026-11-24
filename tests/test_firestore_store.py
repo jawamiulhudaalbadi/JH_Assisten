@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import threading
@@ -17,14 +18,19 @@ from services.firestore_store import (
     _transaction_snapshot,
     _upsert_saved_chat,
     _write_question_pair,
+    _write_daily_questions,
     append_message_pair,
     delete_empty_users_and_recount,
     firestore_status,
     firestore_write_health,
     enqueue_question_answer,
+    enqueue_guest_question,
     get_empty_user_uids,
+    get_admin_users,
     get_runtime_config,
     load_chat_history,
+    _save_user_name,
+    submit_answer_feedback,
     reset_firestore_circuit,
     save_settings_password_hash,
     update_runtime_config,
@@ -151,6 +157,8 @@ class _FakeTransaction:
         self.client.persisted.extend(self.writes)
         for path, _data, _merge in self.writes:
             if path.startswith("users/") and path.count("/") == 1:
+                self.client.created_documents.add(path)
+            if path.startswith("feedback/"):
                 self.client.created_documents.add(path)
 
     def abort(self):
@@ -713,39 +721,147 @@ class FirestoreStoreTests(unittest.TestCase):
         self.assertEqual(client.persisted[-1][1], {"maintenance": True})
         self.assertEqual(client.batches[-1].timeout, 10.0)
 
-    def test_first_saved_question_lazily_creates_user_and_device_stats(self) -> None:
+    def test_guest_daily_write_contains_only_guest_counter(self) -> None:
+        client = _FakeClient()
+        _write_daily_questions(
+            client,
+            time.monotonic() + 10,
+            "",
+            "",
+            _now(),
+            guest=True,
+        )
+
+        self.assertEqual(len(client.persisted), 1)
+        path, fields, merge = client.persisted[0]
+        self.assertRegex(path, r"^stats/daily_\d{8}$")
+        self.assertEqual(set(fields), {"guest_questions"})
+        self.assertEqual(fields["guest_questions"].value, 1)
+        self.assertTrue(merge)
+        self.assertEqual(client.read_paths, [])
+
+    def test_guest_enqueue_uses_only_existing_daily_write_kind(self) -> None:
+        client = object()
+        with patch.object(firestore_store, "_enqueue_write") as enqueue:
+            enqueue_guest_question(client)
+
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.args[:2], (client, "daily_questions"))
+        self.assertIs(enqueue.call_args.args[2], _write_daily_questions)
+        self.assertEqual(enqueue.call_args.args[3:5], ("", ""))
+        self.assertTrue(enqueue.call_args.args[-1])
+
+    def test_expired_guest_emergency_is_ignored(self) -> None:
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        with patch.dict(
+            firestore_store._RUNTIME_CONFIG,
+            {
+                "guest_emergency_enabled": True,
+                "guest_emergency_expires_at": expired,
+            },
+        ):
+            runtime = firestore_store.get_runtime_config(None)
+
+        self.assertFalse(runtime["guest_emergency_enabled"])
+
+    def test_guest_emergency_cannot_be_saved_past_six_hours(self) -> None:
+        client = _FakeClient()
+        too_late = (
+            datetime.now(timezone.utc) + timedelta(hours=6, seconds=1)
+        ).isoformat()
+
+        with self.assertRaisesRegex(ValueError, "maksimal 6 jam"):
+            update_runtime_config(
+                client,
+                guest_emergency_enabled=True,
+                guest_emergency_expires_at=too_late,
+            )
+
+        self.assertEqual(client.persisted, [])
+
+    def test_question_write_requires_user_profile_to_exist(self) -> None:
         client = _FakeClient()
         uid = "0123456789abcdef"
         with patch(
             "google.cloud.firestore.transactional",
             side_effect=_fake_transactional,
         ):
-            _write_question_pair(
-                client,
-                time.monotonic() + 10,
-                uid,
-                "chat",
-                "Question",
-                "Answer",
-                [],
-                _now(),
-                True,
-            )
+            with self.assertRaises(firestore_store.ChatStoreError):
+                _write_question_pair(
+                    client,
+                    time.monotonic() + 10,
+                    uid,
+                    "chat",
+                    "Question",
+                    "Answer",
+                    [],
+                    _now(),
+                    True,
+                )
 
-        paths = [path for path, _data, _merge in client.persisted]
-        self.assertIn(f"users/{uid}", paths)
-        self.assertIn("stats/global", paths)
-        self.assertTrue(any(path.startswith("stats/hourly_") for path in paths))
-        global_write = next(
+        self.assertEqual(client.persisted, [])
+        self.assertNotIn(f"users/{uid}", client.created_documents)
+
+    def test_saving_new_profile_creates_user_and_counts_device_once(self) -> None:
+        client = _FakeClient()
+        uid = "0123456789abcdef"
+        with patch(
+            "google.cloud.firestore.transactional",
+            side_effect=_fake_transactional,
+        ):
+            _save_user_name(client, uid, "Éta Asep")
+            _save_user_name(client, uid, "Asep")
+
+        user_writes = [
+            data
+            for path, data, _merge in client.persisted
+            if path == f"users/{uid}"
+        ]
+        global_writes = [
             data for path, data, _merge in client.persisted if path == "stats/global"
-        )
-        self.assertEqual(global_write["total_devices"].value, 1)
+        ]
+        self.assertEqual(len(user_writes), 2)
+        self.assertEqual(user_writes[0]["name"], "Éta Asep")
+        self.assertEqual(user_writes[0]["name_lower"], "éta asep")
+        self.assertEqual(user_writes[0]["total_questions"], 0)
+        self.assertEqual(len(global_writes), 1)
+        self.assertEqual(global_writes[0]["total_devices"].value, 1)
+
+    def test_admin_user_rows_mark_duplicate_names_case_insensitively(self) -> None:
+        snapshots = [
+            SimpleNamespace(
+                id=uid,
+                to_dict=lambda name=name: {
+                    "name": name,
+                    "name_lower": name.casefold(),
+                },
+            )
+            for uid, name in (
+                ("0123456789abcdef", "Asep"),
+                ("abcdef0123456789", "ASEP"),
+                ("fedcba9876543210", ""),
+            )
+        ]
+        users_query = Mock()
+        users_query.limit.return_value = users_query
+        users_query.stream.return_value = iter(snapshots)
+        client = Mock()
+        client.collection.return_value = users_query
+
+        users = get_admin_users(client)
+
+        self.assertTrue(users[0]["duplicate_name"])
+        self.assertTrue(users[1]["duplicate_name"])
+        self.assertFalse(users[2]["duplicate_name"])
 
     def test_cookie_uid_restores_history_without_page_load_writes(self) -> None:
         uid = "abcdef0123456789"
         chat_id = "saved-chat"
         client = _FakeClient()
-        client.document_data[f"users/{uid}"] = {"total_messages": 2}
+        client.document_data[f"users/{uid}"] = {
+            "name": "Asep",
+            "total_messages": 2,
+        }
         chunk_path = f"users/{uid}/chats/{chat_id}/chunks"
         client.history_chunks[chunk_path] = [
             _FakeSnapshot(
@@ -771,13 +887,18 @@ class FirestoreStoreTests(unittest.TestCase):
             patch.object(device_identity, "st_javascript") as javascript,
         ):
             resolved_uid = device_identity.get_device_uid()
-            history, _stats = load_chat_history(client, resolved_uid, chat_id)
+            history, loaded_stats = load_chat_history(
+                client,
+                resolved_uid,
+                chat_id,
+            )
 
         self.assertEqual(resolved_uid, uid)
         self.assertEqual(
             [message["content"] for message in history],
             ["remembered question", "remembered answer"],
         )
+        self.assertEqual(loaded_stats["name"], "Asep")
         self.assertIn(f"users/{uid}", client.read_paths)
         self.assertEqual(client.persisted, [])
         self.assertNotIn(f"users/{uid}", client.created_documents)
@@ -856,6 +977,89 @@ class FirestoreStoreTests(unittest.TestCase):
         self.assertNotIn("stats/global", paths)
         self.assertTrue(any(path.startswith("stats/hourly_") for path in paths))
 
+    def test_quality_metrics_share_the_existing_question_chunk_write(self) -> None:
+        client = _FakeClient()
+        uid = "0123456789abcdef"
+        client.created_documents.add(f"users/{uid}")
+        with patch(
+            "google.cloud.firestore.transactional",
+            side_effect=_fake_transactional,
+        ):
+            _write_question_pair(
+                client,
+                time.monotonic() + 10,
+                uid,
+                "chat",
+                "Question",
+                "Answer",
+                [{"name": "Kitab"}],
+                _now(),
+                True,
+                "a" * 32,
+                {
+                    "latency_ms": 123,
+                    "source_count": 1,
+                    "top_score": 0.75,
+                    "fallback": True,
+                    "model_used": "gemini-test",
+                    "source_context": [
+                        {"name": "Kitab", "excerpt": "petikan"}
+                    ],
+                },
+                "gemini-test",
+            )
+
+        chunk_data = next(
+            data for path, data, _merge in client.persisted if "/chunks/" in path
+        )
+        answer = chunk_data["messages"][-1]
+        self.assertEqual(answer["answer_id"], "a" * 32)
+        self.assertEqual(answer["latency_ms"], 123)
+        self.assertEqual(answer["source_count"], 1)
+        self.assertEqual(answer["top_score"], 0.75)
+        self.assertTrue(answer["fallback"])
+        self.assertEqual(answer["model_used"], "gemini-test")
+        self.assertEqual(answer["source_context"][0]["excerpt"], "petikan")
+
+    def test_feedback_is_idempotent_and_updates_summary_once(self) -> None:
+        client = _FakeClient()
+        args = {
+            "uid": "0123456789abcdef",
+            "name": "Nami",
+            "chat_id": "chat",
+            "answer_id": "b" * 32,
+            "question": "Question",
+            "answer": "Answer",
+            "rating": "Cocog",
+            "reason": None,
+            "quality_metrics": {
+                "latency_ms": 200,
+                "source_count": 1,
+                "fallback": False,
+                "model_used": "gemini-test",
+            },
+            "sources": [{"name": "Kitab", "excerpt": "petikan"}],
+        }
+        with patch(
+            "google.cloud.firestore.transactional",
+            side_effect=_fake_transactional,
+        ):
+            self.assertTrue(submit_answer_feedback(client, **args))
+            self.assertFalse(submit_answer_feedback(client, **args))
+
+        feedback_writes = [
+            data for path, data, _merge in client.persisted
+            if path == f"feedback/{args['answer_id']}"
+        ]
+        summary_writes = [
+            data for path, data, _merge in client.persisted
+            if path == "stats/quality"
+        ]
+        self.assertEqual(len(feedback_writes), 1)
+        self.assertEqual(len(summary_writes), 1)
+        self.assertEqual(feedback_writes[0]["question"], "Question")
+        self.assertEqual(feedback_writes[0]["sources"][0]["excerpt"], "petikan")
+
     def test_empty_user_cleanup_preserves_history_and_recounts_devices(self) -> None:
         client = _CleanupClient()
 
@@ -873,6 +1077,7 @@ class FirestoreStoreTests(unittest.TestCase):
 
     def test_question_write_retries_once_and_persists_all_domains(self) -> None:
         client = _FakeClient()
+        client.created_documents.add("users/private-user-id")
         client.fail_pair_once = True
         with (
             patch(
@@ -942,6 +1147,7 @@ class FirestoreStoreTests(unittest.TestCase):
 
     def test_daily_stats_failure_does_not_cancel_chunk_write(self) -> None:
         client = _FakeClient()
+        client.created_documents.add("users/private-user-id")
         client.fail_daily = True
         with (
             patch(

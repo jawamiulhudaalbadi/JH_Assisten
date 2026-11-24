@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+import math
+from collections.abc import Mapping, Sequence
 import re
 import threading
 import time
@@ -18,6 +19,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from services.user_profile import validate_user_name
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGES_PER_CHUNK = 20
@@ -45,6 +47,9 @@ _RUNTIME_CONFIG_DEFAULTS: dict[str, Any] = {
     "maintenance": False,
     "announcement": "",
     "daily_question_limit": 0,
+    "guest_daily_question_limit": 10,
+    "guest_emergency_enabled": False,
+    "guest_emergency_expires_at": "",
     "settings_password_hash": "",
 }
 _RUNTIME_CONFIG: dict[str, Any] = dict(_RUNTIME_CONFIG_DEFAULTS)
@@ -138,6 +143,7 @@ def _now() -> datetime:
 
 def _empty_history() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return [], {
+        "name": "",
         "total_messages": 0,
         "total_chunks": 0,
         "active_chunk_count": 0,
@@ -145,6 +151,7 @@ def _empty_history() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "blocked": False,
         "day": "",
         "day_count": 0,
+        "daily_question_limit": 0,
     }
 
 
@@ -667,18 +674,35 @@ def get_admin_users(client: Any | None) -> list[dict[str, Any]]:
         deadline = time.monotonic() + FIRESTORE_READ_TIMEOUT_SECONDS
         snapshots = _snapshots(client.collection("users").limit(500), deadline)
         users = []
+        today_key = _now().strftime("%Y%m%d")
         for snapshot in snapshots:
             data = snapshot.to_dict() or {}
+            name = str(data.get("name", "") or "").strip()
             users.append(
                 {
                     "uid": snapshot.id,
                     "short_id": snapshot.id[:8],
+                    "name": name,
+                    "name_lower": str(
+                        data.get("name_lower", "") or name.casefold()
+                    ),
                     "total_questions": int(data.get("total_questions", 0)),
                     "day_count": int(data.get("day_count", 0)),
                     "day": str(data.get("day", "")),
                     "blocked": bool(data.get("blocked", False)),
+                    "first_seen": data.get("first_seen"),
                     "last_active": data.get("last_active"),
+                    "daily_question_limit": max(
+                        0, int(data.get("daily_question_limit", 0))
+                    ),
                 }
+            )
+        name_counts = Counter(
+            user["name_lower"] for user in users if user["name_lower"]
+        )
+        for user in users:
+            user["duplicate_name"] = bool(
+                user["name_lower"] and name_counts[user["name_lower"]] > 1
             )
         return sorted(users, key=lambda user: user["uid"])
 
@@ -822,8 +846,10 @@ def get_admin_user_chats(client: Any | None, uid: str) -> list[dict[str, str]]:
         active_chat_id = user_data.get("active_chat_id")
         if isinstance(active_chat_id, str) and active_chat_id:
             chat_ids.add(active_chat_id)
-        snapshots = _snapshots(user_ref.collection("chats").limit(100), deadline)
-        chat_ids.update(snapshot.id for snapshot in snapshots)
+        chat_ids.update(
+            item["chat_id"]
+            for item in _valid_saved_chats(user_data.get("saved_chats", []))
+        )
         return [
             {"chat_id": chat_id, "short_id": chat_id[:8]}
             for chat_id in sorted(chat_ids)
@@ -876,12 +902,15 @@ def get_admin_chat_history(
         query = keyword.casefold().strip()
         results: list[dict[str, str]] = []
         for selected_chat_id in chat_ids:
-            chunks = _snapshots(
-                chats_ref.document(selected_chat_id)
-                .collection("chunks")
-                .order_by("__name__"),
-                deadline,
-            )
+            chunks_query = chats_ref.document(selected_chat_id).collection("chunks")
+            if chat_id:
+                chunks_query = (
+                    chunks_query.select(["messages"])
+                    .order_by("__name__", direction="DESCENDING")
+                    .limit(2)
+                )
+            chunks = _snapshots(chunks_query, deadline)
+            chunks.sort(key=lambda item: _chunk_number(item.id))
             for chunk in chunks:
                 data = chunk.to_dict() or {}
                 for message in data.get("messages", []):
@@ -931,6 +960,474 @@ def get_admin_faq(client: Any | None) -> list[dict[str, Any]]:
     )
 
 
+def _quality_summary_snapshot(client: Any) -> dict[str, Any]:
+    return (
+        client.collection("stats")
+        .document("quality")
+        .get(timeout=FIRESTORE_READ_TIMEOUT_SECONDS, retry=None)
+        .to_dict()
+        or {}
+    )
+
+
+def get_answer_quality_summary(client: Any | None) -> dict[str, Any]:
+    """Read quality counters from the bounded summary document, never scan records."""
+    return _bounded_read(
+        client,
+        lambda: _quality_summary_snapshot(client),
+        context="pembacaan ringkasan kualitas jawaban",
+        fallback={},
+    )
+
+
+def submit_answer_feedback(
+    client: Any | None,
+    *,
+    uid: str,
+    name: str,
+    chat_id: str,
+    answer_id: str,
+    question: str,
+    answer: str,
+    rating: str,
+    reason: str | None,
+    quality_metrics: Mapping[str, Any],
+    sources: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Store one feedback record and update its aggregate in a single transaction."""
+    if client is None:
+        raise RuntimeError("Panyimpenan eupan balik teu sayogi.")
+    if (
+        not _DEVICE_UID_RE.fullmatch(uid)
+        or not _CHAT_ID_RE.fullmatch(chat_id)
+        or not re.fullmatch(r"[a-f0-9]{32}", answer_id)
+    ):
+        raise ValueError("ID eupan balik henteu valid.")
+    if rating not in {"Cocog", "Teu cocog"}:
+        raise ValueError("Peunteun eupan balik henteu valid.")
+    allowed_reasons = {"Kaluar tina kontéks", "Salah", "Teu lengkep"}
+    if reason is not None and (rating != "Teu cocog" or reason not in allowed_reasons):
+        raise ValueError("Alesan eupan balik henteu valid.")
+    try:
+        latency_ms = max(
+            0, min(600_000, int(quality_metrics.get("latency_ms", 0)))
+        )
+        source_count = max(
+            0, min(100, int(quality_metrics.get("source_count", len(sources))))
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Métrik kualitas jawaban henteu valid.") from error
+    fallback = bool(quality_metrics.get("fallback", False))
+    model_used = str(quality_metrics.get("model_used") or "")[:100]
+    source_rows = [
+        {
+            "name": str(item.get("name", "Dokumen"))[:100],
+            "excerpt": str(item.get("excerpt", ""))[:350],
+        }
+        for item in sources[:3]
+        if isinstance(item, Mapping)
+    ]
+    now = _now()
+    feedback_ref = client.collection("feedback").document(answer_id)
+    summary_ref = client.collection("stats").document("quality")
+    model_key = hashlib.sha256(model_used.casefold().encode("utf-8")).hexdigest()[:16]
+    is_positive = rating == "Cocog"
+    feedback = {
+        "answer_id": answer_id,
+        "uid": uid,
+        "name": str(name).strip()[:30],
+        "name_lower": str(name).strip().casefold()[:60],
+        "chat_id": chat_id,
+        "created_at": now,
+        "rating": rating,
+        "reason": reason,
+        "question": str(question)[:120],
+        "answer": str(answer)[:120],
+        "source_count": source_count,
+        "fallback": fallback,
+        "model_used": model_used,
+        "sources": source_rows,
+        "latency_ms": latency_ms,
+    }
+
+    try:
+        from google.cloud import firestore
+
+        @firestore.transactional
+        def persist(transaction: Any) -> bool:
+            existing = _transaction_snapshot(
+                transaction,
+                feedback_ref,
+                timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+            )
+            if existing.exists:
+                return False
+            summary_update: dict[str, Any] = {
+                "feedback_count": firestore.Increment(1),
+                "positive_count": firestore.Increment(1 if is_positive else 0),
+                "negative_count": firestore.Increment(0 if is_positive else 1),
+                "without_sources_count": firestore.Increment(
+                    1 if source_count == 0 else 0
+                ),
+                "fallback_count": firestore.Increment(1 if fallback else 0),
+                "latency_total_ms": firestore.Increment(latency_ms),
+                "latency_count": firestore.Increment(1),
+                "updated_at": now,
+            }
+            if model_used:
+                summary_update["models"] = {
+                    model_key: {
+                        "name": model_used,
+                        "feedback_count": firestore.Increment(1),
+                        "latency_total_ms": firestore.Increment(latency_ms),
+                        "latency_count": firestore.Increment(1),
+                    }
+                }
+            transaction.set(feedback_ref, feedback)
+            transaction.set(summary_ref, summary_update, merge=True)
+            return True
+
+        transaction = client.transaction()
+        return persist(transaction)
+    except Exception as error:
+        raise RuntimeError(
+            "Eupan balik teu hasil disimpen "
+            f"({type(error).__name__})."
+        ) from error
+
+
+def get_answer_quality_page(
+    client: Any | None,
+    *,
+    filter_type: str = "Sadayana",
+    filter_value: str = "",
+    start_after: Any | None = None,
+    page_size: int = 25,
+) -> dict[str, Any]:
+    """Read one projected page of answer feedback with one optional filter."""
+    if page_size < 1 or page_size > 25:
+        raise ValueError("Ukuran kaca eupan balik kudu 1 dugi 25.")
+
+    def read_page() -> dict[str, Any]:
+        deadline = time.monotonic() + FIRESTORE_READ_TIMEOUT_SECONDS
+        query = client.collection("feedback").select(
+            [
+                "answer_id",
+                "uid",
+                "name",
+                "name_lower",
+                "chat_id",
+                "created_at",
+                "rating",
+                "reason",
+                "question",
+                "answer",
+                "source_count",
+                "fallback",
+                "model_used",
+                "sources",
+                "latency_ms",
+            ]
+        )
+        filters = {
+            "Teu cocog": ("rating", "Teu cocog"),
+            "Tanpa sumber": ("source_count", 0),
+            "Fallback tanpa AI": ("fallback", True),
+        }
+        if filter_type in filters:
+            field_name, expected = filters[filter_type]
+            query = query.where(field_name, "==", expected)
+        elif filter_type == "Per model" and filter_value:
+            query = query.where("model_used", "==", filter_value)
+        elif filter_type == "Per nama" and filter_value:
+            normalized_name = filter_value.casefold().strip()
+            query = query.where("name_lower", ">=", normalized_name).where(
+                "name_lower", "<=", normalized_name + "\uf8ff"
+            )
+            query = query.order_by("name_lower").order_by("__name__")
+        else:
+            query = query.order_by("__name__", direction="DESCENDING")
+        query = query.limit(page_size)
+        if start_after is not None:
+            if filter_type == "Per nama" and isinstance(start_after, tuple):
+                name_lower, answer_id = start_after
+                cursor = {
+                    "name_lower": name_lower,
+                    "__name__": client.collection("feedback").document(answer_id),
+                }
+            else:
+                answer_id = (
+                    start_after[1]
+                    if isinstance(start_after, tuple)
+                    else start_after
+                )
+                cursor = {
+                    "__name__": client.collection("feedback").document(answer_id)
+                }
+            query = query.start_after(cursor)
+        snapshots = _snapshots(query, deadline)
+        rows = []
+        for snapshot in snapshots:
+            row = snapshot.to_dict() or {}
+            row["answer_id"] = str(row.get("answer_id") or snapshot.id)
+            rows.append(row)
+        return {
+            "items": rows,
+            "next_cursor": (
+                (
+                    (
+                        str((snapshots[-1].to_dict() or {}).get("name_lower", "")),
+                        str((snapshots[-1].to_dict() or {}).get("answer_id") or snapshots[-1].id),
+                    )
+                    if filter_type == "Per nama"
+                    else str(
+                        (snapshots[-1].to_dict() or {}).get("answer_id")
+                        or snapshots[-1].id
+                    )
+                )
+                if len(snapshots) == page_size
+                else None
+            ),
+        }
+
+    return _bounded_read(
+        client,
+        read_page,
+        context="pembacaan kaca kualitas jawaban",
+        fallback={"items": [], "next_cursor": None},
+    )
+
+
+def get_answer_reviews(
+    client: Any | None,
+    answer_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Fetch review labels for up to 25 answer IDs in a single query."""
+    clean_ids = [
+        value for value in dict.fromkeys(answer_ids[:25])
+        if re.fullmatch(r"[a-f0-9]{32}", value)
+    ]
+    if not clean_ids:
+        return {}
+
+    def read_reviews() -> dict[str, dict[str, Any]]:
+        query = (
+            client.collection("reviews")
+            .where("answer_id", "in", clean_ids)
+            .select(["answer_id", "label", "ai_label", "ai_rationale", "updated_at"])
+        )
+        return {
+            str(data["answer_id"]): data
+            for snapshot in _snapshots(
+                query, time.monotonic() + FIRESTORE_READ_TIMEOUT_SECONDS
+            )
+            if (data := snapshot.to_dict() or {}).get("answer_id")
+        }
+
+    return _bounded_read(
+        client,
+        read_reviews,
+        context="pembacaan label tinjauan kualitas",
+        fallback={},
+    )
+
+
+def save_answer_reviews(
+    client: Any | None,
+    reviews: Sequence[Mapping[str, Any]],
+) -> None:
+    """Write up to twenty human or AI review labels in one Firestore batch."""
+    if client is None:
+        raise RuntimeError("Panyimpenan tinjauan teu sayogi.")
+    if len(reviews) > 20:
+        raise ValueError("Maksimal 20 jawaban tiasa ditinjau sakaligus.")
+    valid_labels = {"Sesuai", "Kaluar kontéks", "Salah", "Perlu sumber"}
+    normalized_reviews: list[tuple[str, str | None, str | None, str]] = []
+    for review in reviews:
+        answer_id = str(review.get("answer_id", ""))
+        raw_label = review.get("label")
+        raw_ai_label = review.get("ai_label")
+        label = raw_label if isinstance(raw_label, str) else None
+        ai_label = raw_ai_label if isinstance(raw_ai_label, str) else None
+        if (
+            not re.fullmatch(r"[a-f0-9]{32}", answer_id)
+            or (label not in valid_labels and ai_label not in valid_labels)
+        ):
+            raise ValueError("Label tinjauan kualitas henteu valid.")
+        rationale = str(review.get("ai_rationale", ""))[:300]
+        normalized_reviews.append((answer_id, label, ai_label, rationale))
+    try:
+        batch = client.batch()
+        for answer_id, label, ai_label, rationale in normalized_reviews:
+            payload: dict[str, Any] = {
+                "answer_id": answer_id,
+                "updated_at": _now(),
+            }
+            if label in valid_labels:
+                payload["label"] = label
+            if ai_label in valid_labels:
+                payload["ai_label"] = ai_label
+                payload["ai_rationale"] = rationale
+            batch.set(
+                client.collection("reviews").document(answer_id),
+                payload,
+                merge=True,
+            )
+        batch.commit(timeout=FIRESTORE_ADMIN_TIMEOUT_SECONDS, retry=None)
+    except Exception as error:
+        raise RuntimeError(
+            "Label tinjauan teu hasil disimpen "
+            f"({type(error).__name__})."
+        ) from error
+
+
+def get_admin_user_page(
+    client: Any | None,
+    *,
+    name_query: str = "",
+    start_after: tuple[str, str] | None = None,
+    page_size: int = 25,
+) -> dict[str, Any]:
+    """Read a projected, paginated user page and detect duplicate names in one query."""
+    if page_size < 1 or page_size > 25:
+        raise ValueError("Ukuran kaca pangguna kudu 1 dugi 25.")
+
+    def read_page() -> dict[str, Any]:
+        deadline = time.monotonic() + FIRESTORE_READ_TIMEOUT_SECONDS
+        today_key = _now().strftime("%Y%m%d")
+        query = client.collection("users").select(
+            [
+                "name",
+                "name_lower",
+                "first_seen",
+                "last_active",
+                "total_questions",
+                "blocked",
+                "day_count",
+                "day",
+                "daily_question_limit",
+            ]
+        )
+        normalized_query = name_query.casefold().strip()
+        if normalized_query:
+            query = query.where("name_lower", ">=", normalized_query).where(
+                "name_lower", "<=", normalized_query + "\uf8ff"
+            )
+            query = query.order_by("name_lower").order_by("__name__")
+        else:
+            query = query.order_by("__name__")
+        query = query.limit(page_size)
+        if start_after is not None:
+            name_lower, uid = start_after
+            cursor = {"__name__": client.collection("users").document(uid)}
+            if normalized_query:
+                cursor["name_lower"] = name_lower
+            query = query.start_after(cursor)
+        snapshots = _snapshots(query, deadline)
+        names = list(
+            dict.fromkeys(
+                str((snapshot.to_dict() or {}).get("name_lower", "")).casefold()
+                for snapshot in snapshots
+                if (snapshot.to_dict() or {}).get("name_lower")
+            )
+        )
+        duplicate_names: set[str] = set()
+        if names:
+            duplicate_query = (
+                client.collection("users")
+                .where("name_lower", "in", names[:25])
+                .select(["name_lower"])
+                .limit(100)
+            )
+            counts = Counter(
+                str((snapshot.to_dict() or {}).get("name_lower", "")).casefold()
+                for snapshot in _snapshots(duplicate_query, deadline)
+            )
+            duplicate_names = {
+                name for name, count in counts.items() if count > 1
+            }
+        users = []
+        for snapshot in snapshots:
+            data = snapshot.to_dict() or {}
+            try:
+                day_count = max(0, int(data.get("day_count", 0)))
+                question_count = max(0, int(data.get("total_questions", 0)))
+                daily_limit = max(0, int(data.get("daily_question_limit", 0)))
+            except (TypeError, ValueError, OverflowError):
+                day_count = question_count = daily_limit = 0
+            name_lower = str(data.get("name_lower", "")).casefold()
+            day = str(data.get("day", ""))
+            users.append(
+                {
+                    "uid": snapshot.id,
+                    "short_id": snapshot.id[:6],
+                    "name": str(data.get("name", "") or ""),
+                    "first_seen": data.get("first_seen"),
+                    "last_active": data.get("last_active"),
+                    "total_questions": question_count,
+                    "day_count": day_count,
+                    "day": day,
+                    "blocked": bool(data.get("blocked", False)),
+                    "daily_question_limit": daily_limit,
+                    "duplicate_name": name_lower in duplicate_names,
+                    "no_questions": question_count == 0,
+                    "question_spike": day == today_key and day_count >= 20,
+                }
+            )
+        return {
+            "items": users,
+            "next_cursor": (
+                (
+                    (
+                        str((snapshots[-1].to_dict() or {}).get("name_lower", "")).casefold()
+                        if normalized_query
+                        else ""
+                    ),
+                    snapshots[-1].id,
+                )
+                if len(snapshots) == page_size
+                else None
+            ),
+        }
+
+    return _bounded_read(
+        client,
+        read_page,
+        context="pembacaan kaca pangguna admin",
+        fallback={"items": [], "next_cursor": None},
+    )
+
+
+def update_admin_user_policy(
+    client: Any | None,
+    uid: str,
+    *,
+    blocked: bool,
+    daily_question_limit: int,
+) -> None:
+    """Update a single user's block and daily-limit fields with one write."""
+    if client is None:
+        raise RuntimeError("Firestore teu sayogi pikeun ngarobah kawijakan pangguna.")
+    if not _DEVICE_UID_RE.fullmatch(uid):
+        raise ValueError("ID pangguna henteu valid.")
+    if isinstance(daily_question_limit, bool) or not 0 <= daily_question_limit <= 10_000:
+        raise ValueError("Batas harian kudu 0 dugi 10.000.")
+    try:
+        client.collection("users").document(uid).set(
+            {
+                "blocked": bool(blocked),
+                "daily_question_limit": daily_question_limit,
+            },
+            merge=True,
+            timeout=FIRESTORE_ADMIN_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "Kawijakan pangguna teu hasil disimpen "
+            f"({type(error).__name__})."
+        ) from error
+
+
 def get_runtime_config(client: Any | None) -> dict[str, Any]:
     """Return cached settings immediately and refresh stale data in the background."""
     global _RUNTIME_CONFIG_LAST_ATTEMPT_AT, _RUNTIME_CONFIG_REFRESH_ID
@@ -970,6 +1467,25 @@ def get_runtime_config(client: Any | None) -> dict[str, Any]:
         )
         timer.daemon = True
         timer.start()
+    emergency_enabled = bool(cached.get("guest_emergency_enabled", False))
+    emergency_expires_at = str(
+        cached.get("guest_emergency_expires_at", "") or ""
+    )
+    if emergency_enabled:
+        try:
+            expires_at = datetime.fromisoformat(emergency_expires_at)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            if (
+                expires_at <= now_utc
+                or expires_at > now_utc + timedelta(hours=6)
+            ):
+                emergency_enabled = False
+        except ValueError:
+            emergency_enabled = False
+    cached["guest_emergency_enabled"] = emergency_enabled
+    cached["guest_emergency_expires_at"] = emergency_expires_at
     return cached
 
 
@@ -1032,10 +1548,24 @@ def _finish_runtime_config_refresh(
         )
     except (TypeError, ValueError):
         daily_question_limit = 0
+    try:
+        guest_daily_question_limit = max(
+            1, min(10_000, int(loaded.get("guest_daily_question_limit", 10)))
+        )
+    except (TypeError, ValueError):
+        guest_daily_question_limit = 10
+    guest_emergency_expires_at = str(
+        loaded.get("guest_emergency_expires_at", "") or ""
+    )[:64]
     sanitized = {
         "maintenance": bool(loaded.get("maintenance", False)),
         "announcement": str(loaded.get("announcement", ""))[:1000],
         "daily_question_limit": daily_question_limit,
+        "guest_daily_question_limit": guest_daily_question_limit,
+        "guest_emergency_enabled": bool(
+            loaded.get("guest_emergency_enabled", False)
+        ),
+        "guest_emergency_expires_at": guest_emergency_expires_at,
         "settings_password_hash": str(
             loaded.get("settings_password_hash", "")
         ),
@@ -1054,7 +1584,14 @@ def _finish_runtime_config_refresh(
 
 def update_runtime_config(client: Any | None, **updates: Any) -> None:
     global _RUNTIME_CONFIG_LOADED_AT, _RUNTIME_CONFIG_VERSION
-    allowed = {"maintenance", "announcement", "daily_question_limit"}
+    allowed = {
+        "maintenance",
+        "announcement",
+        "daily_question_limit",
+        "guest_daily_question_limit",
+        "guest_emergency_enabled",
+        "guest_emergency_expires_at",
+    }
     sanitized = {key: value for key, value in updates.items() if key in allowed}
     if "announcement" in sanitized:
         sanitized["announcement"] = str(sanitized["announcement"])[:1000]
@@ -1062,6 +1599,36 @@ def update_runtime_config(client: Any | None, **updates: Any) -> None:
         sanitized["daily_question_limit"] = max(
             0, int(sanitized["daily_question_limit"])
         )
+    if "guest_daily_question_limit" in sanitized:
+        limit = int(sanitized["guest_daily_question_limit"])
+        if isinstance(sanitized["guest_daily_question_limit"], bool) or not (
+            1 <= limit <= 10_000
+        ):
+            raise ValueError("Batas tamu kudu 1 dugi 10.000.")
+        sanitized["guest_daily_question_limit"] = limit
+    if "guest_emergency_enabled" in sanitized:
+        sanitized["guest_emergency_enabled"] = bool(
+            sanitized["guest_emergency_enabled"]
+        )
+    if "guest_emergency_expires_at" in sanitized:
+        expires_at = str(sanitized["guest_emergency_expires_at"] or "")
+        if expires_at:
+            try:
+                parsed_expiry = datetime.fromisoformat(expires_at)
+            except ValueError as error:
+                raise ValueError("Waktu kedaluwarsa mode tamu tidak valid.") from error
+            if parsed_expiry.tzinfo is None:
+                parsed_expiry = parsed_expiry.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            if (
+                "guest_emergency_enabled" in sanitized
+                and sanitized["guest_emergency_enabled"]
+                and not (
+                    now_utc < parsed_expiry <= now_utc + timedelta(hours=6)
+                )
+            ):
+                raise ValueError("Katup darurat hanya boleh aktif maksimal 6 jam.")
+        sanitized["guest_emergency_expires_at"] = expires_at[:64]
     if client is None:
         raise RuntimeError("Firestore tidak tersedia untuk menyimpan kontrol admin.")
     try:
@@ -1294,6 +1861,7 @@ def load_chat_history(
                 )
         active_chunk = recent_chunks[-1].to_dict() or {} if recent_chunks else {}
         return messages[-30:], {
+            "name": str(user_data.get("name", "")),
             "total_messages": int(user_data.get("total_messages", 0)),
             "total_chunks": int(user_data.get("total_chunks", 0)),
             "active_chunk_count": int(active_chunk.get("count", 0)),
@@ -1303,6 +1871,9 @@ def load_chat_history(
             "blocked": bool(user_data.get("blocked", False)),
             "day": str(user_data.get("day", "")),
             "day_count": int(user_data.get("day_count", 0)),
+            "daily_question_limit": max(
+                0, int(user_data.get("daily_question_limit", 0))
+            ),
         }
 
     return _bounded_read(
@@ -1426,6 +1997,58 @@ def get_saved_chats(client: Any | None, uid: str) -> list[dict[str, str]]:
     if result is failed:
         raise ChatStoreError("Daftar chat simpan tidak berhasil dimuat.")
     return result
+
+
+def save_user_name(client: Any | None, uid: str, name: str) -> None:
+    """Create the user's profile on deliberate submission, or update its name."""
+    if not _DEVICE_UID_RE.fullmatch(uid):
+        raise ValueError("ID perangkat henteu valid.")
+    clean_name = validate_user_name(name)
+    _run_chat_mutation(
+        client,
+        _save_user_name,
+        uid,
+        clean_name,
+        context="nyimpen nami pangguna",
+    )
+
+
+def _save_user_name(client: Any, uid: str, name: str) -> None:
+    from google.cloud import firestore
+
+    user_ref = client.collection("users").document(uid)
+    now = _now()
+
+    @firestore.transactional
+    def save_profile(transaction: Any) -> None:
+        user_snapshot = _transaction_snapshot(
+            transaction,
+            user_ref,
+            timeout=FIRESTORE_READ_TIMEOUT_SECONDS,
+        )
+        user_fields: dict[str, Any] = {
+            "name": name,
+            "name_lower": name.casefold(),
+        }
+        if not user_snapshot.exists:
+            user_fields.update(
+                {
+                    "first_seen": now,
+                    "total_questions": 0,
+                    "total_messages": 0,
+                    "total_chunks": 0,
+                    "blocked": False,
+                }
+            )
+        transaction.set(user_ref, user_fields, merge=True)
+        if not user_snapshot.exists:
+            transaction.set(
+                client.collection("stats").document("global"),
+                {"total_devices": firestore.Increment(1)},
+                merge=True,
+            )
+
+    save_profile(client.transaction())
 
 
 def save_named_chat(
@@ -1642,6 +2265,9 @@ def enqueue_question_answer(
     sources: list[dict[str, Any]],
     *,
     count_for_daily_limit: bool = True,
+    answer_id: str | None = None,
+    quality_metrics: Mapping[str, Any] | None = None,
+    model_used: str | None = None,
 ) -> None:
     """Queue history and each independent question summary write."""
     if client is None:
@@ -1658,6 +2284,9 @@ def enqueue_question_answer(
         sources,
         now,
         count_for_daily_limit,
+        answer_id,
+        quality_metrics,
+        model_used,
     )
     _enqueue_write(
         client,
@@ -1679,6 +2308,21 @@ def enqueue_question_answer(
         )
 
 
+def enqueue_guest_question(client: Any | None) -> None:
+    """Queue only the permitted guest counter update in the daily stats document."""
+    if client is None:
+        return
+    _enqueue_write(
+        client,
+        "daily_questions",
+        _write_daily_questions,
+        "",
+        "",
+        _now(),
+        True,
+    )
+
+
 def _write_question_pair(
     client: Any,
     deadline: float,
@@ -1689,6 +2333,9 @@ def _write_question_pair(
     sources: list[dict[str, Any]],
     now: datetime,
     count_for_daily_limit: bool,
+    answer_id: str | None = None,
+    quality_metrics: Mapping[str, Any] | None = None,
+    model_used: str | None = None,
 ) -> None:
     from google.cloud import firestore
 
@@ -1702,6 +2349,10 @@ def _write_question_pair(
             user_ref,
             timeout=_remaining_timeout(deadline, FIRESTORE_READ_TIMEOUT_SECONDS),
         )
+        if not user_snapshot.exists:
+            raise ChatStoreError(
+                "Profil kedah disimpen heula sateuacan nyimpen paguneman."
+            )
         latest_chunks = list(
             transaction.get(
                 chunks_ref.order_by(
@@ -1733,9 +2384,46 @@ def _write_question_pair(
             "role": "assistant",
             "content": answer_text,
             "timestamp": now,
-            "model_used": None,
+            "model_used": str(
+                model_used or (quality_metrics or {}).get("model_used") or ""
+            )[:100]
+            or None,
             "sources": sources,
         }
+        if isinstance(answer_id, str) and re.fullmatch(r"[a-f0-9]{32}", answer_id):
+            answer["answer_id"] = answer_id
+        if quality_metrics is not None:
+            try:
+                latency_ms = int(quality_metrics.get("latency_ms", 0))
+            except (TypeError, ValueError, OverflowError):
+                latency_ms = 0
+            try:
+                source_count = int(
+                    quality_metrics.get("source_count", len(sources))
+                )
+            except (TypeError, ValueError, OverflowError):
+                source_count = len(sources)
+            answer["latency_ms"] = max(0, min(600_000, latency_ms))
+            answer["source_count"] = max(0, min(100, source_count))
+            top_score = quality_metrics.get("top_score")
+            answer["top_score"] = (
+                float(top_score)
+                if isinstance(top_score, (int, float))
+                and not isinstance(top_score, bool)
+                and math.isfinite(float(top_score))
+                else None
+            )
+            answer["fallback"] = bool(quality_metrics.get("fallback", False))
+            raw_context = quality_metrics.get("source_context", [])
+            if isinstance(raw_context, list):
+                answer["source_context"] = [
+                    {
+                        "name": str(item.get("name", "Dokumen"))[:100],
+                        "excerpt": str(item.get("excerpt", ""))[:350],
+                    }
+                    for item in raw_context[:3]
+                    if isinstance(item, Mapping)
+                ]
         next_messages, needs_new_chunk = append_message_pair(
             current_messages, question, answer
         )
@@ -1767,20 +2455,11 @@ def _write_question_pair(
                     ),
                 }
             )
-        if not user_snapshot.exists:
-            user_fields.update({"first_seen": now, "blocked": False})
-
         transaction.set(
             chunk_ref,
             {"messages": next_messages, "count": len(next_messages)},
         )
         transaction.set(user_ref, user_fields, merge=True)
-        if not user_snapshot.exists:
-            transaction.set(
-                client.collection("stats").document("global"),
-                {"total_devices": firestore.Increment(1)},
-                merge=True,
-            )
         hashed_uid = _stats_uid(uid)
         hour_key = now.strftime("%Y%m%d%H")
         transaction.set(
@@ -1801,16 +2480,22 @@ def _write_daily_questions(
     question_text: str,
     stats_uid: str,
     now: datetime,
+    guest: bool = False,
 ) -> None:
     from google.cloud import firestore
 
     batch = client.batch()
-    batch.set(
-        client.collection("stats").document(f"daily_{now:%Y%m%d}"),
-        {
+    daily_fields = (
+        {"guest_questions": firestore.Increment(1)}
+        if guest
+        else {
             "questions": firestore.Increment(1),
             "uids": firestore.ArrayUnion([stats_uid]),
-        },
+        }
+    )
+    batch.set(
+        client.collection("stats").document(f"daily_{now:%Y%m%d}"),
+        daily_fields,
         merge=True,
     )
     batch.commit(

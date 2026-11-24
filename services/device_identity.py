@@ -141,6 +141,12 @@ def _record_browser_result(value: object) -> str:
 
 def get_device_uid(*, polling: bool = False) -> str:
     """Resolve the URL, request cookie, or browser storage UID in that order."""
+    if st.session_state.get("_device_uid_browser_resolved"):
+        session_uid = st.session_state.get("device_uid")
+        if _is_valid_uid(session_uid):
+            return session_uid
+        st.session_state.pop("_device_uid_browser_resolved", None)
+
     key_suffix = "_poll" if polling else ""
     requested_uid = st.query_params.get("uid")
     st.query_params.pop("uid", None)
@@ -153,11 +159,6 @@ def get_device_uid(*, polling: bool = False) -> str:
         _record_diagnostic(source="cookie")
         return _resolve_uid(cookie_uid)
 
-    if st.session_state.get("_device_uid_browser_resolved"):
-        session_uid = st.session_state.get("device_uid")
-        if _is_valid_uid(session_uid):
-            return session_uid
-        st.session_state.pop("_device_uid_browser_resolved", None)
     browser_result = st_javascript(
         _READ_UID_SCRIPT,
         key=f"read_device_uid{key_suffix}",
@@ -178,7 +179,7 @@ def get_device_uid(*, polling: bool = False) -> str:
         if created_status == "found":
             created_uid = created_result.get("uid")
             if _is_valid_uid(created_uid):
-                _record_diagnostic(source="localStorage")
+                _record_diagnostic(source="baru")
                 return _resolve_uid(created_uid)
             _record_diagnostic(status="error")
 
