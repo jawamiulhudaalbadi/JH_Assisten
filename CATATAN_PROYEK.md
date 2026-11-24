@@ -165,6 +165,48 @@
   keadaan identitas/nama dan bahwa sesi tamu tidak membaca Firestore. Uji
   deployment dan tampilan browser tetap perlu dilakukan manual.
 
+## Fase 4D — perbaikan sesi admin permanen & statistik guest
+
+- **Sesi admin permanen per perangkat:** tombol **Keluar** di dashboard admin
+  sekarang hanya menyembunyikan dashboard (`admin_authenticated = False`) tanpa
+  menghapus token sesi di cookie/localStorage (`jh_adm`). Token TTL 30 hari
+  tetap tersimpan sehingga saat reload atau masuk ulang ke mode admin, pengguna
+  langsung terautentikasi tanpa diminta sandi ulang. Hanya **Cabut semua sesi
+  admin** (increment epoch di `config/admin_session`) yang benar-benar mencabut
+  token di semua perangkat.
+- **Tampilkan nama pengguna di header:** nama pengguna aktif ditampilkan di
+  bagian paling atas menu utama (di bawah judul aplikasi) setelah ID final dan
+  nama disimpan.
+- **Statistik guest terpisah di dashboard:** menu **Statistik** sekarang
+  menampilkan dua kolom terpisah per hari — **Pertanyaan pengguna** (dari field
+  `questions`) dan **Pertanyaan tamu** (dari field `guest_questions` di
+  `stats/daily_YYYYMMDD`). `total_devices` tetap hanya menghitung pengguna
+  terdaftar (yang memiliki nama), tidak termasuk sesi guest.
+- **Pembersihan pengguna tanpa nama:** fungsi `get_users_without_name()` dan
+  `delete_users_without_name_and_recount()` sekarang menargetkan **semua dokumen
+  pengguna tanpa nama** (kosong/null/whitespace), bukan hanya yang
+  `total_questions == 0`. Setelah hapus, `total_devices` dihitung ulang dari
+  dokumen pengguna yang tersisa (yang memiliki nama asli). UI dashboard
+  menampilkan preview kandidat sebelum hapus.
+- **Perbarui unit test:** tambah test untuk verifikasi token persist setelah
+  logout, revoke mencabut token, dan statistik guest dibaca dengan benar.
+
+### Cara tes manual Fase 4D
+
+1. **Sesi admin permanen:** login admin via `/admin <kode>` atau tombol Admin
+   3x, reload halaman → dashboard terbuka otomatis. Klik **Keluar** → dashboard
+   tertutup. Masuk mode admin lagi (klik Admin 3x atau `/admin`) → **langsung
+   masuk tanpa sandi**. Tutup browser, buka lagi → **langsung masuk**. Gunakan
+   **Cabut semua sesi admin** dari perangkat lain → token tidak valid, minta
+   sandi ulang.
+2. **Tampil nama di header:** simpan nama pengguna, periksa header paling atas
+   menampilkan "Pengguna: {nama}".
+3. **Statistik guest:** masuk mode guest (via sandi atau emergency valve),
+   ajukan beberapa pertanyaan, buka Dashboard Admin → Statistik. Verifikasi
+   tabel harian menampilkan kolom "Pertanyaan tamu" > 0, "Total perangkat
+   (terdaftar)" tidak berubah, dan "Pertanyaan pengguna" terpisah dari
+   "Pertanyaan tamu".
+
 ### Cara tes manual Fase 4A
 
 1. Pada browser uji, buka aplikasi dengan `?debug=1`. Dengan cookie `jh_uid`
@@ -306,7 +348,9 @@ tidak disimpan di Firestore.
 
 - `app.py` — login admin sebelum jalur percakapan, gerbang ID/nama, mode tamu
   berkode, hitungan sesi, banner privasi, polling UID berbatas waktu, lencana
-  diagnostik/performa, cache riwayat, serta kontrol sinkronisasi Drive.
+  diagnostik/performa, cache riwayat, kontrol sinkronisasi Drive, **tampilkan
+  nama pengguna di header, sesi admin permanen per perangkat (logout tidak hapus
+  token)**.
 - `services/device_identity.py` — prioritas UID URL/cookie, pembacaan browser
   yang tidak menganggap respons kosong sebagai nilai tersimpan, skrip JavaScript
   yang aman dari ASI pada pembungkus komponen, diagnostik terbatas, serta
@@ -319,7 +363,8 @@ tidak disimpan di Firestore.
 - `services/firestore_store.py` — batas waktu dan circuit breaker Firestore,
   antrean tulis latar, ringkasan statistik WIB, FAQ, konfigurasi admin,
   riwayat, pembuatan profil/nama transaksional, statistik perangkat lazy,
-  pembersihan pengguna kosong, serta status kesehatan. Pembacaan konfigurasi
+  **pembersihan pengguna tanpa nama** (berdasarkan field `name` kosong/null/whitespace), serta status kesehatan. **Baca field
+  `guest_questions` dari statistik harian untuk dashboard.** Pembacaan konfigurasi
   runtime tidak menunggu Firestore pada jalur render; perubahan dashboard admin
   memakai timeout 10 detik yang terpisah dari breaker chat.
 - `services/key_pool.py` dan `services/ai_service.py` — refresh key, urutan
@@ -330,7 +375,9 @@ tidak disimpan di Firestore.
 - `services/admin_dashboard.py` — dasbor statistik, riwayat bernama, pengguna,
   kualitas jawaban, FAQ, sinkron Drive, kontrol katup darurat tamu, dan
   kesehatan sistem; menu dirender dalam fragment dan modul hanya dimuat setelah
-  login berhasil.
+  login berhasil. **Logout hanya sembunyikan dashboard (token persist),
+  statistik harian tampilkan kolom terpisah pertanyaan pengguna vs tamu,
+  pembersihan pengguna tanpa nama.**
 - `services/firestore_store.py` — konfigurasi batas harian tamu/katup darurat
   dan penulisan `guest_questions` pada statistik harian.
 - `.streamlit/secrets.toml.example` — nama Secrets baru dan format hash admin
@@ -338,7 +385,7 @@ tidak disimpan di Firestore.
 - `tests/test_firestore_store.py` — uji kegagalan dan batas waktu riwayat
   Firestore, konfigurasi runtime asinkron, penolakan UID perangkat invalid,
   transaksi profil/nama, penghitung perangkat, transaksi chunk dengan retry,
-  serta pembersihan pengguna kosong.
+  serta **pembersihan pengguna tanpa nama**. **Tambah test statistik guest.**
 - `tests/test_device_identity.py` — uji respons komponen kosong sebelum UID
   localStorage tersedia, pemulihan UID melalui cookie, dukungan `?uid=`, serta
   eksekusi skrip UID melalui Node.js dengan pembungkus komponen yang sama.
@@ -348,7 +395,8 @@ tidak disimpan di Firestore.
   banner tamu, batas pertanyaan, dan isolasi Firestore.
 - `tests/test_admin_session.py`, `tests/test_admin_firestore.py`, dan
   `tests/test_admin_dashboard_isolation.py` — uji token/epoch, umpan balik,
-  paginasi/penandaan admin, serta isolasi menu dashboard.
+  paginasi/penandaan admin, serta isolasi menu dashboard. **Tambah test token
+  persist setelah logout & revoke mencabut token.**
 - `CATATAN_PROYEK.md` — catatan fase, struktur data, keputusan, dan pekerjaan
   terbuka.
 

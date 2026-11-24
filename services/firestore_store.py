@@ -586,6 +586,7 @@ def get_admin_statistics(client: Any | None) -> dict[str, Any]:
             or {}
         )
         daily_questions: dict[str, int] = {}
+        daily_guest_questions: dict[str, int] = {}
         daily_unique: dict[str, int] = {}
         daily_uids: dict[str, set[str]] = {}
         for day_key in day_keys:
@@ -601,6 +602,7 @@ def get_admin_statistics(client: Any | None) -> dict[str, Any]:
                 or {}
             )
             daily_questions[day_key] = int(data.get("questions", 0))
+            daily_guest_questions[day_key] = int(data.get("guest_questions", 0))
             uids = {str(value) for value in data.get("uids", [])}
             daily_uids[day_key] = uids
             daily_unique[day_key] = len(uids)
@@ -648,7 +650,7 @@ def get_admin_statistics(client: Any | None) -> dict[str, Any]:
                 }
             ),
             "daily_questions": [
-                {"day": day_key, "questions": daily_questions[day_key]}
+                {"day": day_key, "questions": daily_questions[day_key], "guest_questions": daily_guest_questions[day_key]}
                 for day_key in reversed(day_keys)
             ],
         }
@@ -714,8 +716,8 @@ def get_admin_users(client: Any | None) -> list[dict[str, Any]]:
     )
 
 
-def get_empty_user_uids(client: Any | None) -> list[str]:
-    """List users with an explicit zero question count and no history chunks."""
+def get_users_without_name(client: Any | None) -> list[str]:
+    """List users without a valid name (empty, null, or whitespace only)."""
     if client is None:
         raise RuntimeError("Penyimpanan Firestore tidak tersedia.")
     from google.api_core.exceptions import GoogleAPICallError
@@ -723,31 +725,13 @@ def get_empty_user_uids(client: Any | None) -> list[str]:
     try:
         deadline = time.monotonic() + FIRESTORE_READ_TIMEOUT_SECONDS
         users_ref = client.collection("users")
-        uids_with_chunks: set[str] = set()
-        for chunk_snapshot in _snapshots(
-            client.collection_group("chunks"), deadline
-        ):
-            path_parts = chunk_snapshot.reference.path.split("/")
-            if (
-                len(path_parts) == 6
-                and path_parts[0] == "users"
-                and path_parts[2] == "chats"
-                and path_parts[4] == "chunks"
-            ):
-                uids_with_chunks.add(path_parts[1])
-        empty_uids: list[str] = []
+        uids_without_name: list[str] = []
         for user_snapshot in _snapshots(users_ref, deadline):
             user_data = user_snapshot.to_dict() or {}
-            question_count = user_data.get("total_questions")
-            if (
-                isinstance(question_count, bool)
-                or not isinstance(question_count, (int, float))
-                or question_count != 0
-            ):
-                continue
-            if user_snapshot.id not in uids_with_chunks:
-                empty_uids.append(user_snapshot.id)
-        return empty_uids
+            name = user_data.get("name")
+            if not isinstance(name, str) or not name.strip():
+                uids_without_name.append(user_snapshot.id)
+        return uids_without_name
     except (
         GoogleAPICallError,
         OSError,
@@ -756,15 +740,15 @@ def get_empty_user_uids(client: Any | None) -> list[str]:
         ValueError,
     ) as error:
         raise RuntimeError(
-            "Daftar pengguna kosong gagal dimuat "
+            "Daftar pengguna tanpa nama gagal dimuat "
             f"({type(error).__name__}): {_safe_error_message(error)}"
         ) from error
 
 
-def delete_empty_users_and_recount(
+def delete_users_without_name_and_recount(
     client: Any | None, candidate_uids: list[str]
 ) -> tuple[int, int]:
-    """Delete only the previewed still-empty users and recalculate device count."""
+    """Delete only the previewed users without name and recalculate device count."""
     if client is None:
         raise RuntimeError("Penyimpanan Firestore tidak tersedia.")
     from google.api_core.exceptions import GoogleAPICallError
@@ -772,11 +756,11 @@ def delete_empty_users_and_recount(
     try:
         deadline = time.monotonic() + FIRESTORE_ADMIN_TIMEOUT_SECONDS
         candidates = set(candidate_uids)
-        still_empty = set(get_empty_user_uids(client)) & candidates
+        still_without_name = set(get_users_without_name(client)) & candidates
         users_ref = client.collection("users")
         batch = client.batch()
         pending = 0
-        for uid in sorted(still_empty):
+        for uid in sorted(still_without_name):
             user_ref = users_ref.document(uid)
             for chat_snapshot in _snapshots(user_ref.collection("chats"), deadline):
                 batch.delete(user_ref.collection("chats").document(chat_snapshot.id))
@@ -811,7 +795,7 @@ def delete_empty_users_and_recount(
             timeout=_remaining_timeout(deadline, FIRESTORE_ADMIN_TIMEOUT_SECONDS),
             retry=None,
         )
-        return len(still_empty), remaining
+        return len(still_without_name), remaining
     except (
         GoogleAPICallError,
         OSError,
@@ -820,7 +804,7 @@ def delete_empty_users_and_recount(
         ValueError,
     ) as error:
         raise RuntimeError(
-            "Penghapusan pengguna kosong atau hitung ulang total perangkat gagal "
+            "Penghapusan pengguna tanpa nama atau hitung ulang total perangkat gagal "
             f"({type(error).__name__}): {_safe_error_message(error)}"
         ) from error
 

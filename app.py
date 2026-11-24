@@ -1931,6 +1931,11 @@ def _render_header() -> None:
     else:
         st.markdown(title_html, unsafe_allow_html=True)
 
+    history_stats = st.session_state.get("history_stats", {})
+    profile_name = str(history_stats.get("name", "") or "")
+    if DEVICE_ID_FINAL and profile_name:
+        st.caption(f"Pengguna: {profile_name}")
+
 
 def _render_admin_login_prompt() -> None:
     with st.sidebar:

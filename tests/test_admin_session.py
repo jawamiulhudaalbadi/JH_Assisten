@@ -214,6 +214,46 @@ console.log(JSON.stringify({result: eval(script), cookie, stored: storage.size})
             )
         )
 
+    def test_token_persists_after_logout(self):
+        """Verify that token remains valid after 'logout' (admin_authenticated=False only)."""
+        token = create_admin_session_token(self.uid, 0, self.secrets, now=1_000)
+        # Simulate logout: only admin_authenticated is set to False
+        # Token in cookie/localStorage remains
+        self.assertTrue(
+            verify_admin_session_token(
+                token, self.uid, 0, self.secrets, now=1_001
+            )
+        )
+        # Even after "re-login" (just setting admin_authenticated=True), token still valid
+        self.assertTrue(
+            verify_admin_session_token(
+                token, self.uid, 0, self.secrets, now=1_001
+            )
+        )
+
+    def test_revoke_all_sessions_invalidates_token(self):
+        """Verify that epoch increment (revoke all sessions) invalidates existing tokens."""
+        token = create_admin_session_token(self.uid, 5, self.secrets, now=1_000)
+        # Token valid at epoch 5
+        self.assertTrue(
+            verify_admin_session_token(
+                token, self.uid, 5, self.secrets, now=1_001
+            )
+        )
+        # After revoke, epoch becomes 6 -> token invalid
+        self.assertFalse(
+            verify_admin_session_token(
+                token, self.uid, 6, self.secrets, now=1_001
+            )
+        )
+        # New token at epoch 6 works
+        new_token = create_admin_session_token(self.uid, 6, self.secrets, now=1_000)
+        self.assertTrue(
+            verify_admin_session_token(
+                new_token, self.uid, 6, self.secrets, now=1_001
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

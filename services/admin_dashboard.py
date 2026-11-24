@@ -39,8 +39,8 @@ from services.firestore_store import (
     get_admin_statistics,
     get_admin_user_chats,
     get_admin_users,
-    delete_empty_users_and_recount,
-    get_empty_user_uids,
+    delete_users_without_name_and_recount,
+    get_users_without_name,
     get_runtime_config,
     save_settings_password_hash,
     save_answer_reviews,
@@ -131,7 +131,7 @@ def _render_statistics(client: Any | None) -> None:
     client_key = str(id(client)) if client is not None else "unavailable"
     statistics = _cached_admin_statistics(client_key, client)
     columns = st.columns(4)
-    columns[0].metric("Total perangkat", statistics["total_devices"])
+    columns[0].metric("Total perangkat (terdaftar)", statistics["total_devices"])
     columns[1].metric("Aktif sekitar 1 jam", statistics["active_last_hour"])
     columns[2].metric("Unik hari ini", statistics["unique_today"])
     columns[3].metric("Unik 7 hari", statistics["unique_7_days"])
@@ -144,7 +144,8 @@ def _render_statistics(client: Any | None) -> None:
                     "Tanggal (WIB)": datetime.strptime(row["day"], "%Y%m%d")
                     .replace(tzinfo=_WIB)
                     .strftime("%d-%m-%Y"),
-                    "Pertanyaan": row["questions"],
+                    "Pertanyaan pengguna": row["questions"],
+                    "Pertanyaan tamu": row.get("guest_questions", 0),
                 }
                 for row in daily
             ],
@@ -1134,49 +1135,49 @@ def _save_guest_emergency_toggle(client: Any | None) -> None:
             f"Katup darurat teu tiasa dirobah: {error}"
         )
 
-    if st.button("Bersihkan pengguna kosong", key="admin_preview_empty_users"):
+    if st.button("Bersihkan pengguna tanpa nama", key="admin_preview_users_without_name"):
         try:
-            st.session_state["_empty_user_cleanup_candidates"] = (
-                get_empty_user_uids(client)
+            st.session_state["_users_without_name_candidates"] = (
+                get_users_without_name(client)
             )
         except RuntimeError as error:
-            st.error(f"Tidak dapat memeriksa pengguna kosong: {error}")
+            st.error(f"Tidak dapat memeriksa pengguna tanpa nama: {error}")
         else:
-            st.session_state["_empty_user_cleanup_confirmation"] = True
+            st.session_state["_users_without_name_confirmation"] = True
 
-    if st.session_state.get("_empty_user_cleanup_confirmation"):
-        candidates = st.session_state.get("_empty_user_cleanup_candidates", [])
+    if st.session_state.get("_users_without_name_confirmation"):
+        candidates = st.session_state.get("_users_without_name_candidates", [])
         st.warning(
-            f"{len(candidates)} pengguna dengan 0 pertanyaan dan tanpa chunk "
-            "akan dihapus. Pengguna yang memiliki riwayat tidak disentuh."
+            f"{len(candidates)} pengguna tanpa nama (kosong/null/whitespace) "
+            "akan dihapus. Pengguna yang memiliki nama tidak disentuh."
         )
         confirm_column, cancel_column = st.columns(2)
         if confirm_column.button(
-            "Konfirmasi hapus pengguna kosong",
-            key="admin_confirm_empty_users",
+            "Konfirmasi hapus pengguna tanpa nama",
+            key="admin_confirm_users_without_name",
             type="primary",
         ):
             try:
-                deleted_count, remaining_count = delete_empty_users_and_recount(
+                deleted_count, remaining_count = delete_users_without_name_and_recount(
                     client, candidates
                 )
             except RuntimeError as error:
-                st.error(f"Pembersihan pengguna kosong gagal: {error}")
+                st.error(f"Pembersihan pengguna tanpa nama gagal: {error}")
             else:
-                st.session_state.pop("_empty_user_cleanup_candidates", None)
-                st.session_state.pop("_empty_user_cleanup_confirmation", None)
+                st.session_state.pop("_users_without_name_candidates", None)
+                st.session_state.pop("_users_without_name_confirmation", None)
                 st.session_state.pop("_admin_cache_users", None)
                 st.session_state.pop("_admin_cache_statistics", None)
                 st.success(
-                    f"{deleted_count} pengguna dihapus; total perangkat "
+                    f"{deleted_count} pengguna tanpa nama dihapus; total perangkat "
                     f"dihitung ulang menjadi {remaining_count}."
                 )
         if cancel_column.button(
             "Batal",
-            key="admin_cancel_empty_users",
+            key="admin_cancel_users_without_name",
         ):
-            st.session_state.pop("_empty_user_cleanup_candidates", None)
-            st.session_state.pop("_empty_user_cleanup_confirmation", None)
+            st.session_state.pop("_users_without_name_candidates", None)
+            st.session_state.pop("_users_without_name_confirmation", None)
 
     if st.button("Bersihkan cache aplikasi", key="admin_clear_cache"):
         st.cache_data.clear()
@@ -1318,31 +1319,8 @@ def _render_dashboard_fragment(
     started_at = time.perf_counter()
     st.title("Dashboard Admin")
     if st.button("Keluar", key="admin_dashboard_exit"):
-        st.session_state["_admin_logout_clear_pending"] = True
-        st.rerun(scope="fragment")
-    if st.session_state.get("_admin_logout_clear_pending"):
-        result = st_javascript(
-            build_admin_session_clear_script(),
-            key="clear_admin_session_on_logout",
-        )
-        if result == "error":
-            st.session_state.pop("_admin_logout_clear_pending", None)
-            st.error(
-                "Sesi dina panyungsi teu tiasa dipupus; dashboard tetep kabuka."
-            )
-            return
-        if result in {"cleared", "cookie-cleared"}:
-            if result == "cookie-cleared":
-                st.session_state["_admin_session_clear_warning"] = (
-                    "Cookie parantos dipupus, nanging panyimpenan lokal "
-                    "panyungsi teu tiasa dipupus."
-                )
-            st.session_state["admin_authenticated"] = False
-            st.session_state.pop("_admin_session_token", None)
-            st.session_state.pop("_admin_auth_method", None)
-            st.session_state.pop("_admin_logout_clear_pending", None)
-            st.rerun(scope="app")
-        st.caption("Nuju kaluar tina dashboard admin...")
+        st.session_state["admin_authenticated"] = False
+        st.rerun(scope="app")
 
     section = st.radio(
         "Menu dashboard",

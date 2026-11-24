@@ -20,12 +20,12 @@ from services.firestore_store import (
     _write_question_pair,
     _write_daily_questions,
     append_message_pair,
-    delete_empty_users_and_recount,
+    delete_users_without_name_and_recount,
     firestore_status,
     firestore_write_health,
     enqueue_question_answer,
     enqueue_guest_question,
-    get_empty_user_uids,
+    get_users_without_name,
     get_admin_users,
     get_runtime_config,
     load_chat_history,
@@ -34,6 +34,7 @@ from services.firestore_store import (
     reset_firestore_circuit,
     save_settings_password_hash,
     update_runtime_config,
+    get_admin_statistics,
 )
 
 
@@ -290,12 +291,12 @@ class _CleanupBatch:
 class _CleanupClient:
     def __init__(self):
         self.users = {
-            "empty": {"total_questions": 0},
-            "has_chunk": {"total_questions": 0},
-            "has_questions": {"total_questions": 3},
+            "no_name": {"total_questions": 0},  # tidak punya nama
+            "has_name": {"total_questions": 0, "name": "Budi"},  # punya nama
+            "has_questions": {"total_questions": 3, "name": "Siti"},  # punya nama & pertanyaan
         }
-        self.chats = {"empty": [], "has_chunk": ["chat"], "has_questions": []}
-        self.chunks = {("has_chunk", "chat"): ["000001"]}
+        self.chats = {"no_name": [], "has_name": ["chat"], "has_questions": []}
+        self.chunks = {("has_name", "chat"): ["000001"]}
         self.global_stats = {"total_devices": 26}
 
     def collection(self, name: str):
@@ -1060,18 +1061,18 @@ class FirestoreStoreTests(unittest.TestCase):
         self.assertEqual(feedback_writes[0]["question"], "Question")
         self.assertEqual(feedback_writes[0]["sources"][0]["excerpt"], "petikan")
 
-    def test_empty_user_cleanup_preserves_history_and_recounts_devices(self) -> None:
+    def test_users_without_name_cleanup_preserves_history_and_recounts_devices(self) -> None:
         client = _CleanupClient()
 
-        candidates = get_empty_user_uids(client)
-        deleted_count, remaining_count = delete_empty_users_and_recount(
+        candidates = get_users_without_name(client)
+        deleted_count, remaining_count = delete_users_without_name_and_recount(
             client, candidates
         )
 
-        self.assertEqual(candidates, ["empty"])
+        self.assertEqual(candidates, ["no_name"])
         self.assertEqual((deleted_count, remaining_count), (1, 2))
-        self.assertNotIn("empty", client.users)
-        self.assertIn("has_chunk", client.users)
+        self.assertNotIn("no_name", client.users)
+        self.assertIn("has_name", client.users)
         self.assertIn("has_questions", client.users)
         self.assertEqual(client.global_stats["total_devices"], 2)
 
@@ -1176,6 +1177,137 @@ class FirestoreStoreTests(unittest.TestCase):
         self.assertTrue(any("/chunks/" in path for path in paths))
         self.assertTrue(any(path.startswith("faq/") for path in paths))
         self.assertFalse(any("/daily_" in path for path in paths))
+
+
+class AdminStatisticsGuestTests(unittest.TestCase):
+    """Tests for get_admin_statistics including guest_questions field."""
+
+    @staticmethod
+    def _make_snapshot(data: dict) -> Any:
+        class _Snapshot:
+            def __init__(self, d):
+                self._data = d
+
+            def to_dict(self):
+                return self._data
+
+        return _Snapshot(data)
+
+    def _make_client(self, daily_data: list[dict], global_devices: int = 5):
+        class _Client:
+            def __init__(self, daily_data, global_devices):
+                self.daily_data = {f"daily_{i['day']}": i for i in daily_data}
+                self.global_devices = global_devices
+
+            def collection(self, name: str):
+                class _Collection:
+                    def __init__(self, outer, coll_name):
+                        self.outer = outer
+                        self.coll_name = coll_name
+
+                    def document(self, doc_id: str):
+                        class _Document:
+                            def __init__(self, outer, coll_name, doc_id):
+                                self.outer = outer
+                                self.coll_name = coll_name
+                                self.doc_id = doc_id
+
+                            def get(self, *, timeout, retry):
+                                assert timeout > 0
+                                assert retry is None
+                                if self.coll_name == "stats" and self.doc_id == "global":
+                                    return AdminStatisticsGuestTests._make_snapshot({"total_devices": self.outer.global_devices})
+                                if self.coll_name == "stats" and self.doc_id.startswith("daily_"):
+                                    return AdminStatisticsGuestTests._make_snapshot(self.outer.daily_data.get(self.doc_id, {}))
+                                if self.coll_name == "stats" and self.doc_id.startswith("hourly_"):
+                                    return AdminStatisticsGuestTests._make_snapshot({"active_at": {}})
+                                return AdminStatisticsGuestTests._make_snapshot({})
+
+                        return _Document(self.outer, self.coll_name, doc_id)
+
+                return _Collection(self, name)
+
+        return _Client(daily_data, global_devices)
+
+    @patch("services.firestore_store._now")
+    def test_get_admin_statistics_includes_guest_questions(self, mock_now):
+        """Verify that guest_questions field is read from daily stats."""
+        # Mock _now to return a fixed date (2024-01-15 WIB)
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        _WIB = ZoneInfo("Asia/Jakarta")
+        mock_now.return_value = datetime(2024, 1, 15, 12, 0, 0, tzinfo=_WIB)
+
+        daily_data = [
+            {"day": "20240115", "questions": 10, "uids": ["uid1", "uid2"], "guest_questions": 3},
+            {"day": "20240114", "questions": 5, "uids": ["uid1"], "guest_questions": 0},
+            {"day": "20240113", "questions": 8, "uids": ["uid2", "uid3"], "guest_questions": 2},
+        ]
+        client = self._make_client(daily_data, global_devices=3)
+
+        stats = get_admin_statistics(client)
+
+        self.assertEqual(stats["total_devices"], 3)
+        daily = stats["daily_questions"]
+        # Should have 14 days, but only 3 have data
+        self.assertGreaterEqual(len(daily), 3)
+
+        # Check guest_questions field exists and has correct values for the 3 days
+        day_map = {row["day"]: row for row in daily}
+        self.assertEqual(day_map["20240115"]["questions"], 10)
+        self.assertEqual(day_map["20240115"]["guest_questions"], 3)
+        self.assertEqual(day_map["20240114"]["questions"], 5)
+        self.assertEqual(day_map["20240114"]["guest_questions"], 0)
+        self.assertEqual(day_map["20240113"]["questions"], 8)
+        self.assertEqual(day_map["20240113"]["guest_questions"], 2)
+
+    @patch("services.firestore_store._now")
+    def test_guest_questions_not_counted_as_registered_users(self, mock_now):
+        """Verify that guest questions don't affect total_devices or unique counts."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        _WIB = ZoneInfo("Asia/Jakarta")
+        mock_now.return_value = datetime(2024, 1, 15, 12, 0, 0, tzinfo=_WIB)
+
+        # Many guest questions but few registered users
+        daily_data = [
+            {"day": "20240115", "questions": 2, "uids": ["uid1"], "guest_questions": 50},
+            {"day": "20240114", "questions": 1, "uids": ["uid1"], "guest_questions": 30},
+        ]
+        client = self._make_client(daily_data, global_devices=1)
+
+        stats = get_admin_statistics(client)
+
+        # total_devices only counts registered users (global_devices)
+        self.assertEqual(stats["total_devices"], 1)
+        # unique_today/unique_7_days only count registered UIDs
+        self.assertEqual(stats["unique_today"], 1)
+        self.assertEqual(stats["unique_7_days"], 1)
+        # But guest_questions are tracked separately
+        day_map = {row["day"]: row for row in stats["daily_questions"]}
+        self.assertEqual(day_map["20240115"]["guest_questions"], 50)
+        self.assertEqual(day_map["20240114"]["guest_questions"], 30)
+
+    @patch("services.firestore_store._now")
+    def test_get_admin_statistics_missing_guest_questions_defaults_to_zero(self, mock_now):
+        """Verify backward compatibility: missing guest_questions defaults to 0."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        _WIB = ZoneInfo("Asia/Jakarta")
+        mock_now.return_value = datetime(2024, 1, 15, 12, 0, 0, tzinfo=_WIB)
+
+        # Old daily docs without guest_questions field
+        daily_data = [
+            {"day": "20240115", "questions": 10, "uids": ["uid1"]},  # no guest_questions
+            {"day": "20240114", "questions": 5, "uids": [], "guest_questions": 0},  # explicit 0
+        ]
+        client = self._make_client(daily_data, global_devices=1)
+
+        stats = get_admin_statistics(client)
+
+        day_map = {row["day"]: row for row in stats["daily_questions"]}
+        self.assertEqual(day_map["20240115"]["guest_questions"], 0)
+        self.assertEqual(day_map["20240114"]["guest_questions"], 0)
 
 
 if __name__ == "__main__":
