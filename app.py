@@ -113,6 +113,7 @@ _PERF_ENABLED = (
     st.query_params.get("debug") == "1"
     or bool(st.session_state.get("admin_authenticated"))
 )
+st.session_state["_run_count"] = st.session_state.get("_run_count", 0) + 1
 _PERF_RUN_STARTED = time.perf_counter()
 _PERF_BLOCKS: dict[str, float] = {}
 
@@ -1268,6 +1269,7 @@ if _PERF_ENABLED and not IS_GUEST:
         f"ID alat · sumber: {source_label} · status: {status_label} · "
         f"awalan: {uid_prefix}"
     )
+    st.caption(f"Run ke-{st.session_state['_run_count']}")
 with _measure_perf("configuration"):
     try:
         firestore_credentials_json = credentials_json_from_secrets(st.secrets)
