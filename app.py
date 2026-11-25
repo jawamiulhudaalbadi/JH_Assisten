@@ -1241,6 +1241,7 @@ st.session_state["google_drive_folder_id"] = DEFAULT_FOLDER_ID
 if (
     not st.session_state.get("_device_uid_browser_resolved")
     and not st.session_state.get("_device_uid_wait_timed_out")
+    and not local_cache.component_ready()
     and not re.fullmatch(
         r"[a-f0-9]{16,32}",
         str(st.query_params.get("uid") or ""),
