@@ -1040,7 +1040,7 @@ class FirestoreStoreTests(unittest.TestCase):
             "answer_id": "b" * 32,
             "question": "Question",
             "answer": "Answer",
-            "rating": "Cocog",
+            "rating": "cocok",
             "reason": None,
             "quality_metrics": {
                 "latency_ms": 200,

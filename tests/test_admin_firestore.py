@@ -178,13 +178,13 @@ class AdminFirestoreTests(unittest.TestCase):
                 "feedback": {
                     "a" * 32: {
                         "answer_id": "a" * 32,
-                        "rating": "Cocog",
+                        "rating": "cocok",
                         "source_count": 1,
                         "created_at": 3,
                     },
                     "b" * 32: {
                         "answer_id": "b" * 32,
-                        "rating": "Teu cocog",
+                        "rating": "Teu cocok",
                         "source_count": 0,
                         "created_at": 2,
                     },

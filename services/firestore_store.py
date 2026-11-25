@@ -987,10 +987,10 @@ def submit_answer_feedback(
         or not re.fullmatch(r"[a-f0-9]{32}", answer_id)
     ):
         raise ValueError("ID eupan balik henteu valid.")
-    if rating not in {"Cocog", "Teu cocog"}:
+    if rating not in {"cocok", "Teu cocok"}:
         raise ValueError("Peunteun eupan balik henteu valid.")
     allowed_reasons = {"Kaluar tina kontéks", "Salah", "Teu lengkep"}
-    if reason is not None and (rating != "Teu cocog" or reason not in allowed_reasons):
+    if reason is not None and (rating != "Teu cocok" or reason not in allowed_reasons):
         raise ValueError("Alesan eupan balik henteu valid.")
     try:
         latency_ms = max(
@@ -1015,7 +1015,7 @@ def submit_answer_feedback(
     feedback_ref = client.collection("feedback").document(answer_id)
     summary_ref = client.collection("stats").document("quality")
     model_key = hashlib.sha256(model_used.casefold().encode("utf-8")).hexdigest()[:16]
-    is_positive = rating == "Cocog"
+    is_positive = rating == "cocok"
     feedback = {
         "answer_id": answer_id,
         "uid": uid,
@@ -1114,7 +1114,7 @@ def get_answer_quality_page(
             ]
         )
         filters = {
-            "Teu cocog": ("rating", "Teu cocog"),
+            "Teu cocok": ("rating", "Teu cocok"),
             "Tanpa sumber": ("source_count", 0),
             "Fallback tanpa AI": ("fallback", True),
         }

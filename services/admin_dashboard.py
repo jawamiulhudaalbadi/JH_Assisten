@@ -343,7 +343,7 @@ def _render_users(client: Any | None) -> None:
     page = _cached_user_page(client_key, name_query, cursor, client)
     users = page["items"]
     if not users:
-        st.info("Teu aya pangguna anu cocog.")
+        st.info("Teu aya pangguna anu cocok.")
         return
     today_key = datetime.now(_WIB).strftime("%Y%m%d")
     st.dataframe(
@@ -503,8 +503,8 @@ def _render_answer_quality(
     latency_count = int(summary.get("latency_count", 0) or 0)
     latency_total = int(summary.get("latency_total_ms", 0) or 0)
     columns = st.columns(5)
-    columns[0].metric("Cocog", int(summary.get("positive_count", 0) or 0))
-    columns[1].metric("Teu cocog", int(summary.get("negative_count", 0) or 0))
+    columns[0].metric("cocok", int(summary.get("positive_count", 0) or 0))
+    columns[1].metric("Teu cocok", int(summary.get("negative_count", 0) or 0))
     columns[2].metric(
         "Tanpa sumber",
         f"{100 * no_source_count / feedback_count:.1f}%"
@@ -615,7 +615,7 @@ def _render_answer_quality(
 
     filters = (
         "Sadayana",
-        "Teu cocog",
+        "Teu cocok",
         "Tanpa sumber",
         "Fallback tanpa AI",
         "Per model",
@@ -663,7 +663,7 @@ def _render_answer_quality(
         client, [str(item.get("answer_id", "")) for item in items]
     )
     if not items:
-        st.info("Can data eupan balik anu cocog sareng filter ieu.")
+        st.info("Can data eupan balik anu cocok sareng filter ieu.")
     for item in items:
         answer_id = str(item.get("answer_id", ""))
         review = reviews.get(answer_id, {})

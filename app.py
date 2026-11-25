@@ -837,7 +837,7 @@ def _render_answer_feedback(
     pending_feedback = bool(st.session_state.get(pending_key))
     positive_column, negative_column = st.columns([1, 1])
     if positive_column.button(
-        "Cocog",
+        "cocok",
         key=f"feedback_positive_{answer_id}",
         disabled=pending_feedback,
     ):
@@ -850,7 +850,7 @@ def _render_answer_feedback(
                 answer_id=answer_id,
                 question=question,
                 answer=answer,
-                rating="Cocog",
+                rating="cocok",
                 reason=None,
                 quality_metrics=quality_metrics,
                 sources=sources,
@@ -865,7 +865,7 @@ def _render_answer_feedback(
                 else "Jawaban ieu parantos kantos dipeunteun."
             )
     if negative_column.button(
-        "Teu cocog",
+        "Teu cocok",
         key=f"feedback_negative_{answer_id}",
         disabled=pending_feedback,
     ):
@@ -889,7 +889,7 @@ def _render_answer_feedback(
                     answer_id=answer_id,
                     question=question,
                     answer=answer,
-                    rating="Teu cocog",
+                    rating="Teu cocok",
                     reason=None if reason_label == "Tanpa alesan" else reason_label,
                     quality_metrics=quality_metrics,
                     sources=sources,
