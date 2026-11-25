@@ -114,6 +114,30 @@ _PERF_ENABLED = (
     or bool(st.session_state.get("admin_authenticated"))
 )
 st.session_state["_run_count"] = st.session_state.get("_run_count", 0) + 1
+_now = time.time()
+st.session_state.setdefault("_session_t0", _now)
+_RUN_T = _now - st.session_state["_session_t0"]
+_RERUN_ORIGIN = st.session_state.pop(
+    "_rerun_origin", "browser/komponen (bukan st.rerun)"
+)
+st.session_state.setdefault("_run_log", []).append(
+    f"#{st.session_state['_run_count']} t={_RUN_T:.1f}s {_RERUN_ORIGIN}"
+)
+if not getattr(st.rerun, "_jh_wrapped", False):
+    _orig_st_rerun = st.rerun
+
+    def _logged_rerun(*args, **kwargs):
+        if kwargs.get("scope", "app") != "fragment":
+            import sys
+
+            caller = sys._getframe(1)
+            st.session_state["_rerun_origin"] = (
+                f"{Path(caller.f_code.co_filename).name}:{caller.f_lineno}"
+            )
+        return _orig_st_rerun(*args, **kwargs)
+
+    _logged_rerun._jh_wrapped = True
+    st.rerun = _logged_rerun
 _PERF_RUN_STARTED = time.perf_counter()
 _PERF_BLOCKS: dict[str, float] = {}
 
@@ -1269,7 +1293,7 @@ if _PERF_ENABLED and not IS_GUEST:
         f"ID alat · sumber: {source_label} · status: {status_label} · "
         f"awalan: {uid_prefix}"
     )
-    st.caption(f"Run ke-{st.session_state['_run_count']}")
+    st.text("\n".join(st.session_state["_run_log"][-10:]))
 with _measure_perf("configuration"):
     try:
         firestore_credentials_json = credentials_json_from_secrets(st.secrets)
